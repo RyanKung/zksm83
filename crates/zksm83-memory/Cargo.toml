@@ -1,0 +1,17 @@
+[package]
+name = "zksm83-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ff.workspace = true
+halo2_gadgets.workspace = true
+hex.workspace = true
+pasta_curves.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

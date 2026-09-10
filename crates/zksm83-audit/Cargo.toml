@@ -1,0 +1,21 @@
+[package]
+name = "zksm83-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ff.workspace = true
+halo2_proofs.workspace = true
+pasta_curves.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zksm83-core.workspace = true
+zksm83-isa.workspace = true
+zksm83-memory.workspace = true
+zksm83-trace.workspace = true
+
+[lints]
+workspace = true

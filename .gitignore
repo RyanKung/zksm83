@@ -1,0 +1,45 @@
+# Rust build, coverage, and profiler output
+**/target/
+coverage/
+*.profraw
+*.rs.bk
+
+# Local history and backend experiments
+/backup/
+/jolt-zksm83/
+
+# User-supplied cartridge and save data
+/roms/
+*.gb
+*.gbc
+*.rom
+*.sav
+*.srm
+
+# Long-running Blue input schedules are local research data
+/examples/blue-*
+
+# Generated proofs, traces, checkpoints, and benchmarks
+/artifacts/*
+!/artifacts/README.md
+*.receipt.json
+*.trace.json
+*.trace-summary.json
+*.checkpoint.json
+*.benchmark.json
+*.verification.json
+*.proof
+*.srs
+
+# Temporary work and local environment
+/tmp/
+.env
+.env.*
+!.env.example
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

@@ -1,0 +1,20 @@
+[package]
+name = "zksm83-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+zksm83-core.workspace = true
+zksm83-isa.workspace = true
+zksm83-memory.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

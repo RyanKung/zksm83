@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "crates/zksm83-isa",
+    "crates/zksm83-core",
+    "crates/zksm83-memory",
+    "crates/zksm83-trace",
+    "crates/zksm83-proof",
+    "crates/zksm83-receipt",
+    "crates/zksm83-cli",
+    "crates/zksm83-audit",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+clap = { version = "4.6.5", features = ["derive"] }
+ff = "0.13.1"
+halo2_gadgets = "0.5.0"
+halo2_proofs = "0.3.5"
+hex = "0.4.3"
+pasta_curves = { version = "0.5.2", features = ["serde"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+thiserror = "2.0.20"
+
+zksm83-core = { path = "crates/zksm83-core" }
+zksm83-isa = { path = "crates/zksm83-isa" }
+zksm83-memory = { path = "crates/zksm83-memory" }
+zksm83-audit = { path = "crates/zksm83-audit" }
+zksm83-proof = { path = "crates/zksm83-proof" }
+zksm83-receipt = { path = "crates/zksm83-receipt" }
+zksm83-trace = { path = "crates/zksm83-trace" }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
