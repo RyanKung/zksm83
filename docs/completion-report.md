@@ -9,9 +9,11 @@ not versioned.
 The workspace has one proof route. `zksm83-jolt` composes the 6,144-slot,
 degree-18 CPU/device relation with fixed-table ISA lookup, immutable ROM,
 ordered mutable memory, row-tagged continuity, and committed bus/input/output/
-ISA logs. The v1 receipt binds one statement-scoped ROM commitment and an exact
+ISA logs. The v2 receipt binds one statement-scoped ROM commitment and an exact
 chain of segment boundaries, memory commitments, counters, and cumulative log
-identities.
+identities. Its shared trace uses 13 paired openings for 26 ordered commitment
+groups. Existing v1 receipts remain readable through an explicit
+verification-only branch; new proving and recovery checkpoints are v2-only.
 
 The independent verifier takes a separately supplied exact statement. It does
 not receive or reconstruct an emulator, execution trace, ROM image, memory
@@ -49,6 +51,11 @@ This is a transparent proof system. No witness-hiding or zero-knowledge claim
 is made.
 
 ## Completed proof evidence
+
+The complete receipt and Blue-prefix measurements below were produced by the
+v1 independent-opening pipeline. They remain historical evidence for the
+unchanged SM83 relation, but are not v2 performance or full-receipt evidence.
+The v2 migration intentionally ran only bounded PCS micro-gates and fast tests.
 
 The corrected transcript declares maximum degree 18. A regression reaches that
 exact APU selector degree, preventing the earlier degree-16 understatement.

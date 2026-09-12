@@ -1,10 +1,10 @@
 use akita_pcs::Transcript;
 
 use crate::{
-    NativeField, TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START, UNIFORM_NUM_VARIABLES,
-    WitnessCommitments,
+    NativeField, NativeProtocolVersion, TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START,
+    UNIFORM_NUM_VARIABLES, WitnessCommitments,
     pcs::OpeningProof,
-    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening},
+    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
 };
 
 use super::{MutableMemoryError, push_bytes, transcript};
@@ -34,13 +34,21 @@ pub(super) fn prove(
 }
 
 pub(super) fn verify(
+    protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
     phase_one: &[u8],
     proof: &ClockProof,
 ) -> Result<(), MutableMemoryError> {
     let descriptor = descriptor(phase_one)?;
     let point = point(&descriptor);
-    verify_witness_opening(trace, &point, &proof.values, &descriptor, &proof.opening)?;
+    verify_witness_opening_for_protocol(
+        protocol,
+        trace,
+        &point,
+        &proof.values,
+        &descriptor,
+        &proof.opening,
+    )?;
     check_row_bits(&proof.values, &point)
 }
 

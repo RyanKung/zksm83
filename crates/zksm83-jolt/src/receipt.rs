@@ -8,11 +8,12 @@ mod wire;
 
 use thiserror::Error;
 
+use crate::cpu::verify_native_memory_cpu_for_protocol;
 use crate::{
     CommittedMemory, CommittedRom, MemoryCommitment, NativeCpuStructuralError,
-    NativeExecutionClaim, NativeMemoryCpuProof, NativeStateBoundary, NativeTraceWitness,
-    ProtocolLogCommitments, ProtocolLogError, ROM_IMAGE_BYTES, RomCommitment, UNIFORM_ROW_COUNT,
-    commit_protocol_logs, prove_native_memory_cpu, verify_native_memory_cpu,
+    NativeExecutionClaim, NativeMemoryCpuProof, NativeProtocolVersion, NativeStateBoundary,
+    NativeTraceWitness, ProtocolLogCommitments, ProtocolLogError, ROM_IMAGE_BYTES, RomCommitment,
+    UNIFORM_ROW_COUNT, commit_protocol_logs, prove_native_memory_cpu,
 };
 
 pub use identity::{
@@ -20,11 +21,16 @@ pub use identity::{
     ProtocolLogKind,
 };
 
-use self::identity::{backend_digest, checked_delta, direct_memory_identity, direct_rom_identity};
+use self::identity::{
+    backend_digest, checked_delta, direct_memory_identity, direct_memory_identity_for,
+    direct_rom_identity, direct_rom_identity_for,
+};
 use self::wire::{decode_receipt, decode_statement, encode_receipt, encode_statement};
 
+/// Verification-only historical native receipt wire version.
+pub const LEGACY_NATIVE_RECEIPT_VERSION: u64 = 1;
 /// Current canonical native receipt wire version.
-pub const NATIVE_RECEIPT_VERSION: u64 = 1;
+pub const NATIVE_RECEIPT_VERSION: u64 = 2;
 /// Maximum canonical receipt byte length accepted by the verifier.
 pub const MAX_NATIVE_RECEIPT_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum canonical expected-statement byte length accepted by the verifier.
@@ -54,6 +60,7 @@ pub struct NativeSegmentWitness<'a> {
 /// Exact public statement authenticated by a native receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeStatement {
+    pub(crate) protocol: NativeProtocolVersion,
     pub(crate) backend_digest: [u8; 32],
     pub(crate) machine_profile: u64,
     pub(crate) rom_byte_length: u64,
@@ -86,7 +93,7 @@ pub struct NativeSegmentReceipt {
 /// Canonical versioned transparent receipt for one or more native segments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeReceipt {
-    pub(crate) version: u64,
+    pub(crate) version: NativeProtocolVersion,
     pub(crate) statement: NativeStatement,
     pub(crate) rom: RomCommitment,
     pub(crate) segments: Vec<NativeSegmentReceipt>,
@@ -157,6 +164,12 @@ impl<'a> NativeSegmentWitness<'a> {
 }
 
 impl NativeStatement {
+    /// Returns the protocol revision authenticated by this statement.
+    #[must_use]
+    pub const fn protocol(&self) -> NativeProtocolVersion {
+        self.protocol
+    }
+
     /// Returns the compiled backend digest bound by this statement.
     #[must_use]
     pub const fn backend_digest(&self) -> [u8; 32] {
@@ -236,11 +249,30 @@ impl NativeStatement {
         segment_count: u64,
         relation_step_count: u64,
     ) -> Result<Self, NativeReceiptError> {
+        Self::new_for(
+            NativeProtocolVersion::current(),
+            rom,
+            initial,
+            final_boundary,
+            segment_count,
+            relation_step_count,
+        )
+    }
+
+    fn new_for(
+        protocol: NativeProtocolVersion,
+        rom: CommitmentIdentity,
+        initial: NativeBoundary,
+        final_boundary: NativeBoundary,
+        segment_count: u64,
+        relation_step_count: u64,
+    ) -> Result<Self, NativeReceiptError> {
         let machine_profile = initial.machine_profile()?;
         let m_cycle_count = checked_delta(initial.m_cycles(), final_boundary.m_cycles())?;
         let logs = ProtocolLogCounts::between(&initial, &final_boundary)?;
         let mut statement = Self {
-            backend_digest: backend_digest(),
+            protocol,
+            backend_digest: backend_digest(protocol),
             machine_profile,
             rom_byte_length: u64::try_from(ROM_IMAGE_BYTES)
                 .map_err(|_| NativeReceiptError::Counter)?,
@@ -261,7 +293,7 @@ impl NativeStatement {
     fn validate(&self) -> Result<(), NativeReceiptError> {
         let maximum =
             u64::try_from(MAX_NATIVE_SEGMENT_COUNT).map_err(|_| NativeReceiptError::Counter)?;
-        if self.backend_digest != backend_digest()
+        if self.backend_digest != backend_digest(self.protocol)
             || self.rom_byte_length
                 != u64::try_from(ROM_IMAGE_BYTES).map_err(|_| NativeReceiptError::Counter)?
         {
@@ -272,9 +304,9 @@ impl NativeStatement {
             return Err(NativeReceiptError::InvalidStatement);
         }
         self.rom
-            .validate(CommitmentKind::Rom, self.rom_byte_length)?;
-        self.initial.validate()?;
-        self.final_boundary.validate()?;
+            .validate_for(self.protocol, CommitmentKind::Rom, self.rom_byte_length)?;
+        self.initial.validate_for(self.protocol)?;
+        self.final_boundary.validate_for(self.protocol)?;
         if self.machine_profile != self.initial.machine_profile()?
             || self.machine_profile != self.final_boundary.machine_profile()?
             || self.m_cycle_count
@@ -328,7 +360,7 @@ impl NativeReceipt {
     /// Returns the canonical wire version.
     #[must_use]
     pub const fn version(&self) -> u64 {
-        self.version
+        self.version.code()
     }
 
     /// Returns the exact public statement carried by this receipt.
@@ -430,7 +462,7 @@ pub fn verify_native_receipt(
 ) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
     expected.validate()?;
     receipt.statement.validate()?;
-    if receipt.version != NATIVE_RECEIPT_VERSION || receipt.statement != *expected {
+    if receipt.version != expected.protocol || receipt.statement != *expected {
         return Err(NativeReceiptError::StatementMismatch);
     }
     verify_receipt_structure(receipt)?;
@@ -451,7 +483,7 @@ pub fn verify_native_receipt_bytes(
 
 fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceiptError> {
     let statement = &receipt.statement;
-    if direct_rom_identity(&receipt.rom)? != statement.rom
+    if direct_rom_identity_for(receipt.version, &receipt.rom)? != statement.rom
         || receipt.segments.len()
             != usize::try_from(statement.segment_count).map_err(|_| NativeReceiptError::Counter)?
     {
@@ -462,9 +494,9 @@ fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceipt
     let mut previous_memory: Option<&MemoryCommitment> = None;
     for (index, segment) in receipt.segments.iter().enumerate() {
         if let Some(memory) = previous_memory {
-            ensure_same_memory(memory, &segment.initial_memory)?;
+            ensure_same_memory(memory, &segment.initial_memory, receipt.version)?;
         }
-        verify_segment(index, segment, &boundary, &receipt.rom)?;
+        verify_segment(index, segment, &boundary, &receipt.rom, receipt.version)?;
         steps = steps
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
@@ -482,8 +514,9 @@ fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceipt
 fn ensure_same_memory(
     left: &MemoryCommitment,
     right: &MemoryCommitment,
+    protocol: NativeProtocolVersion,
 ) -> Result<(), NativeReceiptError> {
-    if direct_memory_identity(left)? != direct_memory_identity(right)? {
+    if direct_memory_identity_for(protocol, left)? != direct_memory_identity_for(protocol, right)? {
         return Err(NativeReceiptError::SegmentChain(
             "adjacent mutable-memory commitment identities differ",
         ));
@@ -496,6 +529,7 @@ fn verify_segment(
     segment: &NativeSegmentReceipt,
     expected_initial: &NativeBoundary,
     rom: &RomCommitment,
+    protocol: NativeProtocolVersion,
 ) -> Result<(), NativeReceiptError> {
     let _phase = crate::metrics::start(crate::metrics::Phase::Verify);
     let expected_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
@@ -516,19 +550,21 @@ fn verify_segment(
             "active and padded row counts are invalid",
         ));
     }
-    if direct_memory_identity(&segment.initial_memory)? != segment.initial.memory {
+    if direct_memory_identity_for(protocol, &segment.initial_memory)? != segment.initial.memory {
         return Err(NativeReceiptError::SegmentChain(
             "initial memory commitment identity differs",
         ));
     }
-    if direct_memory_identity(&segment.final_memory)? != segment.final_boundary.memory {
+    if direct_memory_identity_for(protocol, &segment.final_memory)? != segment.final_boundary.memory
+    {
         return Err(NativeReceiptError::SegmentChain(
             "final memory commitment identity differs",
         ));
     }
-    segment.initial.validate()?;
-    segment.final_boundary.validate()?;
-    let expected_final = segment.initial.advance(
+    segment.initial.validate_for(protocol)?;
+    segment.final_boundary.validate_for(protocol)?;
+    let expected_final = segment.initial.advance_for(
+        protocol,
         segment.final_boundary.state,
         segment.final_boundary.memory.clone(),
         &segment.logs,
@@ -561,7 +597,8 @@ fn verify_segment(
         segment.final_boundary.state,
     )
     .map_err(NativeCpuStructuralError::Continuity)?;
-    verify_native_memory_cpu(
+    verify_native_memory_cpu_for_protocol(
+        protocol,
         &segment.proof,
         &claim,
         &segment.logs,

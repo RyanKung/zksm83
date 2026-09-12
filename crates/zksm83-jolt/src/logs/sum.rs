@@ -2,10 +2,10 @@ use akita_pcs::Ring;
 use jolt_field::Field;
 
 use crate::{
-    NativeExecutionClaim, NativeField, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
-    WitnessCommitments,
+    NativeExecutionClaim, NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES,
+    UNIFORM_ROW_COUNT, WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
-    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening},
+    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
 };
 
 use super::{
@@ -62,6 +62,7 @@ pub(super) fn prove(
 }
 
 pub(super) fn verify(
+    protocol: NativeProtocolVersion,
     proof: &ProtocolLogSumProof,
     trace_inverses: &WitnessCommitments,
     logs: &ColumnCommitments,
@@ -72,7 +73,8 @@ pub(super) fn verify(
     let descriptor = descriptor(full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let log_point = half_point(PROTOCOL_LOG_NUM_VARIABLES)?;
-    verify_witness_opening(
+    verify_witness_opening_for_protocol(
+        protocol,
         trace_inverses,
         &trace_point,
         &proof.trace_values,

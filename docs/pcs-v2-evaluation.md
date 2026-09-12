@@ -1,9 +1,8 @@
 # PCS v2 batching evaluation
 
-This document defines the bounded decision gate for replacing version 1's
-independent Akita openings with a genuine multi-group opening. It is an
-experiment plan, not a protocol claim. Version 1 remains the only accepted
-receipt format until every gate below passes.
+This document records the bounded decision gate used to replace version 1's
+independent Akita openings with native receipt v2 pair openings. Version 1 is
+retained only for verification of existing canonical receipts.
 
 ## Confirmed version 1 boundary
 
@@ -22,7 +21,7 @@ encoding.
 
 ## Isolation rules
 
-- Keep `zksm83-native-jolt-akita-v1`, receipt version 1, and all current
+- Keep `zksm83-native-jolt-akita-v1`, receipt version 1, and all v1
   schedules byte-for-byte verifiable.
 - Generate candidate schedules only from pinned Akita revision
   `69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc` into a fresh ignored directory.
@@ -115,12 +114,26 @@ Both child paths stayed far below their independent 30-second deadlines:
 The batched opening was 12.57 percent faster, reduced the framed proof payload
 by 47.20 percent, and increased sampled peak RSS by 5.11 percent. Exact claims
 verified, and all five group-order, commitment, value, point, and schedule
-mutations failed closed. The two-group gate therefore permits the next bounded
-candidate; it does not admit a receipt format or alter version 1.
+mutations failed closed. At that decision checkpoint, the two-group gate
+permitted the next bounded candidate but did not yet admit a receipt format or
+alter version 1.
 
-The next four-group schedule was planned but not proved. Generation completed
-in 16.28 seconds and produced an ignored 15,841-byte artifact containing three
-ordered precommitted `nv9/p128` groups plus one final `nv9/p128` group. Its
-SHA-256 is
-`0ff710c72a46d3681cb367581e2ff13bdace5e9ba4984eccfd94ed110580b17f`.
-No four-group or 26-group commitment/opening has been run.
+## Larger bounded candidates and final selection
+
+The four-group `nv9/p128` candidate completed the same real PCS micro-gate. It
+reduced opening time by 31.55 percent and framed proof bytes from 281,531 to
+82,580, and rejected all five mutations. Sampled peak RSS increased from
+294,174,720 to 386,842,624 bytes, or 31.50 percent, so it failed the 25 percent
+memory gate.
+
+A three-group candidate was then measured as a bounded fallback. It reduced
+opening time by 41.51 percent and framed proof bytes from 211,173 to 77,538,
+and rejected all five mutations. Sampled peak RSS increased from 260,177,920
+to 334,544,896 bytes, or 28.58 percent, so it also failed the memory gate.
+
+The accepted two-group geometry was regenerated for the real `nv14/p128`
+trace layout. The checked-in 13,502-byte schedule has SHA-256
+`1cd339f09114c2a941abbfb434ab795868866cb15485f83300d81cee7bf46e71`.
+Native receipt v2 therefore batches the 26 trace groups as 13 adjacent pairs.
+No 16,384-row SM83 proof or Pokémon Blue proof was run during this migration;
+the measurements above remain PCS micro-gates only.

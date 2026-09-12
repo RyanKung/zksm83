@@ -55,10 +55,10 @@ use crate::{
     ContinuityProof, ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START,
     ISA_OPERATION_BITS_START, ISA_OUTPUT_COUNT, ISA_TAKEN_TIMING, ISA_VALID, ISA_WRITE_BITS_START,
     IsaLookupError, IsaLookupProof, MemoryCommitment, MutableMemoryError, MutableMemoryProof,
-    NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField, NativeTraceError,
-    NativeTraceWitness, ProtocolLogCommitments, ProtocolLogError, ProtocolLogProof,
-    ROM_ADDRESS_BIT_COUNT, RomCommitment, RomLookupError, RomLookupProof, STATE_SCALAR_COUNT,
-    TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
+    NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField, NativeProtocolVersion,
+    NativeTraceError, NativeTraceWitness, ProtocolLogCommitments, ProtocolLogError,
+    ProtocolLogProof, ROM_ADDRESS_BIT_COUNT, RomCommitment, RomLookupError, RomLookupProof,
+    STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
     TRACE_AFTER_RAM_RTC_BITS_START, TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_SP_BITS_START,
     TRACE_AFTER_STATE_START, TRACE_BEFORE_CPU_BYTE_BITS_START, TRACE_BEFORE_PC_BITS_START,
     TRACE_BEFORE_RAM_RTC_BITS_START, TRACE_BEFORE_ROM_BANK_BITS_START, TRACE_BEFORE_SP_BITS_START,
@@ -70,8 +70,12 @@ use crate::{
     TRACE_ROM_SELECTOR_START, TRACE_ROM_VALUE_START, UniformError, UniformRelation,
     UniformRelationProof, WitnessCommitments, commit_witness, prove_continuity, prove_isa_lookup,
     prove_mutable_memory, prove_protocol_logs, prove_rom_lookup, prove_uniform_committed,
-    verify_continuity, verify_isa_lookup, verify_mutable_memory, verify_protocol_logs,
-    verify_rom_lookup, verify_uniform_committed,
+    verify_isa_lookup, verify_rom_lookup, verify_uniform_committed,
+};
+use crate::{
+    continuity::verify_continuity_for_protocol, isa_lookup::verify_isa_lookup_for_protocol,
+    logs::verify_protocol_logs_for_protocol, memory::verify_mutable_memory_for_protocol,
+    rom_lookup::verify_rom_lookup_for_protocol, uniform::verify_uniform_committed_for_protocol,
 };
 
 /// Number of relation slots; unused tail slots are canonical zero identities.
@@ -299,20 +303,52 @@ pub fn verify_native_memory_cpu(
     initial_memory: &MemoryCommitment,
     final_memory: &MemoryCommitment,
 ) -> Result<(), NativeCpuStructuralError> {
+    verify_native_memory_cpu_for_protocol(
+        NativeProtocolVersion::current(),
+        proof,
+        claim,
+        logs,
+        rom,
+        initial_memory,
+        final_memory,
+    )
+}
+
+pub(crate) fn verify_native_memory_cpu_for_protocol(
+    protocol: NativeProtocolVersion,
+    proof: &NativeMemoryCpuProof,
+    claim: &NativeExecutionClaim,
+    logs: &ProtocolLogCommitments,
+    rom: &RomCommitment,
+    initial_memory: &MemoryCommitment,
+    final_memory: &MemoryCommitment,
+) -> Result<(), NativeCpuStructuralError> {
     let relation = CpuStructuralRelation;
-    verify_uniform_committed(&relation, &proof.commitments, &proof.relation)?;
+    verify_uniform_committed_for_protocol(
+        protocol,
+        &relation,
+        &proof.commitments,
+        &proof.relation,
+    )?;
     let isa_layout = crate::trace::canonical_isa_lookup_columns()?;
-    verify_isa_lookup(isa_layout, &proof.commitments, &proof.isa_lookup)?;
+    verify_isa_lookup_for_protocol(protocol, isa_layout, &proof.commitments, &proof.isa_lookup)?;
     let rom_layout = crate::trace::canonical_rom_lookup_columns()?;
-    verify_rom_lookup(rom_layout, rom, &proof.commitments, &proof.rom_lookup)?;
-    verify_mutable_memory(
+    verify_rom_lookup_for_protocol(
+        protocol,
+        rom_layout,
+        rom,
+        &proof.commitments,
+        &proof.rom_lookup,
+    )?;
+    verify_mutable_memory_for_protocol(
+        protocol,
         &proof.memory,
         &proof.commitments,
         initial_memory,
         final_memory,
     )?;
-    verify_continuity(&proof.continuity, &proof.commitments, claim)?;
-    verify_protocol_logs(&proof.logs, &proof.commitments, logs, claim)?;
+    verify_continuity_for_protocol(protocol, &proof.continuity, &proof.commitments, claim)?;
+    verify_protocol_logs_for_protocol(protocol, &proof.logs, &proof.commitments, logs, claim)?;
     Ok(())
 }
 

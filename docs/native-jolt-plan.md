@@ -17,6 +17,7 @@ execution semantics used to construct witness rows.
 | M4 ROM, RAM, and MBC3 | complete | ordered memory and mapper relations share the segment proof |
 | M5 DMG devices | complete | timer, interrupt, serial, APU, PPU, DMA, joypad, and save state are constrained |
 | M6 receipt protocol | complete | bounded canonical stream, independent verifier, resumable prover, and exact segment chain pass |
+| M6b PCS-batched receipt v2 | implementation complete; proof gate deferred | 13 pinned pair openings, v2-only generation/recovery, and v1 read-only verification are implemented; the expensive end-to-end v2 receipt proof was intentionally not run |
 | M7 Pokémon Blue and cutover | in progress | native-only dependency cutover is complete; the full declared path and reproducible final measurements must pass |
 
 The M0 opening proves only that the pinned Akita PCS can be consumed and
@@ -37,13 +38,16 @@ negative leakage tests, and review exist.
 | Field/config | `fp128::DenseBounded` |
 | Fiat-Shamir transcript | Blake2b |
 | M0 single-column schedule SHA-256 | `c2098502e4c976a6a6cf687e4f70acfcb818372e2fbd589bff7b18e8decfa9cf` |
-| Native relation schedule SHA-256 | `e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646` |
+| Native v1 relation schedule SHA-256 | `e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646` |
+| Native v2 pair schedule SHA-256 | `1cd339f09114c2a941abbfb434ab795868866cb15485f83300d81cee7bf46e71` |
+| Native v2 auxiliary schedule SHA-256 | `e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646` |
 | Fixed ISA table schedule SHA-256 | `3a8bbab5196d9233434abf33552cd7fc5637c74f0f76cea66cf247eddb8e7287` |
 | One-MiB ROM schedule SHA-256 | `141f4ffaf9b1546351a35582352a6337b2855aab3d77cd456bfe30241d4c40af` |
 | 128-KiB memory schedule SHA-256 | `8292b771966f1e30f7919796f5ebad3b6327686b7be61a4c778cd4972719ef15` |
 | Protocol-log schedule SHA-256 | `2dba5b6d53ca57eaee58c872ceba3cdf6c7dbfe522162144577e71cadf543a80` |
 | Fixed ISA table commitment SHA-256 | `fc4afaeb9c3d6a7dc063e2927caee773ae4a29f3c16e7d3f1aa5f266ea3f9c9a` |
-| Protocol ID | `zksm83-native-jolt-akita-v1` |
+| Current protocol ID | `zksm83-native-jolt-akita-v2` |
+| Verification-only protocol ID | `zksm83-native-jolt-akita-v1` |
 | Privacy | transparent, not witness-hiding |
 
 The current Jolt Git workspace cannot be used as a normal downstream
@@ -53,7 +57,7 @@ the exact Akita PCS revision directly. Jolt relation, claim, and verifier code
 is introduced only at explicit crate boundaries in later milestones; the SDK
 and RV64 tracer remain out of the dependency graph.
 
-The six checked-in schedules are verifier-relevant protocol parameters, not
+The seven checked-in schedules are verifier-relevant protocol parameters, not
 generated proof fixtures. The upstream one-column catalog remains the M0
 supply-chain baseline. Native relations use a project-generated catalog that
 admits exactly one `14 variables x 128 polynomials` layout. Logical columns are
@@ -65,7 +69,10 @@ fifth final-only catalog admits `17 variables x 1 polynomial` for each
 128-KiB mutable-memory value, timestamp, or inverse-limb column. The sixth
 catalog admits exactly `17 variables x 128 polynomials` for the four
 fixed-capacity protocol logs and their inverse witnesses. All other `.aks`
-files remain ignored.
+files remain ignored. The seventh schedule admits one ordered precommitted plus
+one final `14 variables x 128 polynomials` group. V2 partitions the 26 trace
+groups into 13 fixed adjacent pairs; v1 retains 26 independent openings only
+inside its verification branch.
 
 The fixed SM83 ISA table is now materialized independently of the legacy audit
 crate. It contains all 512 primary/CB addresses, marks exactly 501 as defined,
@@ -247,7 +254,8 @@ memory, input-prefix, and typed endpoint checks.
 
 ## Canonical public statement
 
-The outer receipt starts with fixed magic and version 1. Its statement contains
+The outer receipt starts with version-selected fixed magic. New provers emit
+`ZKSM83R2` and version 2; `ZKSM83R1` remains verification-only. Its statement contains
 exactly:
 
 ```text
@@ -301,7 +309,7 @@ composed_akita_proof
 `active_row_count + padded_row_count` equals the frozen 16,384-row capacity.
 Padding rows are constrained inactive identities and cannot consume cycles, bus
 events, ISA rows, input, output, or memory operations. There is no IVC or
-recursive segment folding in version 1. A receipt is accepted only after the
+recursive segment folding in either version. A receipt is accepted only after the
 independent verifier checks every segment proof and exact equality of all
 adjacent boundaries.
 

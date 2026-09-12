@@ -4,15 +4,16 @@ use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use thiserror::Error;
 
 use crate::{
-    AKITA_ROM_SCHEDULE_SHA256, AkitaWorkerError, NativeField, PROTOCOL_ID, TRACE_BUS_SLOTS,
-    UNIFORM_NUM_VARIABLES,
+    AKITA_ROM_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeProtocolVersion,
+    TRACE_BUS_SLOTS, UNIFORM_NUM_VARIABLES,
     pcs::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
         prove_opening, verify_opening,
     },
     sumcheck::{ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof},
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_opening, verify_witness_opening,
+        CommittedWitness, WitnessCommitments, prove_witness_opening,
+        verify_witness_opening_for_protocol,
     },
 };
 
@@ -24,6 +25,7 @@ pub const ROM_ADDRESS_BIT_COUNT: usize = 20;
 const ROM_TABLE_NUM_VARIABLES: usize = ROM_ADDRESS_BIT_COUNT;
 const ROM_LOOKUP_FACTOR_COUNT: usize = ROM_ADDRESS_BIT_COUNT + 2;
 const ROM_LOOKUP_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-rom-shout/v1";
+const ROM_LOOKUP_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-rom-shout/v2";
 const ROM_COMMITMENT_DOMAIN: &[u8] = b"zksm83/native-rom-commitment/v1";
 const ROM_OPENING_DOMAIN: &[u8] = b"zksm83-native-rom-opening/v1";
 const ROM_SCHEDULE_FILE: &[u8] =
@@ -242,7 +244,23 @@ pub fn verify_rom_lookup(
     trace_commitments: &WitnessCommitments,
     proof: &RomLookupProof,
 ) -> Result<(), RomLookupError> {
-    on_worker(|| verify_on_worker(layout, rom, trace_commitments, proof))
+    verify_rom_lookup_for_protocol(
+        NativeProtocolVersion::current(),
+        layout,
+        rom,
+        trace_commitments,
+        proof,
+    )
+}
+
+pub(crate) fn verify_rom_lookup_for_protocol(
+    protocol: NativeProtocolVersion,
+    layout: RomLookupColumns,
+    rom: &RomCommitment,
+    trace_commitments: &WitnessCommitments,
+    proof: &RomLookupProof,
+) -> Result<(), RomLookupError> {
+    on_worker(|| verify_on_worker(protocol, layout, rom, trace_commitments, proof))
 }
 
 fn prove_on_worker(
@@ -252,8 +270,9 @@ fn prove_on_worker(
 ) -> Result<RomLookupProof, RomLookupError> {
     layout.validate(witness.commitments().column_count())?;
     rom.commitment.validate()?;
-    let descriptor = instance_descriptor(layout, &rom.commitment, witness.commitments())?;
-    let mut transcript = lookup_transcript(&descriptor, TranscriptSide::Prover);
+    let protocol = NativeProtocolVersion::current();
+    let descriptor = instance_descriptor(protocol, layout, &rom.commitment, witness.commitments())?;
+    let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let coefficients = slot_coefficients(&mut transcript)?;
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"rom-cycle-point");
     let mixed_trace = mix_columns(witness.field_columns(), &layout.values, &coefficients)?;
@@ -332,6 +351,7 @@ fn prove_on_worker(
 }
 
 fn verify_on_worker(
+    protocol: NativeProtocolVersion,
     layout: RomLookupColumns,
     rom: &RomCommitment,
     trace_commitments: &WitnessCommitments,
@@ -339,8 +359,8 @@ fn verify_on_worker(
 ) -> Result<(), RomLookupError> {
     layout.validate(trace_commitments.column_count())?;
     rom.validate()?;
-    let descriptor = instance_descriptor(layout, rom, trace_commitments)?;
-    let mut transcript = lookup_transcript(&descriptor, TranscriptSide::Verifier);
+    let descriptor = instance_descriptor(protocol, layout, rom, trace_commitments)?;
+    let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Verifier);
     let coefficients = slot_coefficients(&mut transcript)?;
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"rom-cycle-point");
     transcript.append_field(b"rom-claimed-output", &proof.claimed_output);
@@ -365,7 +385,8 @@ fn verify_on_worker(
         ROM_LOOKUP_FACTOR_COUNT,
         &mut transcript,
     )?;
-    verify_witness_opening(
+    verify_witness_opening_for_protocol(
+        protocol,
         trace_commitments,
         &cycle_point,
         &proof.trace_cycle_values,
@@ -378,7 +399,8 @@ fn verify_on_worker(
         &coefficients,
         proof.claimed_output,
     )?;
-    verify_witness_opening(
+    verify_witness_opening_for_protocol(
+        protocol,
         trace_commitments,
         &address_point,
         &proof.trace_address_values,
@@ -529,12 +551,13 @@ fn slot_coefficients(
 }
 
 fn instance_descriptor(
+    protocol: NativeProtocolVersion,
     layout: RomLookupColumns,
     rom: &RomCommitment,
     trace: &WitnessCommitments,
 ) -> Result<Vec<u8>, RomLookupError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
     push_bytes(&mut descriptor, AKITA_ROM_SCHEDULE_SHA256.as_bytes())?;
     push_usize(&mut descriptor, ROM_IMAGE_BYTES)?;
     push_indices(&mut descriptor, &layout.selectors)?;
@@ -543,7 +566,7 @@ fn instance_descriptor(
     }
     push_indices(&mut descriptor, &layout.values)?;
     push_bytes(&mut descriptor, &rom.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &trace.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
     Ok(descriptor)
 }
 
@@ -552,10 +575,18 @@ enum TranscriptSide {
     Verifier,
 }
 
-fn lookup_transcript(descriptor: &[u8], side: TranscriptSide) -> AkitaTranscript<NativeField> {
+fn lookup_transcript(
+    protocol: NativeProtocolVersion,
+    descriptor: &[u8],
+    side: TranscriptSide,
+) -> AkitaTranscript<NativeField> {
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => ROM_LOOKUP_TRANSCRIPT_DOMAIN,
+        NativeProtocolVersion::V2 => ROM_LOOKUP_TRANSCRIPT_DOMAIN_V2,
+    };
     let mut transcript = match side {
-        TranscriptSide::Prover => AkitaTranscript::unbound_prover(ROM_LOOKUP_TRANSCRIPT_DOMAIN),
-        TranscriptSide::Verifier => AkitaTranscript::unbound_verifier(ROM_LOOKUP_TRANSCRIPT_DOMAIN),
+        TranscriptSide::Prover => AkitaTranscript::unbound_prover(domain),
+        TranscriptSide::Verifier => AkitaTranscript::unbound_verifier(domain),
     };
     transcript.bind_instance_bytes(descriptor);
     transcript

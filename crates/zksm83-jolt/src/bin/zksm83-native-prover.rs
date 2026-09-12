@@ -18,10 +18,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
 use zksm83_jolt::{
-    CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MemoryCommitment, NativeBoundary,
+    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, CommittedMemory,
+    MAX_NATIVE_SEGMENT_COUNT, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
     NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness, NativeTraceError,
-    NativeTraceWitness, UNIFORM_ROW_COUNT, commit_memory, commit_rom, native_proof_phase_metrics,
-    verify_native_spool_reader,
+    NativeTraceWitness, PROTOCOL_ID, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
+    native_proof_phase_metrics, verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -29,8 +30,8 @@ use zksm83_memory::{
 use zksm83_trace::{TraceBuilder, TraceBuilderError};
 
 const EXPECTED_CHECKPOINT_SCHEMA: &str = "zksm83-trace-checkpoint/v7";
-const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v1";
-const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v1";
+const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v2";
+const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v2";
 const INPUT_SCHEDULE_SCHEMA: &str = "zksm83-input-schedule/v1";
 const ROM_BYTE_LENGTH: usize = 1 << 20;
 const MAX_ROM_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -118,6 +119,10 @@ struct InputSegment {
 #[derive(Debug, Deserialize, Serialize)]
 struct ProverProgress {
     schema: String,
+    receipt_version: u64,
+    protocol_id: String,
+    trace_schedule_sha256: String,
+    auxiliary_schedule_sha256: String,
     rom_sha256: String,
     input_sha256: String,
     expected_checkpoint_sha256: String,
@@ -133,6 +138,10 @@ struct ProverProgress {
 struct ProgressEvidence {
     schema: &'static str,
     verified: bool,
+    receipt_version: u64,
+    protocol_id: &'static str,
+    trace_schedule_sha256: &'static str,
+    auxiliary_schedule_sha256: &'static str,
     rom_sha256: String,
     input_sha256: String,
     expected_checkpoint_sha256: String,
@@ -297,6 +306,10 @@ fn inspect_progress(
     let evidence = ProgressEvidence {
         schema: PROGRESS_EVIDENCE_SCHEMA,
         verified: true,
+        receipt_version: NATIVE_RECEIPT_VERSION,
+        protocol_id: PROTOCOL_ID,
+        trace_schedule_sha256: AKITA_SCHEDULE_SHA256,
+        auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256,
         rom_sha256: hex::encode(identities.rom),
         input_sha256: hex::encode(identities.input),
         expected_checkpoint_sha256: hex::encode(identities.expected),
@@ -341,7 +354,11 @@ fn preflight(
     let memory_bytes = hex::decode(&expected.memory_hex)?;
     let memory_witness_root = MemoryImage::from_checkpoint_bytes(memory_bytes)?.root();
     println!(
-        "preflight=true steps={} segment_capacity={} segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
+        "preflight=true receipt_version={} protocol_id={} trace_schedule_sha256={} auxiliary_schedule_sha256={} steps={} segment_capacity={} segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
+        NATIVE_RECEIPT_VERSION,
+        PROTOCOL_ID,
+        AKITA_SCHEDULE_SHA256,
+        AKITA_AUXILIARY_SCHEDULE_SHA256,
         expected.completed_steps,
         capacity,
         segment_count,
@@ -574,6 +591,10 @@ fn write_progress(
 ) -> Result<(), CliError> {
     let progress = ProverProgress {
         schema: PROGRESS_SCHEMA.to_owned(),
+        receipt_version: NATIVE_RECEIPT_VERSION,
+        protocol_id: PROTOCOL_ID.to_owned(),
+        trace_schedule_sha256: AKITA_SCHEDULE_SHA256.to_owned(),
+        auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256.to_owned(),
         rom_sha256: hex::encode(identities.rom),
         input_sha256: hex::encode(identities.input),
         expected_checkpoint_sha256: hex::encode(identities.expected),
@@ -607,7 +628,9 @@ fn finalize(args: &Args, prover: FileProver<'_>) -> Result<(), CliError> {
         .map_err(|source| io_error("publish", &args.receipt, source))?;
     write_new(&args.statement, &statement.to_bytes()?)?;
     println!(
-        "complete statement_id={} segments={} steps={}",
+        "complete receipt_version={} protocol_id={} statement_id={} segments={} steps={}",
+        statement.protocol().code(),
+        PROTOCOL_ID,
         hex::encode(statement.statement_id()),
         statement.segment_count(),
         statement.relation_step_count()
@@ -682,6 +705,13 @@ fn validate_progress(
 ) -> Result<(), CliError> {
     if progress.schema != PROGRESS_SCHEMA {
         return Err(CliError::ProgressMismatch("schema"));
+    }
+    if progress.receipt_version != NATIVE_RECEIPT_VERSION
+        || progress.protocol_id != PROTOCOL_ID
+        || progress.trace_schedule_sha256 != AKITA_SCHEDULE_SHA256
+        || progress.auxiliary_schedule_sha256 != AKITA_AUXILIARY_SCHEDULE_SHA256
+    {
+        return Err(CliError::ProgressMismatch("protocol identity"));
     }
     if progress.segment_capacity != UNIFORM_ROW_COUNT {
         return Err(CliError::ProgressMismatch("segment capacity"));
@@ -849,127 +879,5 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> CliError
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, InputIdentities,
-        PROGRESS_SCHEMA, ProverProgress, ROM_BYTE_LENGTH, SpoolRecovery, UNIFORM_ROW_COUNT,
-        spool_recovery, validate_endpoint, validate_expected_artifact, validate_progress,
-    };
-    use zksm83_core::{
-        CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3State, VmState,
-    };
-    use zksm83_memory::{CommitmentRoot, LogAccumulator, LogKind, MemoryImage, RomImage};
-
-    #[test]
-    fn legacy_roots_do_not_override_exact_native_endpoint_checks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (expected, actual, memory, rom, input) = fixture()?;
-        validate_endpoint(actual, &memory, &rom, &input, &expected)?;
-
-        let mut changed_memory = memory.clone();
-        let byte = changed_memory
-            .get_mut(0)
-            .ok_or_else(|| std::io::Error::other("missing memory byte"))?;
-        *byte ^= 1;
-        assert!(validate_endpoint(actual, &changed_memory, &rom, &input, &expected).is_err());
-
-        let changed_input = [8_u8];
-        assert!(validate_endpoint(actual, &memory, &rom, &changed_input, &expected).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn preflight_rejects_a_short_rom() -> Result<(), Box<dyn std::error::Error>> {
-        let (expected, _, _, _, _) = fixture()?;
-        assert!(validate_expected_artifact(&expected, &[0]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn spool_length_policy_rejects_loss_and_discards_only_uncheckpointed_tail() {
-        assert!(matches!(spool_recovery(8, 8), Ok(SpoolRecovery::Exact)));
-        assert!(matches!(
-            spool_recovery(9, 8),
-            Ok(SpoolRecovery::DiscardUncheckpointedTail)
-        ));
-        assert!(matches!(
-            spool_recovery(7, 8),
-            Err(CliError::ProgressMismatch(
-                "spool is shorter than checkpoint"
-            ))
-        ));
-    }
-
-    #[test]
-    fn progress_schema_capacity_and_input_identities_are_exact()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_, state, memory, _, _) = fixture()?;
-        let identities = InputIdentities {
-            rom: [1; 32],
-            input: [2; 32],
-            expected: [3; 32],
-        };
-        let mut progress = ProverProgress {
-            schema: PROGRESS_SCHEMA.to_owned(),
-            rom_sha256: hex::encode(identities.rom),
-            input_sha256: hex::encode(identities.input),
-            expected_checkpoint_sha256: hex::encode(identities.expected),
-            segment_capacity: UNIFORM_ROW_COUNT,
-            segment_count: 1,
-            relation_step_count: 1,
-            spool_bytes: 1,
-            state,
-            memory_hex: hex::encode(memory),
-        };
-        validate_progress(&progress, identities)?;
-
-        progress.schema = "unsupported".to_owned();
-        assert!(validate_progress(&progress, identities).is_err());
-        progress.schema = PROGRESS_SCHEMA.to_owned();
-        progress.segment_capacity = UNIFORM_ROW_COUNT + 1;
-        assert!(validate_progress(&progress, identities).is_err());
-        progress.segment_capacity = UNIFORM_ROW_COUNT;
-        progress.input_sha256 = hex::encode([9; 32]);
-        assert!(validate_progress(&progress, identities).is_err());
-        Ok(())
-    }
-
-    fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
-        let rom = vec![0_u8; ROM_BYTE_LENGTH];
-        let rom_root = RomImage::new(rom.clone())?.root();
-        let memory_image = MemoryImage::zeroed()?;
-        let memory = memory_image.checkpoint_bytes();
-        let input = vec![7_u8];
-        let input_log = LogAccumulator::commit(LogKind::Input, &input)?;
-        let output_log = LogAccumulator::empty(LogKind::Output);
-        let cpu = CpuState::dmg_post_boot_initial();
-        let devices = DmgDeviceState::dmg_post_boot();
-        let actual = VmState::from_profile_parts(
-            MachineContext::new(MachineProfile::DmgPostBootMbc3V1, devices),
-            cpu,
-            Mbc3State::profile_initial(),
-            rom_root,
-            memory_image.root(),
-            input_log,
-            output_log,
-        )?;
-        let expected = ExpectedCheckpoint {
-            schema: EXPECTED_CHECKPOINT_SCHEMA.to_owned(),
-            completed_steps: 1,
-            state: ExpectedState {
-                profile: MachineProfile::DmgPostBootMbc3V1,
-                cpu,
-                mbc3: Mbc3State::profile_initial(),
-                dmg_devices: devices,
-                _legacy_rom_root: CommitmentRoot::zero(),
-                _legacy_memory_root: CommitmentRoot::zero(),
-                input_log,
-                output_log,
-            },
-            memory_hex: hex::encode(&memory),
-        };
-        Ok((expected, actual, memory, rom, input))
-    }
-
-    type Fixture = (ExpectedCheckpoint, VmState, Vec<u8>, Vec<u8>, Vec<u8>);
-}
+#[path = "zksm83-native-prover/tests.rs"]
+mod tests;

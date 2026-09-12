@@ -12,13 +12,13 @@ use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
 
 use crate::{
-    AKITA_MEMORY_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeTraceWitness, PROTOCOL_ID,
-    TRACE_MEMORY_TIMESTAMP_BITS, UniformError, WitnessCommitments,
+    AKITA_MEMORY_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeProtocolVersion,
+    NativeTraceWitness, TRACE_MEMORY_TIMESTAMP_BITS, UniformError, WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        verify_uniform_composite,
+        verify_uniform_composite_for_protocol,
     },
 };
 
@@ -179,10 +179,12 @@ pub fn prove_mutable_memory(
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
 ) -> Result<MutableMemoryProof, MutableMemoryError> {
+    let protocol = NativeProtocolVersion::current();
     initial.commitment.validate()?;
     final_memory.commitment.validate()?;
     let final_timestamps = commit_u64_columns(&[trace.final_memory_timestamps().to_vec()])?;
     let phase_one = phase_one_descriptor(
+        protocol,
         trace_witness.commitments(),
         &initial.commitment,
         &final_memory.commitment,
@@ -199,6 +201,7 @@ pub fn prove_mutable_memory(
     let event_relation = prove_uniform_composite(&relation, trace_witness, &trace_inverses)?;
     let clock = clock::prove(trace_witness, &phase_one)?;
     let full = full_descriptor(
+        protocol,
         &phase_one,
         trace_inverses.commitments(),
         initial_inverses.commitments(),
@@ -233,22 +236,46 @@ pub fn verify_mutable_memory(
     initial: &MemoryCommitment,
     final_memory: &MemoryCommitment,
 ) -> Result<(), MutableMemoryError> {
+    verify_mutable_memory_for_protocol(
+        NativeProtocolVersion::current(),
+        proof,
+        trace,
+        initial,
+        final_memory,
+    )
+}
+
+pub(crate) fn verify_mutable_memory_for_protocol(
+    protocol: NativeProtocolVersion,
+    proof: &MutableMemoryProof,
+    trace: &WitnessCommitments,
+    initial: &MemoryCommitment,
+    final_memory: &MemoryCommitment,
+) -> Result<(), MutableMemoryError> {
     initial.validate()?;
     final_memory.validate()?;
     proof.final_timestamps.validate(MEMORY_LAYOUT)?;
     proof.initial_inverses.validate(MEMORY_LAYOUT)?;
     proof.final_inverses.validate(MEMORY_LAYOUT)?;
-    let phase_one = phase_one_descriptor(trace, initial, final_memory, &proof.final_timestamps)?;
+    let phase_one = phase_one_descriptor(
+        protocol,
+        trace,
+        initial,
+        final_memory,
+        &proof.final_timestamps,
+    )?;
     let challenges = challenges(&phase_one)?;
     let relation = event::MemoryEventRelation::new(challenges);
-    verify_uniform_composite(
+    verify_uniform_composite_for_protocol(
+        protocol,
         &relation,
         trace,
         &proof.trace_inverses,
         &proof.event_relation,
     )?;
-    clock::verify(trace, &phase_one, &proof.clock)?;
+    clock::verify(protocol, trace, &phase_one, &proof.clock)?;
     let full = full_descriptor(
+        protocol,
         &phase_one,
         &proof.trace_inverses,
         &proof.initial_inverses,
@@ -265,6 +292,7 @@ pub fn verify_mutable_memory(
         &proof.boundary,
     )?;
     sum::verify(
+        protocol,
         &proof.trace_inverses,
         &proof.initial_inverses,
         &proof.final_inverses,
@@ -299,15 +327,16 @@ fn commit_u64_columns(values: &[Vec<u64>]) -> Result<CommittedMemoryColumns, Mut
 }
 
 fn phase_one_descriptor(
+    protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
     initial: &MemoryCommitment,
     final_memory: &MemoryCommitment,
     timestamps: &ColumnCommitments,
 ) -> Result<Vec<u8>, MutableMemoryError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
     push_bytes(&mut descriptor, AKITA_MEMORY_SCHEDULE_SHA256.as_bytes())?;
-    push_bytes(&mut descriptor, &trace.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
     push_bytes(&mut descriptor, &initial.canonical_bytes()?)?;
     push_bytes(&mut descriptor, &final_memory.canonical_bytes()?)?;
     push_bytes(&mut descriptor, &timestamps.canonical_bytes(MEMORY_LAYOUT)?)?;
@@ -315,6 +344,7 @@ fn phase_one_descriptor(
 }
 
 fn full_descriptor(
+    protocol: NativeProtocolVersion,
     phase_one: &[u8],
     trace_inverses: &WitnessCommitments,
     initial_inverses: &ColumnCommitments,
@@ -322,7 +352,10 @@ fn full_descriptor(
 ) -> Result<Vec<u8>, MutableMemoryError> {
     let mut descriptor = Vec::new();
     push_bytes(&mut descriptor, phase_one)?;
-    push_bytes(&mut descriptor, &trace_inverses.canonical_bytes()?)?;
+    push_bytes(
+        &mut descriptor,
+        &trace_inverses.canonical_bytes_for(protocol)?,
+    )?;
     push_bytes(
         &mut descriptor,
         &initial_inverses.canonical_bytes(MEMORY_LAYOUT)?,

@@ -2,11 +2,26 @@
 
 ## Versioned inputs
 
-The repository tracks Rust source, manifests, documentation, and the six
+The repository tracks Rust source, manifests, documentation, and the seven
 verifier-relevant Akita schedules documented under
 `crates/zksm83-jolt/protocol/`. Default tests must run from a fresh clone
 without downloading or locating cartridge images, saves, input schedules,
 checkpoints, traces, receipts, statements, or benchmark output.
+
+## Native receipt v2
+
+New prover output uses `zksm83-native-jolt-akita-v2`, `ZKSM83R2` receipts,
+`ZKSM83S2` statements, and the pinned `nv14/p128` pair schedule. The 3,292
+logical trace columns form 26 commitments and 13 adjacent-pair openings.
+Auxiliary trace planes continue to use the pinned single-group schedule, and
+both schedule digests are bound by the v2 backend identity and resumable
+checkpoint. Existing v1 receipts are verification-only; v1 progress files and
+raw spools are not resumable by the v2 prover.
+
+The migration validation deliberately excludes a 16,384-row proof and the
+611-segment Pokémon Blue run. The accepted two-group result and rejected
+three-/four-group candidates are recorded in
+[`pcs-v2-evaluation.md`](pcs-v2-evaluation.md).
 
 ## Local-only data
 

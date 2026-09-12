@@ -4,19 +4,22 @@ use crate::{NativeMemoryCpuProof, NativeStateBoundary};
 
 use super::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
-    MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
-    NATIVE_RECEIPT_VERSION, NativeBoundary, NativeReceipt, NativeReceiptError,
-    NativeSegmentReceipt, NativeStatement, ProtocolLogCounts, ProtocolLogIdentities,
+    MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES, NativeBoundary,
+    NativeReceipt, NativeReceiptError, NativeSegmentReceipt, NativeStatement, ProtocolLogCounts,
+    ProtocolLogIdentities,
 };
+use crate::NativeProtocolVersion;
 use crate::wire::{Wire, WireError, WireReader, WireWriter};
 
-pub(super) const RECEIPT_MAGIC: &[u8; 8] = b"ZKSM83R1";
-const STATEMENT_MAGIC: &[u8; 8] = b"ZKSM83S1";
+pub(super) const RECEIPT_MAGIC_V1: &[u8; 8] = b"ZKSM83R1";
+pub(super) const RECEIPT_MAGIC_V2: &[u8; 8] = b"ZKSM83R2";
+const STATEMENT_MAGIC_V1: &[u8; 8] = b"ZKSM83S1";
+const STATEMENT_MAGIC_V2: &[u8; 8] = b"ZKSM83S2";
 
 pub(super) fn encode_statement(statement: &NativeStatement) -> Result<Vec<u8>, NativeReceiptError> {
     let mut writer = WireWriter::new();
-    writer.raw(STATEMENT_MAGIC);
-    statement.encode(&mut writer).map_err(map_wire)?;
+    writer.raw(statement_magic(statement.protocol));
+    encode_statement_fields(statement, &mut writer).map_err(map_wire)?;
     let bytes = writer.finish();
     ensure_size(bytes, MAX_NATIVE_STATEMENT_BYTES)
 }
@@ -28,18 +31,19 @@ pub(super) fn decode_statement(bytes: &[u8]) -> Result<NativeStatement, NativeRe
         ));
     }
     let mut reader = WireReader::new(bytes);
-    if reader.fixed::<8>().map_err(map_wire)? != *STATEMENT_MAGIC {
-        return Err(NativeReceiptError::Wire("statement magic".to_owned()));
-    }
-    let statement = NativeStatement::decode(&mut reader).map_err(map_wire)?;
+    let protocol = protocol_from_statement_magic(reader.fixed().map_err(map_wire)?)?;
+    let statement = decode_statement_fields(protocol, &mut reader).map_err(map_wire)?;
     reader.finish().map_err(map_wire)?;
     Ok(statement)
 }
 
 pub(super) fn encode_receipt(receipt: &NativeReceipt) -> Result<Vec<u8>, NativeReceiptError> {
+    if receipt.statement.protocol != receipt.version {
+        return Err(NativeReceiptError::UnsupportedBackend);
+    }
     let mut writer = WireWriter::new();
-    writer.raw(RECEIPT_MAGIC);
-    writer.u64(receipt.version);
+    writer.raw(receipt_magic(receipt.version));
+    writer.u64(receipt.version.code());
     writer
         .blob(&encode_statement(&receipt.statement)?)
         .map_err(map_wire)?;
@@ -57,14 +61,16 @@ pub(super) fn decode_receipt(bytes: &[u8]) -> Result<NativeReceipt, NativeReceip
         return Err(NativeReceiptError::Wire("receipt length limit".to_owned()));
     }
     let mut reader = WireReader::new(bytes);
-    if reader.fixed::<8>().map_err(map_wire)? != *RECEIPT_MAGIC {
-        return Err(NativeReceiptError::Wire("receipt magic".to_owned()));
-    }
-    let version = reader.u64().map_err(map_wire)?;
-    if version != NATIVE_RECEIPT_VERSION {
+    let protocol = protocol_from_receipt_magic(reader.fixed().map_err(map_wire)?)?;
+    let version = NativeProtocolVersion::from_code(reader.u64().map_err(map_wire)?)
+        .ok_or(NativeReceiptError::UnsupportedBackend)?;
+    if version != protocol {
         return Err(NativeReceiptError::UnsupportedBackend);
     }
     let statement = decode_statement(reader.blob(MAX_NATIVE_STATEMENT_BYTES).map_err(map_wire)?)?;
+    if statement.protocol != protocol {
+        return Err(NativeReceiptError::UnsupportedBackend);
+    }
     let rom = decode_rom(
         reader
             .blob(MAX_NATIVE_ROM_COMMITMENT_BYTES)
@@ -84,6 +90,40 @@ pub(super) fn decode_receipt(bytes: &[u8]) -> Result<NativeReceipt, NativeReceip
         rom,
         segments,
     })
+}
+
+pub(super) const fn receipt_magic(protocol: NativeProtocolVersion) -> &'static [u8; 8] {
+    match protocol {
+        NativeProtocolVersion::V1 => RECEIPT_MAGIC_V1,
+        NativeProtocolVersion::V2 => RECEIPT_MAGIC_V2,
+    }
+}
+
+const fn statement_magic(protocol: NativeProtocolVersion) -> &'static [u8; 8] {
+    match protocol {
+        NativeProtocolVersion::V1 => STATEMENT_MAGIC_V1,
+        NativeProtocolVersion::V2 => STATEMENT_MAGIC_V2,
+    }
+}
+
+pub(super) fn protocol_from_receipt_magic(
+    magic: [u8; 8],
+) -> Result<NativeProtocolVersion, NativeReceiptError> {
+    match &magic {
+        value if value == RECEIPT_MAGIC_V1 => Ok(NativeProtocolVersion::V1),
+        value if value == RECEIPT_MAGIC_V2 => Ok(NativeProtocolVersion::V2),
+        _ => Err(NativeReceiptError::Wire("receipt magic".to_owned())),
+    }
+}
+
+fn protocol_from_statement_magic(
+    magic: [u8; 8],
+) -> Result<NativeProtocolVersion, NativeReceiptError> {
+    match &magic {
+        value if value == STATEMENT_MAGIC_V1 => Ok(NativeProtocolVersion::V1),
+        value if value == STATEMENT_MAGIC_V2 => Ok(NativeProtocolVersion::V2),
+        _ => Err(NativeReceiptError::Wire("statement magic".to_owned())),
+    }
 }
 
 pub(super) fn encode_rom(commitment: &crate::RomCommitment) -> Result<Vec<u8>, NativeReceiptError> {
@@ -234,37 +274,42 @@ impl Wire for NativeBoundary {
     }
 }
 
-impl Wire for NativeStatement {
-    fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
-        writer.raw(&self.backend_digest);
-        writer.u64(self.machine_profile);
-        writer.u64(self.rom_byte_length);
-        self.rom.encode(writer)?;
-        self.initial.encode(writer)?;
-        self.final_boundary.encode(writer)?;
-        writer.u64(self.segment_count);
-        writer.u64(self.relation_step_count);
-        writer.u64(self.m_cycle_count);
-        self.logs.encode(writer)?;
-        writer.raw(&self.statement_id);
-        Ok(())
-    }
+fn encode_statement_fields(
+    statement: &NativeStatement,
+    writer: &mut WireWriter,
+) -> Result<(), WireError> {
+    writer.raw(&statement.backend_digest);
+    writer.u64(statement.machine_profile);
+    writer.u64(statement.rom_byte_length);
+    statement.rom.encode(writer)?;
+    statement.initial.encode(writer)?;
+    statement.final_boundary.encode(writer)?;
+    writer.u64(statement.segment_count);
+    writer.u64(statement.relation_step_count);
+    writer.u64(statement.m_cycle_count);
+    statement.logs.encode(writer)?;
+    writer.raw(&statement.statement_id);
+    Ok(())
+}
 
-    fn decode(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        Ok(Self {
-            backend_digest: reader.fixed()?,
-            machine_profile: reader.u64()?,
-            rom_byte_length: reader.u64()?,
-            rom: CommitmentIdentity::decode(reader)?,
-            initial: NativeBoundary::decode(reader)?,
-            final_boundary: NativeBoundary::decode(reader)?,
-            segment_count: reader.u64()?,
-            relation_step_count: reader.u64()?,
-            m_cycle_count: reader.u64()?,
-            logs: ProtocolLogCounts::decode(reader)?,
-            statement_id: reader.fixed()?,
-        })
-    }
+fn decode_statement_fields(
+    protocol: NativeProtocolVersion,
+    reader: &mut WireReader<'_>,
+) -> Result<NativeStatement, WireError> {
+    Ok(NativeStatement {
+        protocol,
+        backend_digest: reader.fixed()?,
+        machine_profile: reader.u64()?,
+        rom_byte_length: reader.u64()?,
+        rom: CommitmentIdentity::decode(reader)?,
+        initial: NativeBoundary::decode(reader)?,
+        final_boundary: NativeBoundary::decode(reader)?,
+        segment_count: reader.u64()?,
+        relation_step_count: reader.u64()?,
+        m_cycle_count: reader.u64()?,
+        logs: ProtocolLogCounts::decode(reader)?,
+        statement_id: reader.fixed()?,
+    })
 }
 
 impl Wire for NativeSegmentReceipt {

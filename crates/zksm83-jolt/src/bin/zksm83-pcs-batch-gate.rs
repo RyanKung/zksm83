@@ -1,4 +1,4 @@
-//! Hard-timeout controller for the isolated two-group PCS batching experiment.
+//! Hard-timeout controller for the isolated multi-group PCS batching experiment.
 
 use std::{
     ffi::OsStr,
@@ -27,9 +27,9 @@ const WORKER_ENVIRONMENT: &str = "ZKSM83_PCS_BATCH_GATE_CHILD";
 const WORKER_ENVIRONMENT_VALUE: &str = "v1";
 
 #[derive(Debug, Parser)]
-#[command(about = "Bounded, non-protocol two-group Akita batching experiment")]
+#[command(about = "Bounded, non-protocol multi-group Akita batching experiment")]
 struct Arguments {
-    /// Locally generated nv9/p128 + nv9/p128 Akita schedule artifact.
+    /// Locally generated two- through four-group nv9/p128 Akita schedule artifact.
     #[arg(long)]
     candidate_schedule: PathBuf,
     /// Hard deadline for each child path; values above 30 are rejected.
@@ -296,8 +296,8 @@ fn max_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 fn acceptance_criteria(independent: &MeasuredPath, batched: &MeasuredPath) -> AcceptanceCriteria {
     let exact_claims_verified = independent.report.verified
         && batched.report.verified
-        && independent.report.opened_group_count == 2
-        && batched.report.opened_group_count == 2;
+        && independent.report.opened_group_count >= 2
+        && independent.report.opened_group_count == batched.report.opened_group_count;
     let tamper_matrix_passed = batched
         .report
         .tamper

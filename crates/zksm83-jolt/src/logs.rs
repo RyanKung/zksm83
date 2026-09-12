@@ -11,9 +11,9 @@ use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
 
 use crate::{
-    AKITA_LOG_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, AkitaWorkerError, ISA_PACKED_HIGH,
-    ISA_PACKED_LOW, NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField,
-    NativeTraceWitness, PROTOCOL_ID, STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_BEFORE_STATE_START,
+    AKITA_LOG_SCHEDULE_SHA256, AkitaWorkerError, ISA_PACKED_HIGH, ISA_PACKED_LOW,
+    NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField, NativeProtocolVersion,
+    NativeTraceWitness, STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_BEFORE_STATE_START,
     TRACE_BUS_KIND_BITS, TRACE_BUS_SLOT_WIDTH, TRACE_BUS_SLOTS, TRACE_BUS_START,
     TRACE_ISA_OUTPUT_START, UNIFORM_ROW_COUNT, UniformError, WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
@@ -43,6 +43,7 @@ const LOG_LAYOUT: PcsLayout = PcsLayout::new(
     b"zksm83-native-protocol-log-opening/v1",
 );
 const CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-protocol-log-challenges/v1";
+const CHALLENGE_DOMAIN_V2: &[u8] = b"zksm83-native-protocol-log-challenges/v2";
 
 const BUS_START: usize = 0;
 const BUS_WIDTH: usize = 9;
@@ -214,16 +215,23 @@ pub fn prove_protocol_logs(
     logs: &CommittedProtocolLogs,
     claim: &NativeExecutionClaim,
 ) -> Result<ProtocolLogProof, ProtocolLogError> {
+    let protocol = NativeProtocolVersion::current();
     claim.validate().map_err(|_| ProtocolLogError::Shape)?;
     logs.commitment.validate()?;
-    let phase_one = phase_one_descriptor(trace_witness.commitments(), &logs.commitment, claim)?;
-    let challenges = challenges(&phase_one)?;
+    let phase_one = phase_one_descriptor(
+        protocol,
+        trace_witness.commitments(),
+        &logs.commitment,
+        claim,
+    )?;
+    let challenges = challenges(protocol, &phase_one)?;
     let trace_inverse_values = trace_relation::inverse_columns(trace.columns(), challenges)?;
     let trace_inverses = crate::commit_witness(&trace_inverse_values)?;
     let table_inverse_values = table_relation::inverse_columns(&logs.inner, challenges)?;
     let table_inverses = commit_log_columns(&table_inverse_values)?;
     let trace_relation = trace_relation::prove(trace_witness, &trace_inverses, challenges)?;
     let full = full_descriptor(
+        protocol,
         &phase_one,
         trace_inverses.commitments(),
         table_inverses.commitments(),
@@ -247,18 +255,34 @@ pub fn verify_protocol_logs(
     logs: &ProtocolLogCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<(), ProtocolLogError> {
+    verify_protocol_logs_for_protocol(NativeProtocolVersion::current(), proof, trace, logs, claim)
+}
+
+pub(crate) fn verify_protocol_logs_for_protocol(
+    protocol: NativeProtocolVersion,
+    proof: &ProtocolLogProof,
+    trace: &WitnessCommitments,
+    logs: &ProtocolLogCommitments,
+    claim: &NativeExecutionClaim,
+) -> Result<(), ProtocolLogError> {
     claim.validate().map_err(|_| ProtocolLogError::Shape)?;
     logs.validate()?;
     proof.table_inverses.validate(LOG_LAYOUT)?;
-    let phase_one = phase_one_descriptor(trace, logs, claim)?;
-    let challenges = challenges(&phase_one)?;
+    let phase_one = phase_one_descriptor(protocol, trace, logs, claim)?;
+    let challenges = challenges(protocol, &phase_one)?;
     trace_relation::verify(
+        protocol,
         trace,
         &proof.trace_inverses,
         challenges,
         &proof.trace_relation,
     )?;
-    let full = full_descriptor(&phase_one, &proof.trace_inverses, &proof.table_inverses)?;
+    let full = full_descriptor(
+        protocol,
+        &phase_one,
+        &proof.trace_inverses,
+        &proof.table_inverses,
+    )?;
     table_relation::verify(
         &logs.inner,
         &proof.table_inverses,
@@ -268,6 +292,7 @@ pub fn verify_protocol_logs(
     )?;
     on_worker(|| {
         sum::verify(
+            protocol,
             &proof.sum,
             &proof.trace_inverses,
             &logs.inner,
@@ -419,28 +444,33 @@ fn append_table<const WIDTH: usize>(
 }
 
 fn phase_one_descriptor(
+    protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
     logs: &ProtocolLogCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<Vec<u8>, ProtocolLogError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
-    push_bytes(&mut descriptor, AKITA_SCHEDULE_SHA256.as_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
+    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
     push_bytes(&mut descriptor, AKITA_LOG_SCHEDULE_SHA256.as_bytes())?;
-    push_bytes(&mut descriptor, &trace.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
     push_bytes(&mut descriptor, &logs.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &claim.canonical_bytes())?;
+    push_bytes(&mut descriptor, &claim.canonical_bytes_for(protocol))?;
     Ok(descriptor)
 }
 
 fn full_descriptor(
+    protocol: NativeProtocolVersion,
     phase_one: &[u8],
     trace_inverses: &WitnessCommitments,
     table_inverses: &ColumnCommitments,
 ) -> Result<Vec<u8>, ProtocolLogError> {
     let mut descriptor = Vec::new();
     push_bytes(&mut descriptor, phase_one)?;
-    push_bytes(&mut descriptor, &trace_inverses.canonical_bytes()?)?;
+    push_bytes(
+        &mut descriptor,
+        &trace_inverses.canonical_bytes_for(protocol)?,
+    )?;
     push_bytes(
         &mut descriptor,
         &table_inverses.canonical_bytes(LOG_LAYOUT)?,
@@ -448,8 +478,15 @@ fn full_descriptor(
     Ok(descriptor)
 }
 
-fn challenges(descriptor: &[u8]) -> Result<LogChallenges, ProtocolLogError> {
-    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(CHALLENGE_DOMAIN);
+fn challenges(
+    protocol: NativeProtocolVersion,
+    descriptor: &[u8],
+) -> Result<LogChallenges, ProtocolLogError> {
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => CHALLENGE_DOMAIN,
+        NativeProtocolVersion::V2 => CHALLENGE_DOMAIN_V2,
+    };
+    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(domain);
     transcript.bind_instance_bytes(descriptor);
     let tuple_mix = challenge_array(&mut transcript, b"tuple-mix")?;
     let inverse_point = challenge_array(&mut transcript, b"inverse-point")?;

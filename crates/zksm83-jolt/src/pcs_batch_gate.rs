@@ -1,9 +1,9 @@
 //! Isolated, non-protocol PCS batching experiment.
 //!
-//! The version-one receipt never calls this module. Its only caller is the
-//! bounded `zksm83-pcs-batch-gate` process, which compares two independent
-//! openings with one genuine two-group opening over the same deterministic
-//! columns and claims.
+//! Receipt proving never calls this module. Its only caller is the bounded
+//! `zksm83-pcs-batch-gate` process, which compares independent openings with
+//! one genuine multi-group opening over the same deterministic columns and
+//! claims.
 
 use std::time::Instant;
 
@@ -35,8 +35,8 @@ type Config = fp128::DenseBounded;
 const NUM_VARIABLES: usize = 9;
 const ROW_COUNT: usize = 1 << NUM_VARIABLES;
 const GROUP_COLUMNS: usize = 128;
-const GROUP_COUNT: usize = 2;
-const TOTAL_COLUMNS: usize = GROUP_COLUMNS * GROUP_COUNT;
+const MIN_GATE_GROUP_COUNT: usize = 2;
+const MAX_GATE_GROUP_COUNT: usize = 4;
 const INDEPENDENT_SCHEDULE: &[u8] =
     include_bytes!("../protocol/akita/fp128_dense_bounded_nv9_p128.aks");
 const INDEPENDENT_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83/pcs-batch-gate/independent/v1";
@@ -47,9 +47,9 @@ const INSTANCE_DOMAIN: &[u8] = b"zksm83-pcs-batch-gate/v1";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PcsBatchGateMode {
-    /// Two version-one single-group openings with independently bound transcripts.
+    /// Single-group openings with independently bound transcripts.
     Independent,
-    /// One candidate opening containing one precommitted and one final group.
+    /// One candidate opening containing ordered precommitments and one final group.
     Batched,
 }
 
@@ -65,7 +65,7 @@ impl PcsBatchGateMode {
 /// Negative verification checks required before a batched candidate can pass.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PcsBatchTamperReport {
-    /// Swapping the two ordered groups was rejected.
+    /// Reversing the ordered groups was rejected.
     pub swapped_groups_rejected: bool,
     /// Replacing one commitment was rejected.
     pub changed_commitment_rejected: bool,
@@ -160,7 +160,7 @@ impl GateContext {
 }
 
 struct CandidateSchedule {
-    precommitted_profile: GroupCommitPhaseParams,
+    precommitted_profiles: Vec<GroupCommitPhaseParams>,
     schedule: FoldSchedule,
 }
 
@@ -202,41 +202,43 @@ fn run_on_worker(
     let candidate_scheme =
         AkitaCommitmentScheme::<Config>::from_schedule_artifact(candidate_bytes)?;
     let candidate = validate_candidate_schedule(&candidate_scheme)?;
+    let group_count = candidate
+        .precommitted_profiles
+        .len()
+        .checked_add(1)
+        .ok_or(PcsBatchGateError::Shape)?;
     let (scheme, schedule, capacity, explicit_precommitted) = match mode {
         PcsBatchGateMode::Independent => {
             let scheme =
                 AkitaCommitmentScheme::<Config>::from_schedule_artifact(INDEPENDENT_SCHEDULE)?;
             let schedule = validate_independent_schedule(&scheme)?;
-            (scheme, schedule, GROUP_COLUMNS, None)
+            (scheme, schedule, GROUP_COLUMNS, &[][..])
         }
         PcsBatchGateMode::Batched => (
             candidate_scheme,
             candidate.schedule,
-            TOTAL_COLUMNS,
-            Some(candidate.precommitted_profile),
+            GROUP_COLUMNS
+                .checked_mul(group_count)
+                .ok_or(PcsBatchGateError::Shape)?,
+            candidate.precommitted_profiles.as_slice(),
         ),
     };
 
     let cold_started = Instant::now();
-    let cold_context = prepare_context(&scheme, &schedule, capacity)?;
+    let cold_context = prepare_context(&scheme, &schedule, capacity, group_count)?;
     let cold_setup_seconds = cold_started.elapsed().as_secs_f64();
     drop(cold_context);
 
     let warm_started = Instant::now();
-    let context = prepare_context(&scheme, &schedule, capacity)?;
+    let context = prepare_context(&scheme, &schedule, capacity, group_count)?;
     let warm_setup_seconds = warm_started.elapsed().as_secs_f64();
-    let columns = deterministic_columns();
+    let columns = deterministic_columns(group_count);
     let point = deterministic_point()?;
     let opened_values = evaluate_groups(&columns, &point)?;
 
     let commit_started = Instant::now();
-    let mut committed = commit_gate_columns(
-        mode,
-        &scheme,
-        &context,
-        &columns,
-        explicit_precommitted.as_ref(),
-    )?;
+    let mut committed =
+        commit_gate_columns(mode, &scheme, &context, &columns, explicit_precommitted)?;
     let commit_seconds = commit_started.elapsed().as_secs_f64();
 
     let opening_started = Instant::now();
@@ -276,7 +278,7 @@ fn run_on_worker(
         verify_seconds,
         worker_seconds: worker_started.elapsed().as_secs_f64(),
         proof_bytes,
-        opened_group_count: GROUP_COUNT,
+        opened_group_count: group_count,
         verified: true,
         tamper,
     })
@@ -286,12 +288,13 @@ fn prepare_context(
     scheme: &AkitaCommitmentScheme<Config>,
     schedule: &FoldSchedule,
     capacity: usize,
+    group_count: usize,
 ) -> Result<GateContext, PcsBatchGateError> {
     let setup = scheme.setup_prover(NUM_VARIABLES, capacity)?;
-    let group_sizes = if capacity == TOTAL_COLUMNS {
-        vec![GROUP_COLUMNS, GROUP_COLUMNS]
-    } else {
+    let group_sizes = if capacity == GROUP_COLUMNS {
         vec![GROUP_COLUMNS]
+    } else {
+        vec![GROUP_COLUMNS; group_count]
     };
     let opening_layout = OpeningClaimsLayout::from_group_sizes(NUM_VARIABLES, &group_sizes)?;
     let verifier_setup = scheme.setup_verifier_for_schedule(&setup, schedule, &opening_layout)?;
@@ -319,19 +322,22 @@ fn validate_candidate_schedule(
         return Err(PcsBatchGateError::Shape);
     }
     let profiles = row.profiles();
-    let precommitted = profiles
+    let group_count = profiles
         .precommitteds
-        .first()
-        .copied()
+        .len()
+        .checked_add(1)
         .ok_or(PcsBatchGateError::Shape)?;
-    if profiles.precommitteds.len() != 1
+    if !(MIN_GATE_GROUP_COUNT..=MAX_GATE_GROUP_COUNT).contains(&group_count)
         || !is_gate_group(profiles.final_group.group)
-        || !is_gate_group(precommitted.group)
+        || profiles
+            .precommitteds
+            .iter()
+            .any(|profile| !is_gate_group(profile.group))
     {
         return Err(PcsBatchGateError::Shape);
     }
     Ok(CandidateSchedule {
-        precommitted_profile: precommitted,
+        precommitted_profiles: profiles.precommitteds.clone(),
         schedule: row.schedule().clone(),
     })
 }
@@ -354,8 +360,8 @@ fn is_gate_group(group: akita_types::PolynomialGroupLayout) -> bool {
     group.num_vars() == NUM_VARIABLES && group.num_polynomials() == GROUP_COLUMNS
 }
 
-fn deterministic_columns() -> Vec<Vec<Vec<NativeField>>> {
-    (0..GROUP_COUNT)
+fn deterministic_columns(group_count: usize) -> Vec<Vec<Vec<NativeField>>> {
+    (0..group_count)
         .map(|group| {
             (0..GROUP_COLUMNS)
                 .map(|column| {
@@ -421,7 +427,7 @@ fn commit_gate_columns(
     scheme: &AkitaCommitmentScheme<Config>,
     context: &GateContext,
     columns: &[Vec<Vec<NativeField>>],
-    explicit_precommitted: Option<&GroupCommitPhaseParams>,
+    explicit_precommitted: &[GroupCommitPhaseParams],
 ) -> Result<CommittedGateColumns, PcsBatchGateError> {
     let polynomials = columns
         .iter()
@@ -432,12 +438,12 @@ fn commit_gate_columns(
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if polynomials.len() != GROUP_COUNT {
+    if polynomials.len() < MIN_GATE_GROUP_COUNT || polynomials.len() > MAX_GATE_GROUP_COUNT {
         return Err(PcsBatchGateError::Shape);
     }
     let stack = context.stack()?;
-    let mut commitments = Vec::with_capacity(GROUP_COUNT);
-    let mut hints = Vec::with_capacity(GROUP_COUNT);
+    let mut commitments = Vec::with_capacity(polynomials.len());
+    let mut hints = Vec::with_capacity(polynomials.len());
     match mode {
         PcsBatchGateMode::Independent => {
             for group in &polynomials {
@@ -452,27 +458,32 @@ fn commit_gate_columns(
             }
         }
         PcsBatchGateMode::Batched => {
-            let profile = explicit_precommitted.ok_or(PcsBatchGateError::Shape)?;
-            let pre_group = polynomials.first().ok_or(PcsBatchGateError::Shape)?;
+            if explicit_precommitted.len().checked_add(1) != Some(polynomials.len()) {
+                return Err(PcsBatchGateError::Shape);
+            }
+            for (pre_group, profile) in polynomials
+                .iter()
+                .take(explicit_precommitted.len())
+                .zip(explicit_precommitted)
+            {
+                let pre = scheme.commit(
+                    &context.setup,
+                    pre_group,
+                    &stack,
+                    akita_prover::GroupContext::explicit(profile),
+                )?;
+                commitments.push(pre.committed_group);
+                hints.push(pre.hint);
+            }
             let final_group = polynomials.last().ok_or(PcsBatchGateError::Shape)?;
-            let pre = scheme.commit(
-                &context.setup,
-                pre_group,
-                &stack,
-                akita_prover::GroupContext::explicit(profile),
-            )?;
-            let precommitteds = PrecommittedGroupProfiles::from_ordered_groups(std::iter::once(
-                &pre.committed_group,
-            ))?;
+            let precommitteds = PrecommittedGroupProfiles::from_ordered_groups(commitments.iter())?;
             let final_output = scheme.commit(
                 &context.setup,
                 final_group,
                 &stack,
                 akita_prover::GroupContext::scheduler_with_precommitted_groups(&precommitteds),
             )?;
-            commitments.push(pre.committed_group);
             commitments.push(final_output.committed_group);
-            hints.push(pre.hint);
             hints.push(final_output.hint);
         }
     }
@@ -526,10 +537,10 @@ fn prove_independent(
     point: &[NativeField],
     opened_values: &[Vec<NativeField>],
 ) -> Result<Vec<GateProof>, PcsBatchGateError> {
-    if hints.len() != GROUP_COUNT {
+    if hints.len() != committed.commitments.len() {
         return Err(PcsBatchGateError::Shape);
     }
-    let mut proofs = Vec::with_capacity(GROUP_COUNT);
+    let mut proofs = Vec::with_capacity(hints.len());
     for (group_index, hint) in hints.into_iter().enumerate() {
         let polynomials = committed
             .polynomials
@@ -692,7 +703,7 @@ fn verify_positive(
 ) -> Result<(), PcsBatchGateError> {
     match mode {
         PcsBatchGateMode::Independent => {
-            if proofs.len() != GROUP_COUNT {
+            if proofs.len() != committed.commitments.len() {
                 return Err(PcsBatchGateError::Shape);
             }
             for (index, proof) in proofs.iter().enumerate() {
@@ -721,8 +732,8 @@ fn verify_positive(
         }
         PcsBatchGateMode::Batched => {
             let proof = proofs.first().ok_or(PcsBatchGateError::Shape)?;
-            let points = [point, point];
             let commitments = committed.commitments.iter().collect::<Vec<_>>();
+            let points = vec![point; commitments.len()];
             verify_claims(
                 mode,
                 scheme,
@@ -786,20 +797,14 @@ fn verify_tamper_matrix(
     proofs: &[GateProof],
 ) -> Result<PcsBatchTamperReport, PcsBatchGateError> {
     let proof = proofs.first().ok_or(PcsBatchGateError::Shape)?;
-    let first = committed
-        .commitments
-        .first()
-        .ok_or(PcsBatchGateError::Shape)?;
-    let second = committed
-        .commitments
-        .last()
-        .ok_or(PcsBatchGateError::Shape)?;
+    if committed.commitments.len() < MIN_GATE_GROUP_COUNT {
+        return Err(PcsBatchGateError::Shape);
+    }
     let fixture = TamperFixture {
         scheme,
         context,
         proof,
-        first,
-        second,
+        commitments: &committed.commitments,
         point,
     };
     let report = PcsBatchTamperReport {
@@ -821,14 +826,13 @@ struct TamperFixture<'a> {
     scheme: &'a AkitaCommitmentScheme<Config>,
     context: &'a GateContext,
     proof: &'a GateProof,
-    first: &'a CommittedGroup<NativeField>,
-    second: &'a CommittedGroup<NativeField>,
+    commitments: &'a [CommittedGroup<NativeField>],
     point: &'a [NativeField],
 }
 
 fn rejects_swapped_groups(fixture: &TamperFixture<'_>) -> bool {
-    let commitments = [fixture.second, fixture.first];
-    let points = [fixture.point, fixture.point];
+    let commitments = fixture.commitments.iter().rev().collect::<Vec<_>>();
+    let points = vec![fixture.point; commitments.len()];
     let values = fixture
         .proof
         .opened_values
@@ -846,8 +850,15 @@ fn rejects_swapped_groups(fixture: &TamperFixture<'_>) -> bool {
 }
 
 fn rejects_changed_commitment(fixture: &TamperFixture<'_>) -> bool {
-    let commitments = [fixture.second, fixture.second];
-    let points = [fixture.point, fixture.point];
+    let mut commitments = fixture.commitments.iter().collect::<Vec<_>>();
+    let Some(replacement) = fixture.commitments.last() else {
+        return false;
+    };
+    let Some(first) = commitments.first_mut() else {
+        return false;
+    };
+    *first = replacement;
+    let points = vec![fixture.point; commitments.len()];
     verify_tampered(
         fixture,
         &commitments,
@@ -864,8 +875,8 @@ fn rejects_changed_value(fixture: &TamperFixture<'_>) -> Result<bool, PcsBatchGa
         .and_then(|group| group.first_mut())
         .ok_or(PcsBatchGateError::Shape)?;
     *changed += NativeField::from_u64(1);
-    let commitments = [fixture.first, fixture.second];
-    let points = [fixture.point, fixture.point];
+    let commitments = fixture.commitments.iter().collect::<Vec<_>>();
+    let points = vec![fixture.point; commitments.len()];
     Ok(verify_tampered(
         fixture,
         &commitments,
@@ -879,8 +890,14 @@ fn rejects_changed_point(fixture: &TamperFixture<'_>) -> Result<bool, PcsBatchGa
     let mut point = fixture.point.to_vec();
     let coordinate = point.first_mut().ok_or(PcsBatchGateError::Shape)?;
     *coordinate += NativeField::from_u64(1);
-    let commitments = [fixture.first, fixture.second];
-    let points = [point.as_slice(), fixture.point];
+    let commitments = fixture.commitments.iter().collect::<Vec<_>>();
+    let remaining = commitments
+        .len()
+        .checked_sub(1)
+        .ok_or(PcsBatchGateError::Shape)?;
+    let points = std::iter::once(point.as_slice())
+        .chain(std::iter::repeat_n(fixture.point, remaining))
+        .collect::<Vec<_>>();
     Ok(verify_tampered(
         fixture,
         &commitments,
@@ -897,8 +914,8 @@ fn rejects_changed_schedule(fixture: &TamperFixture<'_>) -> Result<bool, PcsBatc
     let selection = OpeningScheduleSelection {
         row_digest: ScheduleRowDigest::from_bytes(bytes),
     };
-    let commitments = [fixture.first, fixture.second];
-    let points = [fixture.point, fixture.point];
+    let commitments = fixture.commitments.iter().collect::<Vec<_>>();
+    let points = vec![fixture.point; commitments.len()];
     Ok(verify_tampered(
         fixture,
         &commitments,
@@ -957,34 +974,4 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{PcsBatchGateMode, PcsBatchTamperReport, deterministic_columns};
-
-    #[test]
-    fn deterministic_fixture_has_exact_two_group_shape() {
-        let groups = deterministic_columns();
-        assert_eq!(groups.len(), 2);
-        assert!(groups.iter().all(|group| group.len() == 128));
-        assert!(groups.iter().flatten().all(|column| column.len() == 512));
-    }
-
-    #[test]
-    fn tamper_report_requires_every_rejection() {
-        let complete = PcsBatchTamperReport {
-            swapped_groups_rejected: true,
-            changed_commitment_rejected: true,
-            changed_value_rejected: true,
-            changed_point_rejected: true,
-            changed_schedule_rejected: true,
-        };
-        assert!(complete.all_rejected());
-        assert!(
-            !PcsBatchTamperReport {
-                changed_point_rejected: false,
-                ..complete
-            }
-            .all_rejected()
-        );
-        assert_ne!(PcsBatchGateMode::Independent, PcsBatchGateMode::Batched);
-    }
-}
+mod tests;

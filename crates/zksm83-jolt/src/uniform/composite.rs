@@ -4,8 +4,9 @@ use super::{
     CommittedWitness, NativeField, OpeningProof, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
     UniformError, UniformRelation, WitnessCommitments, ensure_relation_holds, outer_transcript,
     prove_opening, prove_sumcheck, push_bytes, push_usize, replay_sumcheck, sample_point,
-    validate_relation, verify_opening,
+    validate_relation, verify_opening_for_protocol,
 };
+use crate::NativeProtocolVersion;
 
 /// Uniform-relation proof spanning two separately committed trace planes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,29 +23,31 @@ pub(crate) fn prove_uniform_composite(
     left: &CommittedWitness,
     right: &CommittedWitness,
 ) -> Result<CompositeUniformRelationProof, UniformError> {
-    super::on_worker(|| prove_on_worker(relation, left, right))
+    super::on_worker(|| prove_on_worker(NativeProtocolVersion::current(), relation, left, right))
 }
 
-pub(crate) fn verify_uniform_composite(
+pub(crate) fn verify_uniform_composite_for_protocol(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     left: &WitnessCommitments,
     right: &WitnessCommitments,
     proof: &CompositeUniformRelationProof,
 ) -> Result<(), UniformError> {
-    super::on_worker(|| verify_on_worker(relation, left, right, proof))
+    super::on_worker(|| verify_on_worker(protocol, relation, left, right, proof))
 }
 
 fn prove_on_worker(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     left: &CommittedWitness,
     right: &CommittedWitness,
 ) -> Result<CompositeUniformRelationProof, UniformError> {
-    validate_shapes(relation, left.commitments(), right.commitments())?;
+    validate_shapes(protocol, relation, left.commitments(), right.commitments())?;
     let mut columns = left.field_columns().to_vec();
     columns.extend_from_slice(right.field_columns());
     ensure_relation_holds(relation, &columns, UNIFORM_ROW_COUNT)?;
-    let descriptor = descriptor(relation, left.commitments(), right.commitments())?;
-    let mut transcript = outer_transcript(&descriptor, super::TranscriptSide::Prover);
+    let descriptor = descriptor(protocol, relation, left.commitments(), right.commitments())?;
+    let mut transcript = outer_transcript(protocol, &descriptor, super::TranscriptSide::Prover);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
     let constraint_mix = transcript.challenge_scalar(b"constraint-mix");
     if constraint_mix == NativeField::from_u64(0) {
@@ -74,20 +77,21 @@ fn prove_on_worker(
 }
 
 fn verify_on_worker(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     left: &WitnessCommitments,
     right: &WitnessCommitments,
     proof: &CompositeUniformRelationProof,
 ) -> Result<(), UniformError> {
-    validate_shapes(relation, left, right)?;
+    validate_shapes(protocol, relation, left, right)?;
     if proof.rounds.len() != UNIFORM_NUM_VARIABLES
         || proof.left_values.len() != left.column_count()
         || proof.right_values.len() != right.column_count()
     {
         return Err(UniformError::Shape);
     }
-    let descriptor = descriptor(relation, left, right)?;
-    let mut transcript = outer_transcript(&descriptor, super::TranscriptSide::Verifier);
+    let descriptor = descriptor(protocol, relation, left, right)?;
+    let mut transcript = outer_transcript(protocol, &descriptor, super::TranscriptSide::Verifier);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
     let constraint_mix = transcript.challenge_scalar(b"constraint-mix");
     if constraint_mix == NativeField::from_u64(0) {
@@ -103,14 +107,16 @@ fn verify_on_worker(
         constraint_mix,
         &mut transcript,
     )?;
-    verify_opening(
+    verify_opening_for_protocol(
+        protocol,
         left,
         &opening_point,
         &proof.left_values,
         &descriptor,
         &proof.left_opening,
     )?;
-    verify_opening(
+    verify_opening_for_protocol(
+        protocol,
         right,
         &opening_point,
         &proof.right_values,
@@ -120,13 +126,14 @@ fn verify_on_worker(
 }
 
 fn validate_shapes(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     left: &WitnessCommitments,
     right: &WitnessCommitments,
 ) -> Result<(), UniformError> {
     validate_relation(relation)?;
-    left.validate()?;
-    right.validate()?;
+    left.validate_for(protocol)?;
+    right.validate_for(protocol)?;
     let combined = left
         .column_count()
         .checked_add(right.column_count())
@@ -138,20 +145,25 @@ fn validate_shapes(
 }
 
 fn descriptor(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     left: &WitnessCommitments,
     right: &WitnessCommitments,
 ) -> Result<Vec<u8>, UniformError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, super::PROTOCOL_ID.as_bytes())?;
-    push_bytes(&mut descriptor, super::AKITA_SCHEDULE_SHA256.as_bytes())?;
-    push_bytes(&mut descriptor, b"zksm83/native-uniform-composite/v1")?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
+    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => b"zksm83/native-uniform-composite/v1".as_slice(),
+        NativeProtocolVersion::V2 => b"zksm83/native-uniform-composite/v2".as_slice(),
+    };
+    push_bytes(&mut descriptor, domain)?;
     push_bytes(&mut descriptor, relation.domain())?;
     push_bytes(&mut descriptor, &relation.statement_bytes())?;
     push_usize(&mut descriptor, relation.column_count())?;
     push_usize(&mut descriptor, relation.constraint_count())?;
     push_usize(&mut descriptor, relation.max_constraint_degree())?;
-    push_bytes(&mut descriptor, &left.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &right.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &left.canonical_bytes_for(protocol)?)?;
+    push_bytes(&mut descriptor, &right.canonical_bytes_for(protocol)?)?;
     Ok(descriptor)
 }

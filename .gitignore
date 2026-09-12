@@ -44,6 +44,7 @@ coverage/
 *.aks
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded.aks
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv14_p128.aks
+!/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv14_p128_pair.aks
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv9_p128.aks
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv20_p1.aks
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv17_p1.aks

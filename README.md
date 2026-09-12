@@ -17,6 +17,11 @@ domain-separated SHA-256; verifier-visible ROM/RAM/log claims remain Akita
 commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
+New statements and receipts use native receipt v2. Its 26 ordered shared-trace
+commitment groups are opened as 13 schedule-bound adjacent pairs. The
+standalone verifier retains an explicit read-only v1 branch for existing
+receipts; the prover never emits v1.
+
 The complete 611-segment Pokémon Blue receipt is still unfinished. Synthetic
 single- and two-segment receipt gates have passed. A fresh native-only run from
 the frozen `2b342e7` revision produced and recovery-verified four adjacent real
@@ -76,7 +81,9 @@ Use the same arguments plus `--inspect-progress-only` to verify an existing
 progress/spool pair without opening either file for writing. This mode requires
 the spool length to match the checkpoint exactly, verifies every persisted
 proof frame, checks the final state and memory commitment, and prints stable
-`zksm83-native-progress-evidence/v1` JSON. It never truncates crash-tail bytes,
+`zksm83-native-progress-evidence/v2` JSON. The v2 checkpoint binds the receipt
+version, protocol ID, and both trace schedule digests, so a v1 checkpoint
+cannot be resumed into a v2 proof. Inspection never truncates crash-tail bytes,
 continues execution, or creates a receipt or statement.
 
 Completed segment log lines separate process-local `setup`, `commit`,
@@ -103,10 +110,11 @@ The current protocol is transparent and is not witness-hiding. The project may
 not claim zero knowledge until a separate hiding construction, leakage tests,
 and security review exist.
 
-Multi-group PCS batching is a prospective version 2 change, not an unclaimed
-version 1 optimization. Its isolated, 30-second decision gate is specified in
+Version 2 pair batching was selected by the isolated bounded gate documented in
 [pcs-v2-evaluation.md](docs/pcs-v2-evaluation.md). The gate runs only through
 the explicit `zksm83-pcs-batch-gate` binary and is absent from default tests.
+Three- and four-group candidates exceeded the frozen memory-growth limit, so
+v2 deliberately stops at two groups per opening.
 
 ## License
 

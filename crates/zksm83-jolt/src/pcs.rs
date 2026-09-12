@@ -15,9 +15,12 @@ use akita_prover::{
     prewarm_ntt_requirements,
 };
 use akita_serialization::SerializationError;
+#[cfg(test)]
+use akita_types::AkitaScheduleLookupKey;
 use akita_types::{
-    AkitaBatchedProof, AkitaCommitmentHint, AkitaScheduleLookupKey, CommittedGroup, FoldSchedule,
-    GroupBatchStatement, OpeningScheduleSelection, PolynomialGroupLayout,
+    AkitaBatchedProof, AkitaCommitmentHint, AkitaVerifierSetup, CommittedGroup, FoldSchedule,
+    GroupBatchStatement, GroupCommitPhaseParams, OpeningClaimsLayout, OpeningScheduleSelection,
+    PolynomialGroupLayout, PrecommittedGroupProfiles,
 };
 use jolt_field::{CanonicalBytes, Ring};
 use sha2::{Digest, Sha256};
@@ -38,6 +41,13 @@ pub(crate) struct PcsLayout {
     schedule_artifact: &'static [u8],
     commitment_domain: &'static [u8],
     opening_domain: &'static [u8],
+    opening_mode: PcsOpeningMode,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum PcsOpeningMode {
+    Independent,
+    Paired,
 }
 
 /// Prover-owned columns, commitment hints, and verifier-visible commitments.
@@ -54,10 +64,13 @@ struct PcsProverContext {
     setup: AkitaProverSetup<NativeField>,
     backend: CpuBackend,
     prepared: CpuPreparedSetup<NativeField>,
+    schedule: FoldSchedule,
+    precommitted_profiles: Vec<GroupCommitPhaseParams>,
 }
 
 struct PcsContextLease {
     slot: Arc<PcsContextSlot>,
+    layout: PcsLayout,
 }
 
 struct ProverBatch {
@@ -123,12 +136,51 @@ impl PcsLayout {
             schedule_artifact,
             commitment_domain,
             opening_domain,
+            opening_mode: PcsOpeningMode::Independent,
+        }
+    }
+
+    pub(crate) const fn paired(
+        num_variables: usize,
+        group_columns: usize,
+        schedule_artifact: &'static [u8],
+        commitment_domain: &'static [u8],
+        opening_domain: &'static [u8],
+    ) -> Self {
+        Self {
+            num_variables,
+            group_columns,
+            schedule_artifact,
+            commitment_domain,
+            opening_domain,
+            opening_mode: PcsOpeningMode::Paired,
         }
     }
 
     fn row_count(self) -> Result<usize, PcsError> {
         let shift = u32::try_from(self.num_variables).map_err(|_| PcsError::Shape)?;
         1_usize.checked_shl(shift).ok_or(PcsError::Shape)
+    }
+
+    const fn groups_per_opening(self) -> usize {
+        match self.opening_mode {
+            PcsOpeningMode::Independent => 1,
+            PcsOpeningMode::Paired => 2,
+        }
+    }
+
+    fn setup_capacity(self) -> Result<usize, PcsError> {
+        self.group_columns
+            .checked_mul(self.groups_per_opening())
+            .ok_or(PcsError::Shape)
+    }
+
+    fn opening_count(self, group_count: usize) -> Result<usize, PcsError> {
+        let groups_per_opening = self.groups_per_opening();
+        if group_count == 0 || !group_count.is_multiple_of(groups_per_opening) {
+            return Err(PcsError::Shape);
+        }
+        Ok(group_count / groups_per_opening)
     }
 }
 
@@ -140,13 +192,18 @@ impl CommittedColumns {
     pub(crate) fn field_columns(&self) -> &[Vec<NativeField>] {
         &self.field_columns
     }
+
+    pub(crate) const fn layout(&self) -> PcsLayout {
+        self.context.layout()
+    }
 }
 
 impl PcsProverContext {
     fn new(layout: PcsLayout) -> Result<Self, PcsError> {
         let _phase = metrics::start(Phase::Setup);
         let scheme = scheme(layout)?;
-        let setup = scheme.setup_prover(layout.num_variables, layout.group_columns)?;
+        let (schedule, precommitted_profiles) = validate_schedule(layout, &scheme)?;
+        let setup = scheme.setup_prover(layout.num_variables, layout.setup_capacity()?)?;
         let backend = CpuBackend::DEFAULT;
         let prepared = backend.prepare_setup(&setup)?;
         let context = Self {
@@ -155,9 +212,11 @@ impl PcsProverContext {
             setup,
             backend,
             prepared,
+            schedule,
+            precommitted_profiles,
         };
         let stack = context.stack()?;
-        prewarm_root_commit(layout, &context.scheme, &stack)?;
+        prewarm_root_commit(layout, &context.schedule, &stack)?;
         Ok(context)
     }
 
@@ -171,6 +230,10 @@ impl PcsProverContext {
 }
 
 impl PcsContextLease {
+    const fn layout(&self) -> PcsLayout {
+        self.layout
+    }
+
     fn acquire(layout: PcsLayout) -> Result<Self, PcsError> {
         let slot = context_slot(layout)?;
         let initialized = slot.get_or_init(|| {
@@ -181,7 +244,7 @@ impl PcsContextLease {
         if let Err(error) = initialized {
             return Err(PcsError::Context(error.clone()));
         }
-        Ok(Self { slot })
+        Ok(Self { slot, layout })
     }
 
     fn context(&self, layout: PcsLayout) -> Result<&PcsProverContext, PcsError> {
@@ -280,22 +343,21 @@ pub(crate) fn commit_columns(
         .collect::<Vec<_>>();
     let zero_column = vec![NativeField::from_u64(0); row_count];
     let group_count = field_columns.len().div_ceil(layout.group_columns);
+    let _opening_count = layout.opening_count(group_count)?;
     let mut groups = Vec::with_capacity(group_count);
     let mut batches = Vec::with_capacity(group_count);
-    for column_group in field_columns.chunks(layout.group_columns) {
-        let polynomials = padded_polynomials(layout, column_group, &zero_column)?;
-        let output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
-            &prover.setup,
-            &polynomials,
-            &stack,
-            akita_prover::GroupContext::scheduler_without_precommitted_groups(),
-        )?;
-        groups.push(output.committed_group);
-        batches.push(ProverBatch {
-            hint: output.hint,
-            polynomials,
-        });
-    }
+    let polynomial_groups = field_columns
+        .chunks(layout.group_columns)
+        .map(|columns| padded_polynomials(layout, columns, &zero_column))
+        .collect::<Result<Vec<_>, _>>()?;
+    commit_polynomial_groups(
+        layout,
+        prover,
+        &stack,
+        polynomial_groups,
+        &mut groups,
+        &mut batches,
+    )?;
     let commitments = ColumnCommitments {
         num_variables: layout.num_variables,
         logical_column_count: field_columns.len(),
@@ -311,15 +373,80 @@ pub(crate) fn commit_columns(
     })
 }
 
+fn commit_polynomial_groups(
+    layout: PcsLayout,
+    prover: &PcsProverContext,
+    stack: &UniformProverStack<'_, NativeField, CpuBackend>,
+    polynomial_groups: Vec<Vec<DensePoly<NativeField>>>,
+    groups: &mut Vec<CommittedGroup<NativeField>>,
+    batches: &mut Vec<ProverBatch>,
+) -> Result<(), PcsError> {
+    match layout.opening_mode {
+        PcsOpeningMode::Independent => {
+            for polynomials in polynomial_groups {
+                let output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                    &prover.setup,
+                    &polynomials,
+                    stack,
+                    akita_prover::GroupContext::scheduler_without_precommitted_groups(),
+                )?;
+                groups.push(output.committed_group);
+                batches.push(ProverBatch {
+                    hint: output.hint,
+                    polynomials,
+                });
+            }
+        }
+        PcsOpeningMode::Paired => {
+            let profile = prover
+                .precommitted_profiles
+                .first()
+                .ok_or(PcsError::Shape)?;
+            let mut pending = polynomial_groups.into_iter();
+            while let Some(precommitted) = pending.next() {
+                let final_group = pending.next().ok_or(PcsError::Shape)?;
+                let pre = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                    &prover.setup,
+                    &precommitted,
+                    stack,
+                    akita_prover::GroupContext::explicit(profile),
+                )?;
+                let precommitteds = PrecommittedGroupProfiles::from_ordered_groups(
+                    std::iter::once(&pre.committed_group),
+                )?;
+                let final_output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                    &prover.setup,
+                    &final_group,
+                    stack,
+                    akita_prover::GroupContext::scheduler_with_precommitted_groups(&precommitteds),
+                )?;
+                groups.push(pre.committed_group);
+                groups.push(final_output.committed_group);
+                batches.push(ProverBatch {
+                    hint: pre.hint,
+                    polynomials: precommitted,
+                });
+                batches.push(ProverBatch {
+                    hint: final_output.hint,
+                    polynomials: final_group,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prewarm_root_commit(
     layout: PcsLayout,
-    scheme: &AkitaCommitmentScheme<Config>,
+    schedule: &FoldSchedule,
     stack: &UniformProverStack<'_, NativeField, CpuBackend>,
 ) -> Result<(), PcsError> {
-    let group = PolynomialGroupLayout::new(layout.num_variables, layout.group_columns);
-    let key = AkitaScheduleLookupKey::single(group);
-    let schedule = scheme.schedules().resolve_key(&key)?.schedule();
-    let requirements = root_commit_requirements(schedule)?;
+    let requirements = match layout.opening_mode {
+        PcsOpeningMode::Independent => root_commit_requirements(schedule)?,
+        PcsOpeningMode::Paired => {
+            NttExecutionRequirements::from_commit_and_prove_schedule(schedule)?
+        }
+    };
     prewarm_ntt_requirements::<NativeField, _>(stack, &requirements)?;
     Ok(())
 }
@@ -367,49 +494,161 @@ pub(crate) fn prove_opening(
     let _phase = metrics::start(Phase::Opening);
     let prover = columns.context.context(layout)?;
     let stack = prover.stack()?;
-    let mut groups = Vec::with_capacity(columns.batches.len());
-    for (group_index, (committed_group, batch)) in columns
+    let groups = match layout.opening_mode {
+        PcsOpeningMode::Independent => prove_independent_openings(
+            layout,
+            prover,
+            &stack,
+            columns,
+            point,
+            logical_values,
+            instance_descriptor,
+        )?,
+        PcsOpeningMode::Paired => prove_paired_openings(
+            layout,
+            prover,
+            &stack,
+            columns,
+            point,
+            logical_values,
+            instance_descriptor,
+        )?,
+    };
+    Ok(OpeningProof { groups })
+}
+
+fn prove_independent_openings(
+    layout: PcsLayout,
+    prover: &PcsProverContext,
+    stack: &UniformProverStack<'_, NativeField, CpuBackend>,
+    columns: &CommittedColumns,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    descriptor: &[u8],
+) -> Result<Vec<GroupOpeningProof>, PcsError> {
+    let mut proofs = Vec::with_capacity(columns.batches.len());
+    for (index, (commitment, batch)) in columns
         .commitments
         .groups
         .iter()
         .zip(&columns.batches)
         .enumerate()
     {
-        let opened_values = padded_group_values(layout, logical_values, group_index)?;
-        let claims = OpeningClaims::from_groups(vec![PolynomialGroupClaims::new(
-            point.to_vec(),
-            opened_values.clone(),
-            committed_group.clone(),
-        )?])?;
-        let polynomial_group = batch.polynomials.iter().collect::<Vec<_>>();
-        let prover_data = SelectedProverOpeningData::from_committed_claims::<Config>(
-            claims,
-            vec![batch.hint.clone()],
-            vec![polynomial_group.as_slice()],
-            prover.scheme.schedules(),
-        )?;
-        let selection = prover_data.selection();
-        let mut transcript = opening_transcript(
+        let values = padded_group_values(layout, logical_values, index)?;
+        proofs.push(prove_group_batch(
             layout,
-            instance_descriptor,
+            prover,
+            stack,
+            std::slice::from_ref(commitment),
+            std::slice::from_ref(batch),
             point,
-            group_index,
-            TranscriptSide::Prover,
-        )?;
-        let proof = prover.scheme.batched_prove(
-            &prover.setup,
-            prover_data,
-            &stack,
-            &mut transcript,
-            BasisMode::Lagrange,
-        )?;
-        groups.push(GroupOpeningProof {
-            selection,
-            opened_values,
-            proof,
-        });
+            vec![values],
+            descriptor,
+            index,
+        )?);
     }
-    Ok(OpeningProof { groups })
+    Ok(proofs)
+}
+
+fn prove_paired_openings(
+    layout: PcsLayout,
+    prover: &PcsProverContext,
+    stack: &UniformProverStack<'_, NativeField, CpuBackend>,
+    columns: &CommittedColumns,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    descriptor: &[u8],
+) -> Result<Vec<GroupOpeningProof>, PcsError> {
+    let mut proofs = Vec::with_capacity(columns.batches.len() / 2);
+    for (pair_index, (commitments, batches)) in columns
+        .commitments
+        .groups
+        .chunks(2)
+        .zip(columns.batches.chunks(2))
+        .enumerate()
+    {
+        let first_index = pair_index.checked_mul(2).ok_or(PcsError::Shape)?;
+        let second_index = first_index.checked_add(1).ok_or(PcsError::Shape)?;
+        let values = vec![
+            padded_group_values(layout, logical_values, first_index)?,
+            padded_group_values(layout, logical_values, second_index)?,
+        ];
+        proofs.push(prove_group_batch(
+            layout,
+            prover,
+            stack,
+            commitments,
+            batches,
+            point,
+            values,
+            descriptor,
+            pair_index,
+        )?);
+    }
+    Ok(proofs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_group_batch(
+    layout: PcsLayout,
+    prover: &PcsProverContext,
+    stack: &UniformProverStack<'_, NativeField, CpuBackend>,
+    commitments: &[CommittedGroup<NativeField>],
+    batches: &[ProverBatch],
+    point: &[NativeField],
+    values: Vec<Vec<NativeField>>,
+    descriptor: &[u8],
+    opening_index: usize,
+) -> Result<GroupOpeningProof, PcsError> {
+    if commitments.len() != layout.groups_per_opening()
+        || commitments.len() != batches.len()
+        || batches.len() != values.len()
+    {
+        return Err(PcsError::Shape);
+    }
+    let claims = commitments
+        .iter()
+        .zip(&values)
+        .map(|(commitment, values)| {
+            PolynomialGroupClaims::new(point.to_vec(), values.clone(), commitment.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let polynomial_refs = batches
+        .iter()
+        .map(|batch| batch.polynomials.iter().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let polynomial_groups = polynomial_refs
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let hints = batches.iter().map(|batch| batch.hint.clone()).collect();
+    let prover_data = SelectedProverOpeningData::from_committed_claims::<Config>(
+        OpeningClaims::from_groups(claims)?,
+        hints,
+        polynomial_groups,
+        prover.scheme.schedules(),
+    )?;
+    let selection = prover_data.selection();
+    let mut transcript = opening_transcript(
+        layout,
+        descriptor,
+        point,
+        opening_index,
+        selection,
+        TranscriptSide::Prover,
+    )?;
+    let proof = prover.scheme.batched_prove(
+        &prover.setup,
+        prover_data,
+        stack,
+        &mut transcript,
+        BasisMode::Lagrange,
+    )?;
+    Ok(GroupOpeningProof {
+        selection,
+        opened_values: values.into_iter().flatten().collect(),
+        proof,
+    })
 }
 
 pub(crate) fn verify_opening(
@@ -428,34 +667,33 @@ pub(crate) fn verify_opening(
         opening.groups.len(),
     )?;
     let scheme = scheme(layout)?;
-    let prover_setup = scheme.setup_prover(layout.num_variables, layout.group_columns)?;
-    let verifier_setup = scheme.setup_verifier(&prover_setup)?;
-    for (group_index, (committed_group, group_opening)) in
-        commitments.groups.iter().zip(&opening.groups).enumerate()
-    {
-        let expected_values = padded_group_values(layout, logical_values, group_index)?;
-        if group_opening.opened_values != expected_values {
-            return Err(PcsError::Shape);
+    let (schedule, _) = validate_schedule(layout, &scheme)?;
+    let prover_setup = scheme.setup_prover(layout.num_variables, layout.setup_capacity()?)?;
+    let verifier_setup = match layout.opening_mode {
+        PcsOpeningMode::Independent => scheme.setup_verifier(&prover_setup)?,
+        PcsOpeningMode::Paired => {
+            let sizes = vec![layout.group_columns; layout.groups_per_opening()];
+            let claims_layout =
+                OpeningClaimsLayout::from_group_sizes(layout.num_variables, &sizes)?;
+            scheme.setup_verifier_for_schedule(&prover_setup, &schedule, &claims_layout)?
         }
-        let claims = OpeningClaims::from_groups(vec![PolynomialGroupClaims::new(
-            point.to_vec(),
-            group_opening.opened_values.clone(),
-            committed_group,
-        )?])?;
-        let statement = GroupBatchStatement::new(group_opening.selection, claims)?;
-        let mut transcript = opening_transcript(
+    };
+    for (opening_index, (committed_groups, group_opening)) in commitments
+        .groups
+        .chunks(layout.groups_per_opening())
+        .zip(&opening.groups)
+        .enumerate()
+    {
+        verify_group_batch(
             layout,
-            instance_descriptor,
-            point,
-            group_index,
-            TranscriptSide::Verifier,
-        )?;
-        scheme.batched_verify(
-            &group_opening.proof,
+            &scheme,
             &verifier_setup,
-            &mut transcript,
-            statement,
-            BasisMode::Lagrange,
+            committed_groups,
+            point,
+            logical_values,
+            instance_descriptor,
+            opening_index,
+            group_opening,
         )?;
     }
     Ok(())
@@ -464,6 +702,86 @@ pub(crate) fn verify_opening(
 pub(crate) fn scheme(layout: PcsLayout) -> Result<AkitaCommitmentScheme<Config>, PcsError> {
     AkitaCommitmentScheme::<Config>::from_schedule_artifact(layout.schedule_artifact)
         .map_err(PcsError::Akita)
+}
+
+fn validate_schedule(
+    layout: PcsLayout,
+    scheme: &AkitaCommitmentScheme<Config>,
+) -> Result<(FoldSchedule, Vec<GroupCommitPhaseParams>), PcsError> {
+    let mut rows = scheme.schedules().catalog().rows();
+    let row = rows.next().ok_or(PcsError::Shape)?;
+    if rows.next().is_some() {
+        return Err(PcsError::Shape);
+    }
+    let profiles = row.profiles();
+    let expected = PolynomialGroupLayout::new(layout.num_variables, layout.group_columns);
+    let precommitted_count = match layout.opening_mode {
+        PcsOpeningMode::Independent => 0,
+        PcsOpeningMode::Paired => 1,
+    };
+    if profiles.final_group.group != expected
+        || profiles.precommitteds.len() != precommitted_count
+        || profiles
+            .precommitteds
+            .iter()
+            .any(|profile| profile.group != expected)
+    {
+        return Err(PcsError::Shape);
+    }
+    Ok((row.schedule().clone(), profiles.precommitteds.clone()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_group_batch(
+    layout: PcsLayout,
+    scheme: &AkitaCommitmentScheme<Config>,
+    verifier_setup: &AkitaVerifierSetup<NativeField>,
+    commitments: &[CommittedGroup<NativeField>],
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    descriptor: &[u8],
+    opening_index: usize,
+    opening: &GroupOpeningProof,
+) -> Result<(), PcsError> {
+    if commitments.len() != layout.groups_per_opening() {
+        return Err(PcsError::Shape);
+    }
+    let first_group = opening_index
+        .checked_mul(layout.groups_per_opening())
+        .ok_or(PcsError::Shape)?;
+    let values = (0..layout.groups_per_opening())
+        .map(|offset| {
+            let group_index = first_group.checked_add(offset).ok_or(PcsError::Shape)?;
+            padded_group_values(layout, logical_values, group_index)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_flat = values.iter().flatten().copied().collect::<Vec<_>>();
+    if opening.opened_values != expected_flat {
+        return Err(PcsError::Shape);
+    }
+    let claims = commitments
+        .iter()
+        .zip(values)
+        .map(|(commitment, values)| PolynomialGroupClaims::new(point.to_vec(), values, commitment))
+        .collect::<Result<Vec<_>, _>>()?;
+    let statement =
+        GroupBatchStatement::new(opening.selection, OpeningClaims::from_groups(claims)?)?;
+    let mut transcript = opening_transcript(
+        layout,
+        descriptor,
+        point,
+        opening_index,
+        opening.selection,
+        TranscriptSide::Verifier,
+    )?;
+    scheme.batched_verify(
+        &opening.proof,
+        verifier_setup,
+        &mut transcript,
+        statement,
+        BasisMode::Lagrange,
+    )?;
+    Ok(())
 }
 
 fn padded_polynomials(
@@ -501,12 +819,13 @@ fn validate_opening_shape(
     commitments: &ColumnCommitments,
     point: &[NativeField],
     logical_values: &[NativeField],
-    opening_group_count: usize,
+    opening_count: usize,
 ) -> Result<(), PcsError> {
     commitments.validate(layout)?;
+    let expected_opening_count = layout.opening_count(commitments.groups.len())?;
     if point.len() != layout.num_variables
         || logical_values.len() != commitments.logical_column_count
-        || opening_group_count != commitments.groups.len()
+        || opening_count != expected_opening_count
     {
         return Err(PcsError::Shape);
     }
@@ -542,11 +861,17 @@ fn opening_transcript(
     layout: PcsLayout,
     instance_descriptor: &[u8],
     point: &[NativeField],
-    group_index: usize,
+    opening_index: usize,
+    selection: OpeningScheduleSelection,
     side: TranscriptSide,
 ) -> Result<AkitaTranscript<NativeField>, PcsError> {
     let mut descriptor = instance_descriptor.to_vec();
-    push_usize(&mut descriptor, group_index)?;
+    if layout.opening_mode == PcsOpeningMode::Paired {
+        push_bytes(&mut descriptor, b"zksm83/native-pcs-pair/v2")?;
+        push_bytes(&mut descriptor, selection.row_digest.as_bytes())?;
+        push_usize(&mut descriptor, layout.groups_per_opening())?;
+    }
+    push_usize(&mut descriptor, opening_index)?;
     push_usize(&mut descriptor, point.len())?;
     for coordinate in point {
         descriptor.extend_from_slice(&coordinate.to_bytes_le_vec());
@@ -576,71 +901,4 @@ fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), PcsError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::{
-        AkitaScheduleLookupKey, PcsLayout, PolynomialGroupLayout, context_slot,
-        root_commit_requirements, scheme,
-    };
-
-    const DOMAIN: &[u8] = b"zksm83/pcs-prewarm-test/v1";
-    const ROM_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv20_p1.aks");
-    const ROM_SCHEDULE: &[u8] = ROM_FILE.split_at(ROM_FILE.len() - 1).0;
-    const MEMORY_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv17_p1.aks");
-    const MEMORY_SCHEDULE: &[u8] = MEMORY_FILE.split_at(MEMORY_FILE.len() - 1).0;
-    const LOG_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv17_p128.aks");
-    const LOG_SCHEDULE: &[u8] = LOG_FILE.split_at(LOG_FILE.len() - 1).0;
-
-    #[test]
-    fn every_pinned_layout_has_explicit_root_commit_prewarm_requirements()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for layout in layouts() {
-            let scheme = scheme(layout)?;
-            let group = PolynomialGroupLayout::new(layout.num_variables, layout.group_columns);
-            let key = AkitaScheduleLookupKey::single(group);
-            let schedule = scheme.schedules().resolve_key(&key)?.schedule();
-            assert!(!root_commit_requirements(schedule)?.entries().is_empty());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn live_layouts_share_one_initialization_slot() -> Result<(), Box<dyn std::error::Error>> {
-        let rom_layout = layout(20, 1, ROM_FILE);
-        let first = context_slot(rom_layout)?;
-        let second = context_slot(rom_layout)?;
-        let different = context_slot(layout(17, 1, MEMORY_FILE))?;
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!Arc::ptr_eq(&first, &different));
-        assert!(first.get().is_none());
-        Ok(())
-    }
-
-    fn layouts() -> [PcsLayout; 6] {
-        [
-            layout(
-                14,
-                128,
-                include_bytes!("../protocol/akita/fp128_dense_bounded_nv14_p128.aks"),
-            ),
-            layout(
-                9,
-                128,
-                include_bytes!("../protocol/akita/fp128_dense_bounded_nv9_p128.aks"),
-            ),
-            layout(20, 1, ROM_SCHEDULE),
-            layout(17, 1, MEMORY_SCHEDULE),
-            layout(17, 128, LOG_SCHEDULE),
-            layout(
-                14,
-                1,
-                include_bytes!("../protocol/akita/fp128_dense_bounded.aks"),
-            ),
-        ]
-    }
-
-    const fn layout(variables: usize, columns: usize, schedule: &'static [u8]) -> PcsLayout {
-        PcsLayout::new(variables, columns, schedule, DOMAIN, DOMAIN)
-    }
-}
+mod tests;

@@ -2,13 +2,13 @@ use akita_pcs::Ring;
 use jolt_field::CanonicalBytes;
 
 use crate::{
-    ISA_PACKED_HIGH, ISA_PACKED_LOW, NATIVE_TRACE_COLUMN_COUNT, NativeField, TRACE_ACTIVE,
-    TRACE_BEFORE_STATE_START, TRACE_BUS_KIND_BITS, TRACE_BUS_SLOT_WIDTH, TRACE_BUS_SLOTS,
-    TRACE_BUS_START, TRACE_ISA_OUTPUT_START, UNIFORM_ROW_COUNT, UniformError, UniformRelation,
-    WitnessCommitments,
+    ISA_PACKED_HIGH, ISA_PACKED_LOW, NATIVE_TRACE_COLUMN_COUNT, NativeField, NativeProtocolVersion,
+    TRACE_ACTIVE, TRACE_BEFORE_STATE_START, TRACE_BUS_KIND_BITS, TRACE_BUS_SLOT_WIDTH,
+    TRACE_BUS_SLOTS, TRACE_BUS_START, TRACE_ISA_OUTPUT_START, UNIFORM_ROW_COUNT, UniformError,
+    UniformRelation, WitnessCommitments,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        verify_uniform_composite,
+        verify_uniform_composite_for_protocol,
     },
 };
 
@@ -23,27 +23,39 @@ pub(super) fn prove(
     inverses: &CommittedWitness,
     challenges: LogChallenges,
 ) -> Result<CompositeUniformRelationProof, ProtocolLogError> {
-    let relation = TraceLogRelation { challenges };
+    let relation = TraceLogRelation {
+        protocol: NativeProtocolVersion::current(),
+        challenges,
+    };
     prove_uniform_composite(&relation, trace, inverses).map_err(Into::into)
 }
 
 pub(super) fn verify(
+    protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
     inverses: &WitnessCommitments,
     challenges: LogChallenges,
     proof: &CompositeUniformRelationProof,
 ) -> Result<(), ProtocolLogError> {
-    let relation = TraceLogRelation { challenges };
-    verify_uniform_composite(&relation, trace, inverses, proof).map_err(Into::into)
+    let relation = TraceLogRelation {
+        protocol,
+        challenges,
+    };
+    verify_uniform_composite_for_protocol(protocol, &relation, trace, inverses, proof)
+        .map_err(Into::into)
 }
 
 struct TraceLogRelation {
+    protocol: NativeProtocolVersion,
     challenges: LogChallenges,
 }
 
 impl UniformRelation for TraceLogRelation {
     fn domain(&self) -> &'static [u8] {
-        b"zksm83/native-protocol-log-trace-inverses/v1"
+        match self.protocol {
+            NativeProtocolVersion::V1 => b"zksm83/native-protocol-log-trace-inverses/v1",
+            NativeProtocolVersion::V2 => b"zksm83/native-protocol-log-trace-inverses/v2",
+        }
     }
 
     fn statement_bytes(&self) -> Vec<u8> {

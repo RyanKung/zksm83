@@ -5,16 +5,17 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
 };
 
-use crate::{CommittedRom, MemoryCommitment, NativeStateBoundary};
+use crate::{CommittedRom, MemoryCommitment, NativeProtocolVersion, NativeStateBoundary};
 
 use super::{
     MAX_NATIVE_ROM_COMMITMENT_BYTES, MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT,
-    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
-    NativeBoundary, NativeReceiptError, NativeSegmentWitness, NativeStatement,
-    VerifiedNativeReceipt, direct_memory_identity, direct_rom_identity, prove_segment,
+    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NativeBoundary,
+    NativeReceiptError, NativeSegmentWitness, NativeStatement, VerifiedNativeReceipt,
+    direct_memory_identity_for, direct_rom_identity, direct_rom_identity_for, prove_segment,
     verify_segment,
     wire::{
-        RECEIPT_MAGIC, decode_rom, decode_segment, encode_rom, encode_segment, encode_statement,
+        decode_rom, decode_segment, encode_rom, encode_segment, encode_statement,
+        protocol_from_receipt_magic, receipt_magic,
     },
 };
 
@@ -168,7 +169,11 @@ where
             return Err(NativeReceiptError::InvalidStatement);
         }
         if let Some(memory) = self.previous_memory.as_ref() {
-            ensure_same_memory(memory, witness.initial_memory.commitment())?;
+            ensure_same_memory(
+                memory,
+                witness.initial_memory.commitment(),
+                NativeProtocolVersion::current(),
+            )?;
         }
         let boundary = match &self.boundary {
             Some(boundary) => boundary.clone(),
@@ -234,8 +239,8 @@ where
                 "stream receipt length limit".to_owned(),
             ));
         }
-        output.write_all(RECEIPT_MAGIC)?;
-        output.write_all(&NATIVE_RECEIPT_VERSION.to_le_bytes())?;
+        output.write_all(receipt_magic(statement.protocol))?;
+        output.write_all(&statement.protocol.code().to_le_bytes())?;
         write_blob(&mut output, &statement_bytes)?;
         write_blob(&mut output, &rom_bytes)?;
         output.write_all(&self.segment_count.to_le_bytes())?;
@@ -303,10 +308,10 @@ pub fn verify_native_receipt_reader<R: Read>(
 ) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
     expected.validate()?;
     let mut reader = BoundedReader::new(reader);
-    if reader.fixed::<8>()? != *RECEIPT_MAGIC {
-        return Err(NativeReceiptError::Wire("receipt magic".to_owned()));
-    }
-    if reader.u64()? != NATIVE_RECEIPT_VERSION {
+    let protocol = protocol_from_receipt_magic(reader.fixed()?)?;
+    let encoded_protocol = NativeProtocolVersion::from_code(reader.u64()?)
+        .ok_or(NativeReceiptError::UnsupportedBackend)?;
+    if protocol != encoded_protocol || protocol != expected.protocol {
         return Err(NativeReceiptError::UnsupportedBackend);
     }
     let statement = NativeStatement::from_bytes(&reader.blob(MAX_NATIVE_STATEMENT_BYTES)?)?;
@@ -314,14 +319,14 @@ pub fn verify_native_receipt_reader<R: Read>(
         return Err(NativeReceiptError::StatementMismatch);
     }
     let rom = decode_rom(&reader.blob(MAX_NATIVE_ROM_COMMITMENT_BYTES)?)?;
-    if direct_rom_identity(&rom)? != statement.rom {
+    if direct_rom_identity_for(protocol, &rom)? != statement.rom {
         return Err(NativeReceiptError::StatementMismatch);
     }
     let count = reader.usize(MAX_NATIVE_SEGMENT_COUNT)?;
     if u64::try_from(count).map_err(|_| NativeReceiptError::Counter)? != statement.segment_count {
         return Err(NativeReceiptError::StatementMismatch);
     }
-    verify_frames(&mut reader, count, &statement, &rom)?;
+    verify_frames(&mut reader, count, &statement, &rom, protocol)?;
     reader.finish()?;
     Ok(VerifiedNativeReceipt {
         statement_id: expected.statement_id,
@@ -360,6 +365,7 @@ fn verify_frames<R: Read>(
     count: usize,
     statement: &NativeStatement,
     rom: &crate::RomCommitment,
+    protocol: NativeProtocolVersion,
 ) -> Result<(), NativeReceiptError> {
     let mut boundary = statement.initial.clone();
     let mut previous_memory: Option<MemoryCommitment> = None;
@@ -367,9 +373,9 @@ fn verify_frames<R: Read>(
     for index in 0..count {
         let segment = decode_segment(&reader.blob(MAX_NATIVE_SEGMENT_BYTES)?)?;
         if let Some(memory) = previous_memory.as_ref() {
-            ensure_same_memory(memory, &segment.initial_memory)?;
+            ensure_same_memory(memory, &segment.initial_memory, protocol)?;
         }
-        verify_segment(index, &segment, &boundary, rom)?;
+        verify_segment(index, &segment, &boundary, rom, protocol)?;
         steps = steps
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
@@ -405,9 +411,19 @@ fn verify_spool<S: Read + Seek>(
             None => NativeBoundary::initial(segment.initial.state, &segment.initial_memory)?,
         };
         if let Some(memory) = previous_memory.as_ref() {
-            ensure_same_memory(memory, &segment.initial_memory)?;
+            ensure_same_memory(
+                memory,
+                &segment.initial_memory,
+                NativeProtocolVersion::current(),
+            )?;
         }
-        verify_segment(index, &segment, &expected_initial, rom)?;
+        verify_segment(
+            index,
+            &segment,
+            &expected_initial,
+            rom,
+            NativeProtocolVersion::current(),
+        )?;
         relation_step_count = relation_step_count
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
@@ -431,8 +447,9 @@ fn verify_spool<S: Read + Seek>(
 fn ensure_same_memory(
     left: &MemoryCommitment,
     right: &MemoryCommitment,
+    protocol: NativeProtocolVersion,
 ) -> Result<(), NativeReceiptError> {
-    if direct_memory_identity(left)? != direct_memory_identity(right)? {
+    if direct_memory_identity_for(protocol, left)? != direct_memory_identity_for(protocol, right)? {
         return Err(NativeReceiptError::SegmentChain(
             "adjacent mutable-memory commitment identities differ",
         ));

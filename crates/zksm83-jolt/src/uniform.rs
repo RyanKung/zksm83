@@ -9,17 +9,18 @@ use akita_serialization::SerializationError;
 use jolt_field::Field;
 use thiserror::Error;
 
-use crate::{AKITA_SCHEDULE_SHA256, AkitaWorkerError, PROTOCOL_ID};
+use crate::{AkitaWorkerError, NativeProtocolVersion};
 pub use commitment::{CommittedWitness, WitnessCommitments};
-use commitment::{OpeningProof, commit_columns, prove_opening, verify_opening};
+use commitment::{OpeningProof, commit_columns, prove_opening, verify_opening_for_protocol};
 pub(crate) use composite::{
-    CompositeUniformRelationProof, prove_uniform_composite, verify_uniform_composite,
+    CompositeUniformRelationProof, prove_uniform_composite, verify_uniform_composite_for_protocol,
 };
 
 /// Scalar field used by the native transparent relation and Akita PCS.
 pub type NativeField = fp128::Field;
 
 const OUTER_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-uniform/v1";
+const OUTER_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-uniform/v2";
 /// Number of rows in every native relation segment, including inactive padding.
 pub const UNIFORM_ROW_COUNT: usize = 1 << UNIFORM_NUM_VARIABLES;
 
@@ -209,7 +210,21 @@ pub fn verify_uniform_committed(
     commitments: &WitnessCommitments,
     proof: &UniformRelationProof,
 ) -> Result<(), UniformError> {
-    on_worker(|| verify_uniform_committed_on_worker(relation, commitments, proof))
+    verify_uniform_committed_for_protocol(
+        NativeProtocolVersion::current(),
+        relation,
+        commitments,
+        proof,
+    )
+}
+
+pub(crate) fn verify_uniform_committed_for_protocol(
+    protocol: NativeProtocolVersion,
+    relation: &impl UniformRelation,
+    commitments: &WitnessCommitments,
+    proof: &UniformRelationProof,
+) -> Result<(), UniformError> {
+    on_worker(|| verify_uniform_committed_on_worker(protocol, relation, commitments, proof))
 }
 
 pub(crate) fn prove_witness_opening(
@@ -221,24 +236,26 @@ pub(crate) fn prove_witness_opening(
     prove_opening(witness, point, values, descriptor)
 }
 
-pub(crate) fn verify_witness_opening(
+pub(crate) fn verify_witness_opening_for_protocol(
+    protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     values: &[NativeField],
     descriptor: &[u8],
     opening: &crate::pcs::OpeningProof,
 ) -> Result<(), UniformError> {
-    verify_opening(commitments, point, values, descriptor, opening)
+    verify_opening_for_protocol(protocol, commitments, point, values, descriptor, opening)
 }
 
 fn prove_uniform_committed_on_worker(
     relation: &impl UniformRelation,
     witness: &CommittedWitness,
 ) -> Result<UniformRelationProof, UniformError> {
-    validate_committed_relation(relation, witness.commitments())?;
+    let protocol = NativeProtocolVersion::current();
+    validate_committed_relation(protocol, relation, witness.commitments())?;
     ensure_relation_holds(relation, witness.field_columns(), UNIFORM_ROW_COUNT)?;
-    let descriptor = relation_instance_descriptor(relation, witness.commitments())?;
-    let mut transcript = outer_transcript(&descriptor, TranscriptSide::Prover);
+    let descriptor = relation_instance_descriptor(protocol, relation, witness.commitments())?;
+    let mut transcript = outer_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
     let constraint_mix = transcript.challenge_scalar(b"constraint-mix");
     if constraint_mix == NativeField::from_u64(0) {
@@ -262,19 +279,20 @@ fn prove_uniform_committed_on_worker(
 }
 
 fn verify_uniform_committed_on_worker(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     commitments: &WitnessCommitments,
     proof: &UniformRelationProof,
 ) -> Result<(), UniformError> {
-    validate_committed_relation(relation, commitments)?;
+    validate_committed_relation(protocol, relation, commitments)?;
     if proof.logical_column_count != relation.column_count()
         || proof.sumcheck_rounds.len() != UNIFORM_NUM_VARIABLES
         || proof.opened_values.len() != relation.column_count()
     {
         return Err(UniformError::Shape);
     }
-    let descriptor = relation_instance_descriptor(relation, commitments)?;
-    let mut transcript = outer_transcript(&descriptor, TranscriptSide::Verifier);
+    let descriptor = relation_instance_descriptor(protocol, relation, commitments)?;
+    let mut transcript = outer_transcript(protocol, &descriptor, TranscriptSide::Verifier);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
     let constraint_mix = transcript.challenge_scalar(b"constraint-mix");
     if constraint_mix == NativeField::from_u64(0) {
@@ -288,7 +306,8 @@ fn verify_uniform_committed_on_worker(
         constraint_mix,
         &mut transcript,
     )?;
-    verify_opening(
+    verify_opening_for_protocol(
+        protocol,
         commitments,
         &opening_point,
         &proof.opened_values,
@@ -329,11 +348,12 @@ fn validate_witness_shape(
 }
 
 fn validate_committed_relation(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     commitments: &WitnessCommitments,
 ) -> Result<(), UniformError> {
     validate_relation(relation)?;
-    commitments.validate()?;
+    commitments.validate_for(protocol)?;
     if commitments.column_count() != relation.column_count() {
         return Err(UniformError::Shape);
     }
@@ -377,33 +397,38 @@ enum TranscriptSide {
     Verifier,
 }
 
-fn outer_transcript(descriptor: &[u8], side: TranscriptSide) -> AkitaTranscript<NativeField> {
+fn outer_transcript(
+    protocol: NativeProtocolVersion,
+    descriptor: &[u8],
+    side: TranscriptSide,
+) -> AkitaTranscript<NativeField> {
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => OUTER_TRANSCRIPT_DOMAIN,
+        NativeProtocolVersion::V2 => OUTER_TRANSCRIPT_DOMAIN_V2,
+    };
     let mut transcript = match side {
-        TranscriptSide::Prover => {
-            AkitaTranscript::<NativeField>::unbound_prover(OUTER_TRANSCRIPT_DOMAIN)
-        }
-        TranscriptSide::Verifier => {
-            AkitaTranscript::<NativeField>::unbound_verifier(OUTER_TRANSCRIPT_DOMAIN)
-        }
+        TranscriptSide::Prover => AkitaTranscript::<NativeField>::unbound_prover(domain),
+        TranscriptSide::Verifier => AkitaTranscript::<NativeField>::unbound_verifier(domain),
     };
     transcript.bind_instance_bytes(descriptor);
     transcript
 }
 
 fn relation_instance_descriptor(
+    protocol: NativeProtocolVersion,
     relation: &impl UniformRelation,
     commitments: &WitnessCommitments,
 ) -> Result<Vec<u8>, UniformError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
-    push_bytes(&mut descriptor, AKITA_SCHEDULE_SHA256.as_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
+    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
     push_bytes(&mut descriptor, relation.domain())?;
     push_bytes(&mut descriptor, &relation.statement_bytes())?;
     push_usize(&mut descriptor, UNIFORM_NUM_VARIABLES)?;
     push_usize(&mut descriptor, relation.column_count())?;
     push_usize(&mut descriptor, relation.constraint_count())?;
     push_usize(&mut descriptor, relation.max_constraint_degree())?;
-    push_bytes(&mut descriptor, &commitments.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &commitments.canonical_bytes_for(protocol)?)?;
     Ok(descriptor)
 }
 
@@ -705,7 +730,7 @@ mod tests {
     use super::{
         COMMITMENT_GROUP_COLUMNS, NativeField, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
         UniformError, UniformProof, UniformRelation, commit_witness,
-        commitment::{SCHEDULE_ARTIFACT, scheme},
+        commitment::{LEGACY_SCHEDULE_ARTIFACT, SCHEDULE_ARTIFACT, scheme},
         prove_uniform, prove_uniform_committed, verify_uniform, verify_uniform_committed,
     };
     use akita_pcs::Ring;
@@ -716,7 +741,7 @@ mod tests {
     struct EdgeEqualityColumns<const N: usize>;
 
     #[test]
-    fn pinned_schedule_has_only_the_frozen_group_shape() -> Result<(), UniformError> {
+    fn pinned_v2_schedule_has_only_the_frozen_pair_shape() -> Result<(), UniformError> {
         let scheme = scheme()?;
         let shapes = scheme
             .schedules()
@@ -740,12 +765,23 @@ mod tests {
             shapes.first().ok_or(UniformError::Shape)?;
         assert_eq!(*num_variables, UNIFORM_NUM_VARIABLES);
         assert_eq!(*num_polynomials, COMMITMENT_GROUP_COLUMNS);
-        assert!(precommitted.is_empty());
+        assert_eq!(
+            precommitted.as_slice(),
+            &[(UNIFORM_NUM_VARIABLES, COMMITMENT_GROUP_COLUMNS)]
+        );
         assert_eq!(
             format!("{:x}", Sha256::digest(SCHEDULE_ARTIFACT)),
             crate::AKITA_SCHEDULE_SHA256
         );
         Ok(())
+    }
+
+    #[test]
+    fn pinned_v1_schedule_digest_remains_available_for_verification() {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(LEGACY_SCHEDULE_ARTIFACT)),
+            crate::AKITA_SCHEDULE_SHA256_V1
+        );
     }
 
     impl UniformRelation for BooleanColumn {

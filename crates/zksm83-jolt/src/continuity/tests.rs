@@ -7,8 +7,8 @@ use super::{
     evaluate_field_column, half_point, inverse_columns,
 };
 use crate::{
-    NATIVE_TRACE_COLUMN_COUNT, NativeField, NativeStateBoundary, NativeTraceWitness,
-    TRACE_BEFORE_STATE_START, UNIFORM_ROW_COUNT, UniformRelation,
+    NATIVE_TRACE_COLUMN_COUNT, NativeField, NativeProtocolVersion, NativeStateBoundary,
+    NativeTraceWitness, TRACE_BEFORE_STATE_START, UNIFORM_ROW_COUNT, UniformRelation,
 };
 
 fn two_row_trace() -> Result<NativeTraceWitness, Box<dyn std::error::Error>> {
@@ -67,7 +67,10 @@ fn inverse_relation_and_global_sum_accept_exact_chain() -> Result<(), Box<dyn st
     let claim = NativeExecutionClaim::from_trace(&trace)?;
     let challenges = fixed_challenges();
     let inverses = inverse_columns(trace.columns(), challenges)?;
-    let relation = ContinuityRelation { challenges };
+    let relation = ContinuityRelation {
+        protocol: NativeProtocolVersion::current(),
+        challenges,
+    };
     for row_index in [0, 1, 2] {
         let mut row = trace
             .columns()

@@ -97,13 +97,14 @@ pub use pcs_batch_gate::{
     run_pcs_batch_gate_worker,
 };
 pub use receipt::{
-    CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
-    MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
-    MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION, NativeBoundary, NativeReceipt,
-    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentReceipt, NativeSegmentWitness,
-    NativeStatement, ProtocolLogCounts, ProtocolLogIdentities, ProtocolLogKind,
-    VerifiedNativeReceipt, VerifiedNativeSpool, verify_native_receipt, verify_native_receipt_bytes,
-    verify_native_receipt_reader, verify_native_spool_reader,
+    CommitmentIdentity, CommitmentKind, LEGACY_NATIVE_RECEIPT_VERSION, MAX_NATIVE_RECEIPT_BYTES,
+    MAX_NATIVE_ROM_COMMITMENT_BYTES, MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT,
+    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
+    NativeBoundary, NativeReceipt, NativeReceiptError, NativeReceiptStreamProver,
+    NativeSegmentReceipt, NativeSegmentWitness, NativeStatement, ProtocolLogCounts,
+    ProtocolLogIdentities, ProtocolLogKind, VerifiedNativeReceipt, VerifiedNativeSpool,
+    verify_native_receipt, verify_native_receipt_bytes, verify_native_receipt_reader,
+    verify_native_spool_reader,
 };
 pub use rom_lookup::{
     CommittedRom, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment, RomLookupColumns,
@@ -164,9 +165,19 @@ pub const JOLT_FIELD_REVISION: &str = "72dc6451628d8b1dd794147a1f1cc40be0d77963"
 pub const AKITA_BASELINE_SCHEDULE_SHA256: &str =
     "c2098502e4c976a6a6cf687e4f70acfcb818372e2fbd589bff7b18e8decfa9cf";
 
-/// SHA-256 of the generated 14-variable, 128-column relation schedule.
-pub const AKITA_SCHEDULE_SHA256: &str =
+/// SHA-256 of the version-one 14-variable, 128-column relation schedule.
+pub const AKITA_SCHEDULE_SHA256_V1: &str =
     "e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646";
+
+/// SHA-256 of the version-two paired 14-variable, 128-column relation schedule.
+pub const AKITA_SCHEDULE_SHA256_V2: &str =
+    "1cd339f09114c2a941abbfb434ab795868866cb15485f83300d81cee7bf46e71";
+
+/// SHA-256 of the current native trace schedule.
+pub const AKITA_SCHEDULE_SHA256: &str = AKITA_SCHEDULE_SHA256_V2;
+
+/// SHA-256 of the single-group schedule used by v2 auxiliary trace planes.
+pub const AKITA_AUXILIARY_SCHEDULE_SHA256: &str = AKITA_SCHEDULE_SHA256_V1;
 
 /// SHA-256 of the generated 9-variable, 128-column fixed-ISA schedule.
 pub const AKITA_ISA_TABLE_SCHEDULE_SHA256: &str =
@@ -184,8 +195,69 @@ pub const AKITA_MEMORY_SCHEDULE_SHA256: &str =
 pub const AKITA_LOG_SCHEDULE_SHA256: &str =
     "2dba5b6d53ca57eaee58c872ceba3cdf6c7dbfe522162144577e71cadf543a80";
 
-/// Stable protocol identifier for the first native SM83 Akita integration.
-pub const PROTOCOL_ID: &str = "zksm83-native-jolt-akita-v1";
+/// Stable protocol identifier for verification-only version-one receipts.
+pub const PROTOCOL_ID_V1: &str = "zksm83-native-jolt-akita-v1";
+
+/// Stable protocol identifier for canonical version-two receipts.
+pub const PROTOCOL_ID_V2: &str = "zksm83-native-jolt-akita-v2";
+
+/// Stable protocol identifier emitted by the current prover.
+pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
+
+/// Supported native receipt protocol revisions.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeProtocolVersion {
+    /// Historical independent-opening receipt accepted only for verification.
+    V1,
+    /// Canonical paired-opening receipt emitted by current provers.
+    V2,
+}
+
+impl NativeProtocolVersion {
+    /// Returns the protocol emitted by current provers.
+    #[must_use]
+    pub const fn current() -> Self {
+        Self::V2
+    }
+
+    /// Decodes a canonical receipt version number.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::V1),
+            2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical receipt version number.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Returns the stable protocol identifier.
+    #[must_use]
+    pub const fn protocol_id(self) -> &'static str {
+        match self {
+            Self::V1 => PROTOCOL_ID_V1,
+            Self::V2 => PROTOCOL_ID_V2,
+        }
+    }
+
+    /// Returns the pinned trace schedule digest.
+    #[must_use]
+    pub const fn trace_schedule_sha256(self) -> &'static str {
+        match self {
+            Self::V1 => AKITA_SCHEDULE_SHA256_V1,
+            Self::V2 => AKITA_SCHEDULE_SHA256_V2,
+        }
+    }
+}
 
 /// Privacy guarantee implemented by a proof backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -217,6 +289,8 @@ pub struct BackendIdentity {
     pub jolt_field_revision: &'static str,
     /// Digest of the embedded schedule artifact.
     pub schedule_sha256: &'static str,
+    /// Digest of the single-group schedule used by auxiliary trace planes.
+    pub auxiliary_schedule_sha256: &'static str,
     /// Digest of the embedded fixed-ISA table schedule artifact.
     pub isa_table_schedule_sha256: &'static str,
     /// Digest of the embedded one-MiB ROM schedule artifact.
@@ -249,12 +323,19 @@ pub struct BackendIdentity {
 
 /// Returns the exact backend identity that receipts must bind.
 pub const fn backend_identity() -> BackendIdentity {
+    backend_identity_for(NativeProtocolVersion::current())
+}
+
+/// Returns the exact backend identity bound by one supported receipt protocol.
+#[must_use]
+pub const fn backend_identity_for(protocol: NativeProtocolVersion) -> BackendIdentity {
     BackendIdentity {
-        protocol: PROTOCOL_ID,
+        protocol: protocol.protocol_id(),
         jolt_reference_revision: JOLT_REFERENCE_REVISION,
         akita_revision: AKITA_REVISION,
         jolt_field_revision: JOLT_FIELD_REVISION,
-        schedule_sha256: AKITA_SCHEDULE_SHA256,
+        schedule_sha256: protocol.trace_schedule_sha256(),
+        auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256,
         isa_table_schedule_sha256: AKITA_ISA_TABLE_SCHEDULE_SHA256,
         rom_schedule_sha256: AKITA_ROM_SCHEDULE_SHA256,
         memory_schedule_sha256: AKITA_MEMORY_SCHEDULE_SHA256,
@@ -274,7 +355,10 @@ pub const fn backend_identity() -> BackendIdentity {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProofPrivacy, backend_identity};
+    use super::{
+        LEGACY_NATIVE_RECEIPT_VERSION, NATIVE_RECEIPT_VERSION, NativeProtocolVersion, ProofPrivacy,
+        backend_identity, backend_identity_for,
+    };
 
     #[test]
     fn backend_identity_excludes_rv64_and_witness_hiding() {
@@ -282,5 +366,20 @@ mod tests {
         assert!(!identity.uses_rv64_guest);
         assert_eq!(identity.privacy, ProofPrivacy::Transparent);
         assert!(!identity.privacy.hides_witness());
+    }
+
+    #[test]
+    fn protocol_versions_have_distinct_backend_identities() {
+        let legacy = backend_identity_for(NativeProtocolVersion::V1);
+        let current = backend_identity_for(NativeProtocolVersion::V2);
+        assert_ne!(legacy.protocol, current.protocol);
+        assert_ne!(legacy.schedule_sha256, current.schedule_sha256);
+        assert_eq!(backend_identity(), current);
+        assert_eq!(
+            NativeProtocolVersion::V1.code(),
+            LEGACY_NATIVE_RECEIPT_VERSION
+        );
+        assert_eq!(NativeProtocolVersion::V2.code(), NATIVE_RECEIPT_VERSION);
+        assert_eq!(NativeProtocolVersion::current(), NativeProtocolVersion::V2);
     }
 }

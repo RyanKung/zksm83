@@ -8,20 +8,24 @@ use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
 
 use crate::{
-    AKITA_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeStateBoundary, NativeTraceWitness,
-    PROTOCOL_ID, STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_STATE_START,
-    TRACE_BEFORE_STATE_START, TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START, UNIFORM_NUM_VARIABLES,
-    UNIFORM_ROW_COUNT, UniformError, UniformRelation, WitnessCommitments,
+    AkitaWorkerError, NativeField, NativeProtocolVersion, NativeStateBoundary, NativeTraceWitness,
+    STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_STATE_START, TRACE_BEFORE_STATE_START,
+    TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
+    UniformError, UniformRelation, WitnessCommitments,
     pcs::OpeningProof,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        prove_witness_opening, verify_uniform_composite, verify_witness_opening,
+        prove_witness_opening, verify_uniform_composite_for_protocol,
+        verify_witness_opening_for_protocol,
     },
 };
 
 const CLAIM_DOMAIN: &[u8] = b"zksm83/native-execution-claim/v1";
+const CLAIM_DOMAIN_V2: &[u8] = b"zksm83/native-execution-claim/v2";
 const CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-continuity-challenges/v1";
+const CHALLENGE_DOMAIN_V2: &[u8] = b"zksm83-native-continuity-challenges/v2";
 const SUM_DOMAIN: &[u8] = b"zksm83-native-continuity-sum/v1";
+const SUM_DOMAIN_V2: &[u8] = b"zksm83-native-continuity-sum/v2";
 const INVERSE_COLUMN_COUNT: usize = 4;
 
 /// Public semantic claim for one fixed-capacity native trace segment.
@@ -124,8 +128,16 @@ impl NativeExecutionClaim {
     /// Returns the canonical protocol encoding of this public claim.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.canonical_bytes_for(NativeProtocolVersion::current())
+    }
+
+    pub(crate) fn canonical_bytes_for(&self, protocol: NativeProtocolVersion) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(24 + 16 * STATE_SCALAR_COUNT);
-        append_bytes_infallible(&mut bytes, CLAIM_DOMAIN);
+        let domain = match protocol {
+            NativeProtocolVersion::V1 => CLAIM_DOMAIN,
+            NativeProtocolVersion::V2 => CLAIM_DOMAIN_V2,
+        };
+        append_bytes_infallible(&mut bytes, domain);
         bytes.extend_from_slice(&self.active_row_count.to_le_bytes());
         self.initial_state.append_canonical_bytes(&mut bytes);
         self.final_state.append_canonical_bytes(&mut bytes);
@@ -147,15 +159,19 @@ pub fn prove_continuity(
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
 ) -> Result<ContinuityProof, ContinuityError> {
+    let protocol = NativeProtocolVersion::current();
     claim.validate()?;
-    let phase_one = phase_one_descriptor(trace_witness.commitments(), claim)?;
-    let challenges = challenges(&phase_one)?;
+    let phase_one = phase_one_descriptor(protocol, trace_witness.commitments(), claim)?;
+    let challenges = challenges(protocol, &phase_one)?;
     let inverse_columns = inverse_columns(trace.columns(), challenges)?;
     let inverses = crate::commit_witness(&inverse_columns)?;
-    let relation = ContinuityRelation { challenges };
+    let relation = ContinuityRelation {
+        protocol,
+        challenges,
+    };
     let relation_proof = prove_uniform_composite(&relation, trace_witness, &inverses)?;
-    let full = full_descriptor(&phase_one, inverses.commitments())?;
-    let sum = on_worker(|| prove_sum(&inverses, claim, challenges, &full))?;
+    let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
+    let sum = on_worker(|| prove_sum(protocol, &inverses, claim, challenges, &full))?;
     Ok(ContinuityProof {
         inverse_commitments: inverses.into_commitments(),
         relation: relation_proof,
@@ -169,19 +185,33 @@ pub fn verify_continuity(
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<(), ContinuityError> {
+    verify_continuity_for_protocol(NativeProtocolVersion::current(), proof, trace, claim)
+}
+
+pub(crate) fn verify_continuity_for_protocol(
+    protocol: NativeProtocolVersion,
+    proof: &ContinuityProof,
+    trace: &WitnessCommitments,
+    claim: &NativeExecutionClaim,
+) -> Result<(), ContinuityError> {
     claim.validate()?;
-    let phase_one = phase_one_descriptor(trace, claim)?;
-    let challenges = challenges(&phase_one)?;
-    let relation = ContinuityRelation { challenges };
-    verify_uniform_composite(
+    let phase_one = phase_one_descriptor(protocol, trace, claim)?;
+    let challenges = challenges(protocol, &phase_one)?;
+    let relation = ContinuityRelation {
+        protocol,
+        challenges,
+    };
+    verify_uniform_composite_for_protocol(
+        protocol,
         &relation,
         trace,
         &proof.inverse_commitments,
         &proof.relation,
     )?;
-    let full = full_descriptor(&phase_one, &proof.inverse_commitments)?;
+    let full = full_descriptor(protocol, &phase_one, &proof.inverse_commitments)?;
     on_worker(|| {
         verify_sum(
+            protocol,
             &proof.sum,
             &proof.inverse_commitments,
             claim,
@@ -202,12 +232,16 @@ fn on_worker<T: Send>(
 }
 
 struct ContinuityRelation {
+    protocol: NativeProtocolVersion,
     challenges: ContinuityChallenges,
 }
 
 impl UniformRelation for ContinuityRelation {
     fn domain(&self) -> &'static [u8] {
-        b"zksm83/native-continuity-inverses/v1"
+        match self.protocol {
+            NativeProtocolVersion::V1 => b"zksm83/native-continuity-inverses/v1",
+            NativeProtocolVersion::V2 => b"zksm83/native-continuity-inverses/v2",
+        }
     }
 
     fn statement_bytes(&self) -> Vec<u8> {
@@ -332,12 +366,13 @@ fn push_inverse(
 }
 
 fn prove_sum(
+    protocol: NativeProtocolVersion,
     inverses: &CommittedWitness,
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
 ) -> Result<ContinuitySumProof, ContinuityError> {
-    let descriptor = sum_descriptor(full_descriptor)?;
+    let descriptor = sum_descriptor(protocol, full_descriptor)?;
     let point = half_point()?;
     let values = inverses
         .field_columns()
@@ -350,15 +385,23 @@ fn prove_sum(
 }
 
 fn verify_sum(
+    protocol: NativeProtocolVersion,
     proof: &ContinuitySumProof,
     inverses: &WitnessCommitments,
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
 ) -> Result<(), ContinuityError> {
-    let descriptor = sum_descriptor(full_descriptor)?;
+    let descriptor = sum_descriptor(protocol, full_descriptor)?;
     let point = half_point()?;
-    verify_witness_opening(inverses, &point, &proof.values, &descriptor, &proof.opening)?;
+    verify_witness_opening_for_protocol(
+        protocol,
+        inverses,
+        &point,
+        &proof.values,
+        &descriptor,
+        &proof.opening,
+    )?;
     check_sum(&proof.values, claim, challenges)
 }
 
@@ -440,29 +483,38 @@ fn state_token_from_trace(
 }
 
 fn phase_one_descriptor(
+    protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<Vec<u8>, ContinuityError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
-    push_bytes(&mut descriptor, AKITA_SCHEDULE_SHA256.as_bytes())?;
-    push_bytes(&mut descriptor, &trace.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &claim.canonical_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
+    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
+    push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
+    push_bytes(&mut descriptor, &claim.canonical_bytes_for(protocol))?;
     Ok(descriptor)
 }
 
 fn full_descriptor(
+    protocol: NativeProtocolVersion,
     phase_one: &[u8],
     inverses: &WitnessCommitments,
 ) -> Result<Vec<u8>, ContinuityError> {
     let mut descriptor = Vec::new();
     push_bytes(&mut descriptor, phase_one)?;
-    push_bytes(&mut descriptor, &inverses.canonical_bytes()?)?;
+    push_bytes(&mut descriptor, &inverses.canonical_bytes_for(protocol)?)?;
     Ok(descriptor)
 }
 
-fn challenges(descriptor: &[u8]) -> Result<ContinuityChallenges, ContinuityError> {
-    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(CHALLENGE_DOMAIN);
+fn challenges(
+    protocol: NativeProtocolVersion,
+    descriptor: &[u8],
+) -> Result<ContinuityChallenges, ContinuityError> {
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => CHALLENGE_DOMAIN,
+        NativeProtocolVersion::V2 => CHALLENGE_DOMAIN_V2,
+    };
+    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(domain);
     transcript.bind_instance_bytes(descriptor);
     let state_mix = transcript.challenge_scalar(b"state-mix");
     let inverse_point = transcript.challenge_scalar(b"inverse-point");
@@ -475,9 +527,16 @@ fn challenges(descriptor: &[u8]) -> Result<ContinuityChallenges, ContinuityError
     })
 }
 
-fn sum_descriptor(full: &[u8]) -> Result<Vec<u8>, ContinuityError> {
+fn sum_descriptor(
+    protocol: NativeProtocolVersion,
+    full: &[u8],
+) -> Result<Vec<u8>, ContinuityError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, SUM_DOMAIN)?;
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => SUM_DOMAIN,
+        NativeProtocolVersion::V2 => SUM_DOMAIN_V2,
+    };
+    push_bytes(&mut descriptor, domain)?;
     push_bytes(&mut descriptor, full)?;
     Ok(descriptor)
 }

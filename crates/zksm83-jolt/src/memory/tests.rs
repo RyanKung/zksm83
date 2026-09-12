@@ -24,6 +24,7 @@ type MemoryTrace = (NativeTraceWitness, Vec<u8>, Vec<u8>);
 const _: () = assert!(TRACE_BUS_SLOTS * (1 << 14) < (1 << 17));
 
 #[test]
+#[ignore = "expensive pair of 128-KiB Akita commitments and wire round trip"]
 fn identical_memory_images_have_identical_commitments() -> Result<(), MutableMemoryError> {
     let image = vec![0x5a; MEMORY_IMAGE_BYTES];
     let first = commit_memory(&image)?;

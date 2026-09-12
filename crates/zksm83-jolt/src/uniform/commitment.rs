@@ -7,24 +7,45 @@ use akita_pcs::AkitaCommitmentScheme;
 
 #[cfg(test)]
 use crate::pcs::scheme as pcs_scheme;
-use crate::pcs::{
-    ColumnCommitments, CommittedColumns, OpeningProof as PcsOpeningProof, PcsError, PcsLayout,
-    commit_columns as commit_pcs_columns, prove_opening as prove_pcs_opening,
-    verify_opening as verify_pcs_opening,
+use crate::{
+    NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion,
+    pcs::{
+        ColumnCommitments, CommittedColumns, OpeningProof as PcsOpeningProof, PcsError, PcsLayout,
+        commit_columns as commit_pcs_columns, prove_opening as prove_pcs_opening,
+        verify_opening as verify_pcs_opening,
+    },
 };
 
 use super::{COMMITMENT_GROUP_COLUMNS, NativeField, UNIFORM_NUM_VARIABLES, UniformError};
 
-const PCS_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-shared-opening/v1";
-const COMMITMENT_ENCODING_DOMAIN: &[u8] = b"zksm83/native-witness-commitments/v1";
-pub(super) const SCHEDULE_ARTIFACT: &[u8] =
+const PCS_TRANSCRIPT_DOMAIN_V1: &[u8] = b"zksm83-native-shared-opening/v1";
+const COMMITMENT_ENCODING_DOMAIN_V1: &[u8] = b"zksm83/native-witness-commitments/v1";
+const PCS_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-shared-opening/v2";
+const COMMITMENT_ENCODING_DOMAIN_V2: &[u8] = b"zksm83/native-witness-commitments/v2";
+pub(super) const LEGACY_SCHEDULE_ARTIFACT: &[u8] =
     include_bytes!("../../protocol/akita/fp128_dense_bounded_nv14_p128.aks");
-const LAYOUT: PcsLayout = PcsLayout::new(
+pub(super) const SCHEDULE_ARTIFACT: &[u8] =
+    include_bytes!("../../protocol/akita/fp128_dense_bounded_nv14_p128_pair.aks");
+const LEGACY_LAYOUT: PcsLayout = PcsLayout::new(
+    UNIFORM_NUM_VARIABLES,
+    COMMITMENT_GROUP_COLUMNS,
+    LEGACY_SCHEDULE_ARTIFACT,
+    COMMITMENT_ENCODING_DOMAIN_V1,
+    PCS_TRANSCRIPT_DOMAIN_V1,
+);
+const V2_SINGLE_LAYOUT: PcsLayout = PcsLayout::new(
+    UNIFORM_NUM_VARIABLES,
+    COMMITMENT_GROUP_COLUMNS,
+    LEGACY_SCHEDULE_ARTIFACT,
+    COMMITMENT_ENCODING_DOMAIN_V2,
+    PCS_TRANSCRIPT_DOMAIN_V2,
+);
+const V2_TRACE_LAYOUT: PcsLayout = PcsLayout::paired(
     UNIFORM_NUM_VARIABLES,
     COMMITMENT_GROUP_COLUMNS,
     SCHEDULE_ARTIFACT,
-    COMMITMENT_ENCODING_DOMAIN,
-    PCS_TRANSCRIPT_DOMAIN,
+    COMMITMENT_ENCODING_DOMAIN_V2,
+    PCS_TRANSCRIPT_DOMAIN_V2,
 );
 
 /// Prover-owned committed witness plane.
@@ -69,7 +90,7 @@ impl WitnessCommitments {
         self.inner.column_count()
     }
 
-    /// Returns the number of independently opened Akita commitment groups.
+    /// Returns the number of fixed-width Akita commitment groups.
     #[must_use]
     pub fn group_count(&self) -> usize {
         self.inner.group_count()
@@ -77,21 +98,48 @@ impl WitnessCommitments {
 
     /// Returns the canonical protocol encoding of the commitment identity.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, UniformError> {
-        self.inner.canonical_bytes(LAYOUT).map_err(map_pcs_error)
+        self.canonical_bytes_for(NativeProtocolVersion::current())
     }
 
     /// Returns SHA-256 of the canonical commitment identity.
     pub fn digest(&self) -> Result<[u8; 32], UniformError> {
-        self.inner.digest(LAYOUT).map_err(map_pcs_error)
+        self.digest_for(NativeProtocolVersion::current())
     }
 
-    pub(super) fn validate(&self) -> Result<(), UniformError> {
-        self.inner.validate(LAYOUT).map_err(map_pcs_error)
+    pub(crate) fn canonical_bytes_for(
+        &self,
+        protocol: NativeProtocolVersion,
+    ) -> Result<Vec<u8>, UniformError> {
+        self.inner
+            .canonical_bytes(layout_for(protocol, self.column_count()))
+            .map_err(map_pcs_error)
+    }
+
+    pub(crate) fn digest_for(
+        &self,
+        protocol: NativeProtocolVersion,
+    ) -> Result<[u8; 32], UniformError> {
+        self.inner
+            .digest(layout_for(protocol, self.column_count()))
+            .map_err(map_pcs_error)
+    }
+
+    pub(crate) fn validate_for(&self, protocol: NativeProtocolVersion) -> Result<(), UniformError> {
+        self.inner
+            .validate(layout_for(protocol, self.column_count()))
+            .map_err(map_pcs_error)
     }
 }
 
 pub(super) fn commit_columns(columns: &[Vec<u64>]) -> Result<CommittedWitness, UniformError> {
-    commit_pcs_columns(LAYOUT, columns)
+    commit_columns_for(NativeProtocolVersion::current(), columns)
+}
+
+pub(super) fn commit_columns_for(
+    protocol: NativeProtocolVersion,
+    columns: &[Vec<u64>],
+) -> Result<CommittedWitness, UniformError> {
+    commit_pcs_columns(layout_for(protocol, columns.len()), columns)
         .map(|inner| CommittedWitness {
             commitments: WitnessCommitments {
                 inner: inner.commitments().clone(),
@@ -108,7 +156,7 @@ pub(super) fn prove_opening(
     instance_descriptor: &[u8],
 ) -> Result<OpeningProof, UniformError> {
     prove_pcs_opening(
-        LAYOUT,
+        witness.inner.layout(),
         &witness.inner,
         point,
         logical_values,
@@ -117,7 +165,8 @@ pub(super) fn prove_opening(
     .map_err(map_pcs_error)
 }
 
-pub(super) fn verify_opening(
+pub(super) fn verify_opening_for_protocol(
+    protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     logical_values: &[NativeField],
@@ -125,7 +174,7 @@ pub(super) fn verify_opening(
     opening: &OpeningProof,
 ) -> Result<(), UniformError> {
     verify_pcs_opening(
-        LAYOUT,
+        layout_for(protocol, commitments.column_count()),
         &commitments.inner,
         point,
         logical_values,
@@ -137,7 +186,15 @@ pub(super) fn verify_opening(
 
 #[cfg(test)]
 pub(super) fn scheme() -> Result<AkitaCommitmentScheme<fp128::DenseBounded>, UniformError> {
-    pcs_scheme(LAYOUT).map_err(map_pcs_error)
+    pcs_scheme(V2_TRACE_LAYOUT).map_err(map_pcs_error)
+}
+
+const fn layout_for(protocol: NativeProtocolVersion, column_count: usize) -> PcsLayout {
+    match protocol {
+        NativeProtocolVersion::V1 => LEGACY_LAYOUT,
+        NativeProtocolVersion::V2 if column_count == NATIVE_TRACE_COLUMN_COUNT => V2_TRACE_LAYOUT,
+        NativeProtocolVersion::V2 => V2_SINGLE_LAYOUT,
+    }
 }
 
 fn map_pcs_error(error: PcsError) -> UniformError {

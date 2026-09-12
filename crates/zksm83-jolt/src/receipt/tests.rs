@@ -8,7 +8,10 @@ use super::{
     NativeSegmentWitness, NativeStatement, ProtocolLogIdentities, verify_native_receipt,
     verify_native_receipt_bytes, verify_native_receipt_reader,
 };
-use crate::{MEMORY_IMAGE_BYTES, NativeStateBoundary, NativeTraceWitness, ROM_IMAGE_BYTES};
+use crate::{
+    MEMORY_IMAGE_BYTES, NativeProtocolVersion, NativeStateBoundary, NativeTraceWitness,
+    ROM_IMAGE_BYTES,
+};
 
 #[test]
 fn commitment_kind_codes_are_stable_and_reject_unknown_values() {
@@ -53,6 +56,67 @@ fn statement_wire_is_canonical_and_binds_every_field() -> Result<(), Box<dyn std
     tampered.statement_id[0] ^= 1;
     assert!(NativeStatement::from_bytes(&tampered.to_bytes()?).is_err());
     Ok(())
+}
+
+#[test]
+fn statement_wire_keeps_v1_read_only_and_separates_v2() -> Result<(), Box<dyn std::error::Error>> {
+    let v1 = structural_statement_for(NativeProtocolVersion::V1)?;
+    let v2 = structural_statement_for(NativeProtocolVersion::V2)?;
+    let v1_bytes = v1.to_bytes()?;
+    let v2_bytes = v2.to_bytes()?;
+
+    assert_eq!(v1_bytes.get(..8), Some(b"ZKSM83S1".as_slice()));
+    assert_eq!(v2_bytes.get(..8), Some(b"ZKSM83S2".as_slice()));
+    assert_eq!(NativeStatement::from_bytes(&v1_bytes)?, v1);
+    assert_eq!(NativeStatement::from_bytes(&v2_bytes)?, v2);
+    assert_ne!(v1.statement_id(), v2.statement_id());
+    assert_ne!(v1.backend_digest(), v2.backend_digest());
+
+    let mut relabeled = v2_bytes;
+    relabeled
+        .get_mut(..8)
+        .ok_or("missing statement magic")?
+        .copy_from_slice(b"ZKSM83S1");
+    assert!(NativeStatement::from_bytes(&relabeled).is_err());
+    Ok(())
+}
+
+#[test]
+fn receipt_magic_and_numeric_version_must_agree() -> Result<(), Box<dyn std::error::Error>> {
+    for (magic, wrong_version) in [(b"ZKSM83R1", 2_u64), (b"ZKSM83R2", 1_u64)] {
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(&wrong_version.to_le_bytes());
+        assert!(NativeReceipt::from_bytes(&bytes).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_and_embedded_statement_versions_cannot_be_mixed()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (receipt_magic, version, statement_protocol) in [
+        (b"ZKSM83R1", 1_u64, NativeProtocolVersion::V2),
+        (b"ZKSM83R2", 2_u64, NativeProtocolVersion::V1),
+    ] {
+        let statement = structural_statement_for(statement_protocol)?.to_bytes()?;
+        let mut bytes = receipt_magic.to_vec();
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&u64::try_from(statement.len())?.to_le_bytes());
+        bytes.extend_from_slice(&statement);
+        assert!(matches!(
+            NativeReceipt::from_bytes(&bytes),
+            Err(super::NativeReceiptError::UnsupportedBackend)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn v1_backend_digest_remains_byte_compatible() {
+    assert_eq!(
+        hex::encode(super::identity::backend_digest(NativeProtocolVersion::V1)),
+        "fe6d281688b19eb1adedc36a91f6c7138ee8224ccbd70479db07c1f41855d474"
+    );
 }
 
 #[test]
@@ -103,12 +167,16 @@ fn zero_cursor_requires_the_unique_empty_log_identity() -> Result<(), Box<dyn st
     let statement = structural_statement()?;
     let mut boundary = statement.initial.clone();
     boundary.logs.bus.digest[0] ^= 1;
-    assert!(boundary.validate().is_err());
+    assert!(
+        boundary
+            .validate_for(NativeProtocolVersion::current())
+            .is_err()
+    );
     Ok(())
 }
 
 #[test]
-#[ignore = "expensive complete native receipt, canonical wire, and tamper matrix gate"]
+#[ignore = "expensive complete v2 paired receipt, canonical wire, and tamper matrix gate"]
 fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
 -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -186,7 +254,7 @@ fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
 }
 
 #[test]
-#[ignore = "expensive two-segment native receipt and exact boundary-chain gate"]
+#[ignore = "expensive two-segment v2 paired receipt and exact boundary-chain gate"]
 fn two_segment_receipt_authenticates_exact_shared_boundary()
 -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -250,10 +318,17 @@ fn two_segment_receipt_authenticates_exact_shared_boundary()
 }
 
 fn structural_statement() -> Result<NativeStatement, Box<dyn std::error::Error>> {
+    structural_statement_for(NativeProtocolVersion::current())
+}
+
+fn structural_statement_for(
+    protocol: NativeProtocolVersion,
+) -> Result<NativeStatement, Box<dyn std::error::Error>> {
     let mut scalars = [0_u64; crate::STATE_SCALAR_COUNT];
     scalars[20] = 1;
     let state = NativeStateBoundary::from_scalars(scalars);
     let memory = super::identity::direct_identity(
+        protocol,
         CommitmentKind::MutableMemory,
         u64::try_from(MEMORY_IMAGE_BYTES)?,
         b"structural-memory-commitment",
@@ -261,14 +336,15 @@ fn structural_statement() -> Result<NativeStatement, Box<dyn std::error::Error>>
     let boundary = NativeBoundary {
         state,
         memory,
-        logs: ProtocolLogIdentities::empty(),
+        logs: ProtocolLogIdentities::empty_for(protocol),
     };
     let rom = super::identity::direct_identity(
+        protocol,
         CommitmentKind::Rom,
         u64::try_from(ROM_IMAGE_BYTES)?,
         b"structural-rom-commitment",
     )?;
-    NativeStatement::new(rom, boundary.clone(), boundary, 1, 1).map_err(Into::into)
+    NativeStatement::new_for(protocol, rom, boundary.clone(), boundary, 1, 1).map_err(Into::into)
 }
 
 type ReceiptTrace = (NativeTraceWitness, Vec<u8>, Vec<u8>, Vec<u8>);
@@ -334,11 +410,13 @@ fn two_segment_trace() -> Result<TwoSegmentTrace, Box<dyn std::error::Error>> {
 fn direct_commitment_identities_are_typed_and_layout_separated()
 -> Result<(), Box<dyn std::error::Error>> {
     let rom_identity: CommitmentIdentity = super::identity::direct_identity(
+        NativeProtocolVersion::current(),
         CommitmentKind::Rom,
         u64::try_from(ROM_IMAGE_BYTES)?,
         b"same-commitment-bytes",
     )?;
     let memory_identity = super::identity::direct_identity(
+        NativeProtocolVersion::current(),
         CommitmentKind::MutableMemory,
         u64::try_from(MEMORY_IMAGE_BYTES)?,
         b"same-commitment-bytes",

@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     AKITA_ISA_TABLE_SCHEDULE_SHA256, AkitaWorkerError, COMMITMENT_GROUP_COLUMNS, ISA_OUTPUT_COUNT,
-    ISA_TABLE_ROW_COUNT, IsaTableError, NativeField, PROTOCOL_ID, UNIFORM_NUM_VARIABLES,
+    ISA_TABLE_ROW_COUNT, IsaTableError, NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES,
     UniformError, fixed_isa_table, fixed_isa_table_digest,
     pcs::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
@@ -13,7 +13,8 @@ use crate::{
     },
     sumcheck::{MultiProductSumcheckProof, ProductSumcheckError, ProductSumcheckProof},
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_opening, verify_witness_opening,
+        CommittedWitness, WitnessCommitments, prove_witness_opening,
+        verify_witness_opening_for_protocol,
     },
 };
 
@@ -26,6 +27,7 @@ pub const FIXED_ISA_TABLE_COMMITMENT_SHA256: &str =
 
 const ISA_TABLE_NUM_VARIABLES: usize = 9;
 const ISA_LOOKUP_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-isa-shout/v1";
+const ISA_LOOKUP_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-isa-shout/v2";
 const ISA_TABLE_COMMITMENT_DOMAIN: &[u8] = b"zksm83/native-isa-table-commitment/v1";
 const ISA_TABLE_OPENING_DOMAIN: &[u8] = b"zksm83-native-isa-table-opening/v1";
 const ISA_SCHEDULE_ARTIFACT: &[u8] =
@@ -206,7 +208,21 @@ pub fn verify_isa_lookup(
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
 ) -> Result<(), IsaLookupError> {
-    on_worker(|| verify_isa_lookup_on_worker(layout, trace_commitments, proof))
+    verify_isa_lookup_for_protocol(
+        NativeProtocolVersion::current(),
+        layout,
+        trace_commitments,
+        proof,
+    )
+}
+
+pub(crate) fn verify_isa_lookup_for_protocol(
+    protocol: NativeProtocolVersion,
+    layout: IsaLookupColumns,
+    trace_commitments: &WitnessCommitments,
+    proof: &IsaLookupProof,
+) -> Result<(), IsaLookupError> {
+    on_worker(|| verify_isa_lookup_on_worker(protocol, layout, trace_commitments, proof))
 }
 
 fn prove_isa_lookup_on_worker(
@@ -218,8 +234,10 @@ fn prove_isa_lookup_on_worker(
     let table_commitments = FixedIsaCommitments {
         inner: table.commitments().clone(),
     };
-    let descriptor = instance_descriptor(layout, &table_commitments, witness.commitments())?;
-    let mut transcript = lookup_transcript(&descriptor, TranscriptSide::Prover);
+    let protocol = NativeProtocolVersion::current();
+    let descriptor =
+        instance_descriptor(protocol, layout, &table_commitments, witness.commitments())?;
+    let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let output_mix = nonzero_challenge(&mut transcript, b"isa-output-mix")?;
     let coefficients = challenge_powers(output_mix, ISA_OUTPUT_COUNT);
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"isa-cycle-point");
@@ -297,14 +315,20 @@ fn prove_isa_lookup_on_worker(
 }
 
 fn verify_isa_lookup_on_worker(
+    protocol: NativeProtocolVersion,
     layout: IsaLookupColumns,
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
 ) -> Result<(), IsaLookupError> {
     layout.validate(trace_commitments.column_count())?;
     validate_fixed_commitments(&proof.table_commitments)?;
-    let descriptor = instance_descriptor(layout, &proof.table_commitments, trace_commitments)?;
-    let mut transcript = lookup_transcript(&descriptor, TranscriptSide::Verifier);
+    let descriptor = instance_descriptor(
+        protocol,
+        layout,
+        &proof.table_commitments,
+        trace_commitments,
+    )?;
+    let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Verifier);
     let output_mix = nonzero_challenge(&mut transcript, b"isa-output-mix")?;
     let coefficients = challenge_powers(output_mix, ISA_OUTPUT_COUNT);
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"isa-cycle-point");
@@ -335,7 +359,8 @@ fn verify_isa_lookup_on_worker(
         ISA_ADDRESS_BIT_COUNT + 1,
         &mut transcript,
     )?;
-    verify_witness_opening(
+    verify_witness_opening_for_protocol(
+        protocol,
         trace_commitments,
         &cycle_point,
         &proof.trace_cycle_values,
@@ -349,7 +374,8 @@ fn verify_isa_lookup_on_worker(
         proof.claimed_output,
         IsaLookupError::OutputClaimMismatch,
     )?;
-    verify_witness_opening(
+    verify_witness_opening_for_protocol(
+        protocol,
         trace_commitments,
         &address_point,
         &proof.trace_address_values,
@@ -514,12 +540,13 @@ fn verify_address_terminal(
 }
 
 fn instance_descriptor(
+    protocol: NativeProtocolVersion,
     layout: IsaLookupColumns,
     table_commitments: &FixedIsaCommitments,
     trace_commitments: &WitnessCommitments,
 ) -> Result<Vec<u8>, IsaLookupError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, PROTOCOL_ID.as_bytes())?;
+    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
     push_bytes(&mut descriptor, AKITA_ISA_TABLE_SCHEDULE_SHA256.as_bytes())?;
     push_bytes(&mut descriptor, &fixed_isa_table_digest()?)?;
     push_usize(&mut descriptor, ISA_TABLE_ROW_COUNT)?;
@@ -527,7 +554,10 @@ fn instance_descriptor(
     push_indices(&mut descriptor, &layout.address_bits)?;
     push_indices(&mut descriptor, &layout.outputs)?;
     push_bytes(&mut descriptor, &table_commitments.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &trace_commitments.canonical_bytes()?)?;
+    push_bytes(
+        &mut descriptor,
+        &trace_commitments.canonical_bytes_for(protocol)?,
+    )?;
     Ok(descriptor)
 }
 
@@ -536,10 +566,18 @@ enum TranscriptSide {
     Verifier,
 }
 
-fn lookup_transcript(descriptor: &[u8], side: TranscriptSide) -> AkitaTranscript<NativeField> {
+fn lookup_transcript(
+    protocol: NativeProtocolVersion,
+    descriptor: &[u8],
+    side: TranscriptSide,
+) -> AkitaTranscript<NativeField> {
+    let domain = match protocol {
+        NativeProtocolVersion::V1 => ISA_LOOKUP_TRANSCRIPT_DOMAIN,
+        NativeProtocolVersion::V2 => ISA_LOOKUP_TRANSCRIPT_DOMAIN_V2,
+    };
     let mut transcript = match side {
-        TranscriptSide::Prover => AkitaTranscript::unbound_prover(ISA_LOOKUP_TRANSCRIPT_DOMAIN),
-        TranscriptSide::Verifier => AkitaTranscript::unbound_verifier(ISA_LOOKUP_TRANSCRIPT_DOMAIN),
+        TranscriptSide::Prover => AkitaTranscript::unbound_prover(domain),
+        TranscriptSide::Verifier => AkitaTranscript::unbound_verifier(domain),
     };
     transcript.bind_instance_bytes(descriptor);
     transcript

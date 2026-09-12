@@ -35,10 +35,11 @@ enum CliError {
 fn main() -> ExitCode {
     let phases_before = native_proof_phase_metrics();
     match run() {
-        Ok(statement_id) => {
+        Ok((statement_id, version)) => {
             let phases = native_proof_phase_metrics().since(phases_before);
             println!(
-                "verified statement {} verify_seconds={:.3}",
+                "verified receipt_version={} statement={} verify_seconds={:.3}",
+                version,
                 hex(statement_id),
                 phases.verify().as_secs_f64()
             );
@@ -51,11 +52,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<[u8; 32], CliError> {
+fn run() -> Result<([u8; 32], u64), CliError> {
     run_from(env::args_os().skip(1))
 }
 
-fn run_from<I>(arguments: I) -> Result<[u8; 32], CliError>
+fn run_from<I>(arguments: I) -> Result<([u8; 32], u64), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -78,7 +79,8 @@ where
         source,
     })?;
     let expected = NativeStatement::from_bytes(&statement_bytes)?;
-    Ok(verify_native_receipt_reader(BufReader::new(receipt), &expected)?.statement_id())
+    let verified = verify_native_receipt_reader(BufReader::new(receipt), &expected)?;
+    Ok((verified.statement_id(), expected.protocol().code()))
 }
 
 fn require_bounded_receipt(path: &Path) -> Result<(), CliError> {
