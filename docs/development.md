@@ -250,6 +250,13 @@ only verifies recovery state. Omitting the limit continues toward the exact
 endpoint. Spool, progress checkpoint, ROM, input schedule, receipt, and public
 statement all remain ignored local artifacts.
 
+For audit-only recovery checks, use the normal prover arguments with
+`--inspect-progress-only`. This path opens the spool read-only, rejects both a
+short spool and uncheckpointed trailing bytes, verifies every frame plus the
+checkpointed final state and memory commitment, and emits stable JSON with the
+input, checkpoint, progress, and spool SHA-256 identities. It performs no VM
+steps, proof generation, truncation, or receipt finalization.
+
 ## Generated output
 
 Prefer a fresh temporary directory for manual proofs and measurements. Record

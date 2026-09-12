@@ -95,8 +95,8 @@ pub use receipt::{
     MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION, NativeBoundary, NativeReceipt,
     NativeReceiptError, NativeReceiptStreamProver, NativeSegmentReceipt, NativeSegmentWitness,
     NativeStatement, ProtocolLogCounts, ProtocolLogIdentities, ProtocolLogKind,
-    VerifiedNativeReceipt, verify_native_receipt, verify_native_receipt_bytes,
-    verify_native_receipt_reader,
+    VerifiedNativeReceipt, VerifiedNativeSpool, verify_native_receipt, verify_native_receipt_bytes,
+    verify_native_receipt_reader, verify_native_spool_reader,
 };
 pub use rom_lookup::{
     CommittedRom, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment, RomLookupColumns,

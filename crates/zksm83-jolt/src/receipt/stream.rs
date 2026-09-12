@@ -30,6 +30,55 @@ pub struct NativeReceiptStreamProver<'a, S> {
     spool_bytes: u64,
 }
 
+/// Public boundaries and counters recovered from a read-only verified segment spool.
+#[derive(Debug, Eq, PartialEq)]
+pub struct VerifiedNativeSpool {
+    initial: NativeBoundary,
+    final_boundary: NativeBoundary,
+    final_memory: MemoryCommitment,
+    segment_count: u64,
+    relation_step_count: u64,
+    spool_bytes: u64,
+}
+
+impl VerifiedNativeSpool {
+    /// Returns the first authenticated execution boundary.
+    #[must_use]
+    pub const fn initial(&self) -> &NativeBoundary {
+        &self.initial
+    }
+
+    /// Returns the last authenticated execution boundary.
+    #[must_use]
+    pub const fn final_boundary(&self) -> &NativeBoundary {
+        &self.final_boundary
+    }
+
+    /// Returns the last authenticated mutable-memory commitment.
+    #[must_use]
+    pub const fn final_memory(&self) -> &MemoryCommitment {
+        &self.final_memory
+    }
+
+    /// Returns the number of verified segment frames.
+    #[must_use]
+    pub const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    /// Returns the number of authenticated relation rows.
+    #[must_use]
+    pub const fn relation_step_count(&self) -> u64 {
+        self.relation_step_count
+    }
+
+    /// Returns the exact verified spool byte length.
+    #[must_use]
+    pub const fn spool_bytes(&self) -> u64 {
+        self.spool_bytes
+    }
+}
+
 impl<'a, S> NativeReceiptStreamProver<'a, S>
 where
     S: Read + Write + Seek,
@@ -62,15 +111,14 @@ where
                 "segment spool length is invalid".to_owned(),
             ));
         }
-        spool.seek(SeekFrom::Start(0))?;
-        let progress = verify_spool(&mut spool, spool_bytes, rom.commitment())?;
+        let progress = verify_native_spool_reader(&mut spool, spool_bytes, rom.commitment())?;
         spool.seek(SeekFrom::Start(spool_bytes))?;
         Ok(Self {
             rom,
             spool,
             initial: Some(progress.initial),
-            boundary: Some(progress.boundary),
-            previous_memory: Some(progress.previous_memory),
+            boundary: Some(progress.final_boundary),
+            previous_memory: Some(progress.final_memory),
             segment_count: progress.segment_count,
             relation_step_count: progress.relation_step_count,
             spool_bytes,
@@ -278,6 +326,32 @@ pub fn verify_native_receipt_reader<R: Read>(
     })
 }
 
+/// Verifies every frame in an exact-length segment spool without write access.
+pub fn verify_native_spool_reader<R: Read + Seek>(
+    mut spool: R,
+    declared_spool_bytes: u64,
+    rom: &crate::RomCommitment,
+) -> Result<VerifiedNativeSpool, NativeReceiptError> {
+    let actual_spool_bytes = spool.seek(SeekFrom::End(0))?;
+    validate_spool_length(actual_spool_bytes, declared_spool_bytes)?;
+    spool.seek(SeekFrom::Start(0))?;
+    verify_spool(&mut spool, declared_spool_bytes, rom)
+}
+
+fn validate_spool_length(actual: u64, declared: u64) -> Result<(), NativeReceiptError> {
+    if declared == 0 || declared > MAX_NATIVE_STREAM_RECEIPT_BYTES {
+        return Err(NativeReceiptError::Wire(
+            "segment spool length is invalid".to_owned(),
+        ));
+    }
+    if actual != declared {
+        return Err(NativeReceiptError::Wire(
+            "segment spool length differs from the declared length".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn verify_frames<R: Read>(
     reader: &mut BoundedReader<R>,
     count: usize,
@@ -307,19 +381,11 @@ fn verify_frames<R: Read>(
     Ok(())
 }
 
-struct SpoolProgress {
-    initial: NativeBoundary,
-    boundary: NativeBoundary,
-    previous_memory: MemoryCommitment,
-    segment_count: u64,
-    relation_step_count: u64,
-}
-
 fn verify_spool<S: Read + Seek>(
     spool: &mut S,
     spool_bytes: u64,
     rom: &crate::RomCommitment,
-) -> Result<SpoolProgress, NativeReceiptError> {
+) -> Result<VerifiedNativeSpool, NativeReceiptError> {
     let mut initial: Option<NativeBoundary> = None;
     let mut boundary: Option<NativeBoundary> = None;
     let mut previous_memory: Option<MemoryCommitment> = None;
@@ -349,12 +415,13 @@ fn verify_spool<S: Read + Seek>(
         boundary = Some(segment.final_boundary);
         previous_memory = Some(segment.final_memory);
     }
-    Ok(SpoolProgress {
+    Ok(VerifiedNativeSpool {
         initial: initial.ok_or(NativeReceiptError::InvalidStatement)?,
-        boundary: boundary.ok_or(NativeReceiptError::InvalidStatement)?,
-        previous_memory: previous_memory.ok_or(NativeReceiptError::InvalidStatement)?,
+        final_boundary: boundary.ok_or(NativeReceiptError::InvalidStatement)?,
+        final_memory: previous_memory.ok_or(NativeReceiptError::InvalidStatement)?,
         segment_count,
         relation_step_count,
+        spool_bytes,
     })
 }
 
@@ -492,5 +559,25 @@ impl<R: Read> BoundedReader<R> {
             )),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_NATIVE_STREAM_RECEIPT_BYTES, validate_spool_length};
+
+    #[test]
+    fn exact_spool_length_is_required_at_the_read_only_boundary() {
+        assert!(validate_spool_length(8, 8).is_ok());
+        assert!(validate_spool_length(0, 0).is_err());
+        assert!(validate_spool_length(7, 8).is_err());
+        assert!(validate_spool_length(9, 8).is_err());
+        assert!(
+            validate_spool_length(
+                MAX_NATIVE_STREAM_RECEIPT_BYTES + 1,
+                MAX_NATIVE_STREAM_RECEIPT_BYTES + 1,
+            )
+            .is_err()
+        );
     }
 }

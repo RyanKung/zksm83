@@ -72,6 +72,13 @@ Use the same arguments plus `--resume` to verify the durable prefix and
 continue from its exact SM83 boundary. A partial spool is never published as
 the declared final receipt.
 
+Use the same arguments plus `--inspect-progress-only` to verify an existing
+progress/spool pair without opening either file for writing. This mode requires
+the spool length to match the checkpoint exactly, verifies every persisted
+proof frame, checks the final state and memory commitment, and prints stable
+`zksm83-native-progress-evidence/v1` JSON. It never truncates crash-tail bytes,
+continues execution, or creates a receipt or statement.
+
 ## Development
 
 ```sh

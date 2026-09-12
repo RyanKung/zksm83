@@ -6,7 +6,7 @@
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     time::Instant,
@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
 use zksm83_jolt::{
-    CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, NativeReceiptError, NativeReceiptStreamProver,
-    NativeSegmentWitness, NativeTraceError, NativeTraceWitness, UNIFORM_ROW_COUNT, commit_memory,
-    commit_rom,
+    CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MemoryCommitment, NativeBoundary,
+    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness, NativeTraceError,
+    NativeTraceWitness, UNIFORM_ROW_COUNT, commit_memory, commit_rom, verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -29,6 +29,7 @@ use zksm83_trace::{TraceBuilder, TraceBuilderError};
 
 const EXPECTED_CHECKPOINT_SCHEMA: &str = "zksm83-trace-checkpoint/v7";
 const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v1";
+const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v1";
 const INPUT_SCHEDULE_SCHEMA: &str = "zksm83-input-schedule/v1";
 const ROM_BYTE_LENGTH: usize = 1 << 20;
 const MAX_ROM_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -69,6 +70,12 @@ struct Args {
     /// Validate identities, endpoint data, and protocol bounds without proving.
     #[arg(long)]
     preflight_only: bool,
+    /// Verify an existing progress/spool pair and print read-only JSON evidence.
+    #[arg(
+        long,
+        conflicts_with_all = ["resume", "segment_limit", "preflight_only"]
+    )]
+    inspect_progress_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +126,24 @@ struct ProverProgress {
     spool_bytes: u64,
     state: VmState,
     memory_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressEvidence {
+    schema: &'static str,
+    verified: bool,
+    rom_sha256: String,
+    input_sha256: String,
+    expected_checkpoint_sha256: String,
+    progress_checkpoint_sha256: String,
+    spool_sha256: String,
+    segment_capacity: usize,
+    segment_count: u64,
+    relation_step_count: u64,
+    spool_bytes: u64,
+    initial_state_scalars: Vec<u64>,
+    final_state_scalars: Vec<u64>,
+    final_memory_commitment_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -178,15 +203,13 @@ fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("native proving failed: {error}");
+            eprintln!("native prover command failed: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn run(args: Args) -> Result<(), CliError> {
-    require_absent(&args.receipt)?;
-    require_absent(&args.statement)?;
     let rom_bytes = read_bounded(&args.rom, "ROM", MAX_ROM_FILE_BYTES)?;
     let input = load_input(&args.input)?;
     let expected_bytes = read_bounded(
@@ -205,6 +228,11 @@ fn run(args: Args) -> Result<(), CliError> {
         return preflight(&expected, &rom_bytes, &input, identities);
     }
     let committed_rom = commit_rom(&rom_bytes)?;
+    if args.inspect_progress_only {
+        return inspect_progress(&args, identities, &committed_rom);
+    }
+    require_absent(&args.receipt)?;
+    require_absent(&args.statement)?;
     let (mut builder, mut initial_memory, completed, mut prover) = if args.resume {
         resume(&args, &rom_bytes, &input, identities, &committed_rom)?
     } else {
@@ -237,6 +265,51 @@ fn run(args: Args) -> Result<(), CliError> {
         &expected,
     )?;
     finalize(&args, prover)?;
+    Ok(())
+}
+
+fn inspect_progress(
+    args: &Args,
+    identities: InputIdentities,
+    committed_rom: &zksm83_jolt::CommittedRom,
+) -> Result<(), CliError> {
+    let progress_bytes = read_bounded(
+        &args.progress_checkpoint,
+        "progress checkpoint",
+        MAX_CHECKPOINT_FILE_BYTES,
+    )?;
+    let progress: ProverProgress = serde_json::from_slice(&progress_bytes)?;
+    validate_progress(&progress, identities)?;
+    let mut spool = File::open(&args.spool)
+        .map_err(|source| io_error("open read-only", &args.spool, source))?;
+    let verified =
+        verify_native_spool_reader(&mut spool, progress.spool_bytes, committed_rom.commitment())?;
+    let spool_sha256 = sha256_reader(&mut spool, progress.spool_bytes, &args.spool)?;
+    let view = VerifiedProgress {
+        segment_count: verified.segment_count(),
+        relation_step_count: verified.relation_step_count(),
+        spool_bytes: verified.spool_bytes(),
+        final_boundary: verified.final_boundary(),
+        final_memory: verified.final_memory(),
+    };
+    let _checkpoint_memory = validate_verified_progress(&progress, view)?;
+    let evidence = ProgressEvidence {
+        schema: PROGRESS_EVIDENCE_SCHEMA,
+        verified: true,
+        rom_sha256: hex::encode(identities.rom),
+        input_sha256: hex::encode(identities.input),
+        expected_checkpoint_sha256: hex::encode(identities.expected),
+        progress_checkpoint_sha256: hex::encode(sha256(&progress_bytes)),
+        spool_sha256: hex::encode(spool_sha256),
+        segment_capacity: progress.segment_capacity,
+        segment_count: verified.segment_count(),
+        relation_step_count: verified.relation_step_count(),
+        spool_bytes: verified.spool_bytes(),
+        initial_state_scalars: verified.initial().state().scalars().to_vec(),
+        final_state_scalars: verified.final_boundary().state().scalars().to_vec(),
+        final_memory_commitment_sha256: hex::encode(verified.final_memory().digest()?),
+    };
+    println!("{}", serde_json::to_string_pretty(&evidence)?);
     Ok(())
 }
 
@@ -295,6 +368,15 @@ type FileProver<'a> = NativeReceiptStreamProver<'a, File>;
 enum SpoolRecovery {
     Exact,
     DiscardUncheckpointedTail,
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedProgress<'a> {
+    segment_count: u64,
+    relation_step_count: u64,
+    spool_bytes: u64,
+    final_boundary: &'a NativeBoundary,
+    final_memory: &'a MemoryCommitment,
 }
 
 fn spool_recovery(actual: u64, checkpointed: u64) -> Result<SpoolRecovery, CliError> {
@@ -361,29 +443,23 @@ fn resume<'a>(
             .map_err(|source| io_error("sync", &args.spool, source))?;
     }
     let prover = NativeReceiptStreamProver::resume(committed_rom, spool)?;
-    if prover.segment_count() != progress.segment_count
-        || prover.relation_step_count() != progress.relation_step_count
-        || prover.spooled_bytes() != progress.spool_bytes
-    {
-        return Err(CliError::ProgressMismatch("verified spool counters differ"));
-    }
-    let checkpoint_state = zksm83_jolt::NativeStateBoundary::from_vm_state(progress.state);
-    if prover.current_boundary().map(|boundary| boundary.state()) != Some(checkpoint_state) {
-        return Err(CliError::ProgressMismatch(
-            "verified spool state differs from checkpoint",
-        ));
-    }
-    let memory_bytes = hex::decode(&progress.memory_hex)?;
-    let initial_memory = commit_memory(&memory_bytes)?;
-    let spooled_memory = prover
+    let final_boundary = prover.current_boundary().ok_or(CliError::ProgressMismatch(
+        "verified spool has no final boundary",
+    ))?;
+    let final_memory = prover
         .current_memory_commitment()
         .ok_or(CliError::ProgressMismatch("verified spool has no memory"))?;
-    if spooled_memory.canonical_bytes()? != initial_memory.commitment().canonical_bytes()? {
-        return Err(CliError::ProgressMemoryCommitment {
-            spooled: hex::encode(spooled_memory.digest()?),
-            checkpoint: hex::encode(initial_memory.commitment().digest()?),
-        });
-    }
+    let initial_memory = validate_verified_progress(
+        &progress,
+        VerifiedProgress {
+            segment_count: prover.segment_count(),
+            relation_step_count: prover.relation_step_count(),
+            spool_bytes: prover.spooled_bytes(),
+            final_boundary,
+            final_memory,
+        },
+    )?;
+    let memory_bytes = hex::decode(&progress.memory_hex)?;
     let memory = MemoryImage::from_checkpoint_bytes(memory_bytes)?;
     let builder = TraceBuilder::resume(
         RomImage::new(rom_bytes.to_vec())?,
@@ -397,6 +473,35 @@ fn resume<'a>(
         progress.relation_step_count,
         prover,
     ))
+}
+
+fn validate_verified_progress(
+    progress: &ProverProgress,
+    verified: VerifiedProgress<'_>,
+) -> Result<CommittedMemory, CliError> {
+    if verified.segment_count != progress.segment_count
+        || verified.relation_step_count != progress.relation_step_count
+        || verified.spool_bytes != progress.spool_bytes
+    {
+        return Err(CliError::ProgressMismatch("verified spool counters differ"));
+    }
+    let checkpoint_state = zksm83_jolt::NativeStateBoundary::from_vm_state(progress.state);
+    if verified.final_boundary.state() != checkpoint_state {
+        return Err(CliError::ProgressMismatch(
+            "verified spool state differs from checkpoint",
+        ));
+    }
+    let memory_bytes = hex::decode(&progress.memory_hex)?;
+    let checkpoint_memory = commit_memory(&memory_bytes)?;
+    if verified.final_memory.canonical_bytes()?
+        != checkpoint_memory.commitment().canonical_bytes()?
+    {
+        return Err(CliError::ProgressMemoryCommitment {
+            spooled: hex::encode(verified.final_memory.digest()?),
+            checkpoint: hex::encode(checkpoint_memory.commitment().digest()?),
+        });
+    }
+    Ok(checkpoint_memory)
 }
 
 fn prove_segments(
@@ -690,6 +795,43 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+fn sha256_reader(
+    reader: &mut (impl Read + Seek),
+    expected_length: u64,
+    path: &Path,
+) -> Result<[u8; 32], CliError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("seek", path, source))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| io_error("read", path, source))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| CliError::ProgressMismatch("file hash length overflow"))?,
+            )
+            .ok_or(CliError::ProgressMismatch("file hash length overflow"))?;
+        let chunk = buffer
+            .get(..read)
+            .ok_or(CliError::ProgressMismatch("file hash buffer range"))?;
+        hash.update(chunk);
+    }
+    if total != expected_length {
+        return Err(CliError::ProgressMismatch(
+            "spool length changed while hashing",
+        ));
+    }
+    Ok(hash.finalize().into())
+}
+
 fn io_error(operation: &'static str, path: &Path, source: io::Error) -> CliError {
     CliError::Io {
         operation,
@@ -701,8 +843,9 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> CliError
 #[cfg(test)]
 mod tests {
     use super::{
-        CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, ROM_BYTE_LENGTH,
-        SpoolRecovery, spool_recovery, validate_endpoint, validate_expected_artifact,
+        CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, InputIdentities,
+        PROGRESS_SCHEMA, ProverProgress, ROM_BYTE_LENGTH, SpoolRecovery, UNIFORM_ROW_COUNT,
+        spool_recovery, validate_endpoint, validate_expected_artifact, validate_progress,
     };
     use zksm83_core::{
         CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3State, VmState,
@@ -747,6 +890,40 @@ mod tests {
                 "spool is shorter than checkpoint"
             ))
         ));
+    }
+
+    #[test]
+    fn progress_schema_capacity_and_input_identities_are_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, state, memory, _, _) = fixture()?;
+        let identities = InputIdentities {
+            rom: [1; 32],
+            input: [2; 32],
+            expected: [3; 32],
+        };
+        let mut progress = ProverProgress {
+            schema: PROGRESS_SCHEMA.to_owned(),
+            rom_sha256: hex::encode(identities.rom),
+            input_sha256: hex::encode(identities.input),
+            expected_checkpoint_sha256: hex::encode(identities.expected),
+            segment_capacity: UNIFORM_ROW_COUNT,
+            segment_count: 1,
+            relation_step_count: 1,
+            spool_bytes: 1,
+            state,
+            memory_hex: hex::encode(memory),
+        };
+        validate_progress(&progress, identities)?;
+
+        progress.schema = "unsupported".to_owned();
+        assert!(validate_progress(&progress, identities).is_err());
+        progress.schema = PROGRESS_SCHEMA.to_owned();
+        progress.segment_capacity = UNIFORM_ROW_COUNT + 1;
+        assert!(validate_progress(&progress, identities).is_err());
+        progress.segment_capacity = UNIFORM_ROW_COUNT;
+        progress.input_sha256 = hex::encode([9; 32]);
+        assert!(validate_progress(&progress, identities).is_err());
+        Ok(())
     }
 
     fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {

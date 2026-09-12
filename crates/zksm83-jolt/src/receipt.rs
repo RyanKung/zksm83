@@ -38,7 +38,10 @@ pub const MAX_NATIVE_STREAM_RECEIPT_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 /// Maximum number of fixed-capacity segments in one receipt.
 pub const MAX_NATIVE_SEGMENT_COUNT: usize = 4096;
 
-pub use stream::{NativeReceiptStreamProver, verify_native_receipt_reader};
+pub use stream::{
+    NativeReceiptStreamProver, VerifiedNativeSpool, verify_native_receipt_reader,
+    verify_native_spool_reader,
+};
 
 /// Prover-side inputs for one contiguous native trace segment.
 #[derive(Clone, Copy)]
