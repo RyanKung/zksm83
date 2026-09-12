@@ -4,7 +4,10 @@ use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use jolt_field::Field;
 use thiserror::Error;
 
-use crate::NativeField;
+use crate::{
+    NativeField,
+    metrics::{self, Phase},
+};
 
 /// Proof that a Boolean-hypercube sum equals an inner product of two MLEs.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +69,7 @@ impl ProductSumcheckProof {
         right: &[NativeField],
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
+        let _phase = metrics::start(Phase::Sumcheck);
         validate_tables(left, right)?;
         let mut left = left.to_vec();
         let mut right = right.to_vec();
@@ -144,6 +148,7 @@ impl MultiProductSumcheckProof {
         factors: &[Vec<NativeField>],
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
+        let _phase = metrics::start(Phase::Sumcheck);
         validate_factors(factors)?;
         let mut factors = factors.to_vec();
         let claim = sum_of_products(&factors)?;
@@ -248,6 +253,7 @@ impl SumOfProductsSumcheckProof {
         terms: &[Vec<Vec<NativeField>>],
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
+        let _phase = metrics::start(Phase::Sumcheck);
         let (_, _, mut current_len) = validate_terms(terms)?;
         let claim = sum_of_term_products(terms)?;
         let mut terms = terms.to_vec();

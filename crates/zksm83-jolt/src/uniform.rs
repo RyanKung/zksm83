@@ -150,6 +150,9 @@ pub enum UniformError {
     /// Canonical Akita serialization failed.
     #[error("native uniform proof serialization failed: {0}")]
     Serialization(#[from] SerializationError),
+    /// A cached per-layout PCS prover context could not be initialized.
+    #[error("native uniform PCS context failed: {0}")]
+    PcsContext(String),
     /// The operating system rejected creation of the bounded proof worker.
     #[error("failed to start native uniform proof worker: {0}")]
     WorkerSpawn(#[source] std::io::Error),
@@ -435,6 +438,7 @@ fn prove_sumcheck(
     constraint_mix: NativeField,
     transcript: &mut AkitaTranscript<NativeField>,
 ) -> Result<SumcheckOutput, UniformError> {
+    let _phase = crate::metrics::start(crate::metrics::Phase::Sumcheck);
     if columns.iter().any(|column| column.len() != weights.len()) {
         return Err(UniformError::Shape);
     }

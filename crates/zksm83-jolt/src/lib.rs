@@ -10,6 +10,7 @@ mod isa;
 mod isa_lookup;
 mod logs;
 mod memory;
+mod metrics;
 mod pcs;
 mod receipt;
 mod rom_lookup;
@@ -89,6 +90,7 @@ pub use memory::{
     MutableMemoryError, MutableMemoryProof, commit_memory, prove_mutable_memory,
     verify_mutable_memory,
 };
+pub use metrics::{NativeProofPhaseMetrics, native_proof_phase_metrics};
 pub use receipt::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
     MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,

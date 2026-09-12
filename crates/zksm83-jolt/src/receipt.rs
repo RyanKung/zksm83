@@ -497,6 +497,7 @@ fn verify_segment(
     expected_initial: &NativeBoundary,
     rom: &RomCommitment,
 ) -> Result<(), NativeReceiptError> {
+    let _phase = crate::metrics::start(crate::metrics::Phase::Verify);
     let expected_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
     let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| NativeReceiptError::Counter)?;
     if segment.segment_index != expected_index {

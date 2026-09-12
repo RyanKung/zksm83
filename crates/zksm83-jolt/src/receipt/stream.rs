@@ -270,7 +270,10 @@ fn prove_frame(
 ) -> Result<ProvedFrame, NativeReceiptError> {
     crate::on_akita_worker(|| {
         let (receipt, final_boundary) = prove_segment(index, initial, witness, rom)?;
-        let encoded = encode_segment(&receipt)?;
+        let encoded = {
+            let _phase = crate::metrics::start(crate::metrics::Phase::Encode);
+            encode_segment(&receipt)?
+        };
         Ok(ProvedFrame {
             encoded,
             initial: receipt.initial,

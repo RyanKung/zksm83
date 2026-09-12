@@ -145,5 +145,6 @@ fn map_pcs_error(error: PcsError) -> UniformError {
         PcsError::Shape => UniformError::Shape,
         PcsError::Akita(error) => UniformError::Akita(error),
         PcsError::Serialization(error) => UniformError::Serialization(error),
+        PcsError::Context(error) => UniformError::PcsContext(error),
     }
 }

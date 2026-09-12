@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 use zksm83_jolt::{
     MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NativeReceiptError,
-    NativeStatement, verify_native_receipt_reader,
+    NativeStatement, native_proof_phase_metrics, verify_native_receipt_reader,
 };
 
 #[derive(Debug, Error)]
@@ -33,9 +33,15 @@ enum CliError {
 }
 
 fn main() -> ExitCode {
+    let phases_before = native_proof_phase_metrics();
     match run() {
         Ok(statement_id) => {
-            println!("verified statement {}", hex(statement_id));
+            let phases = native_proof_phase_metrics().since(phases_before);
+            println!(
+                "verified statement {} verify_seconds={:.3}",
+                hex(statement_id),
+                phases.verify().as_secs_f64()
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {

@@ -79,6 +79,11 @@ proof frame, checks the final state and memory commitment, and prints stable
 `zksm83-native-progress-evidence/v1` JSON. It never truncates crash-tail bytes,
 continues execution, or creates a receipt or statement.
 
+Completed segment log lines separate process-local `setup`, `commit`,
+`sumcheck`, `opening`, and `encode` wall times. The standalone verifier reports
+its aggregate `verify_seconds`. These diagnostics are not receipt fields and do
+not affect the protocol identity.
+
 ## Development
 
 ```sh

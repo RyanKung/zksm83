@@ -257,6 +257,15 @@ checkpointed final state and memory commitment, and emits stable JSON with the
 input, checkpoint, progress, and spool SHA-256 identities. It performs no VM
 steps, proof generation, truncation, or receipt finalization.
 
+Native proof diagnostics expose process-local cumulative setup, commitment,
+sumcheck, opening, encoding, and verification timers. The prover prints the
+per-segment delta for its construction phases, while the standalone verifier
+prints its verification delta. Timers are operational measurements rather than
+consensus data; concurrent proof work in the same process contributes to the
+same counters. Per-layout prover contexts are shared only while committed
+columns using that layout remain alive, so prepared setup state is reusable
+within a proof without becoming an unbounded cross-segment cache.
+
 ## Generated output
 
 Prefer a fresh temporary directory for manual proofs and measurements. Record

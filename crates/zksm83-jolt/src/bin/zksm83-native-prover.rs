@@ -20,7 +20,8 @@ use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
 use zksm83_jolt::{
     CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MemoryCommitment, NativeBoundary,
     NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness, NativeTraceError,
-    NativeTraceWitness, UNIFORM_ROW_COUNT, commit_memory, commit_rom, verify_native_spool_reader,
+    NativeTraceWitness, UNIFORM_ROW_COUNT, commit_memory, commit_rom, native_proof_phase_metrics,
+    verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -531,6 +532,7 @@ fn prove_segments(
         let remaining = expected.completed_steps - prover.relation_step_count();
         let segment_steps = remaining.min(capacity);
         let started = Instant::now();
+        let phases_before = native_proof_phase_metrics();
         let witness = builder.run_exact_steps(segment_steps)?;
         let native_trace = NativeTraceWitness::from_witness(&witness)?;
         let final_bytes = builder.checkpoint_memory();
@@ -546,13 +548,19 @@ fn prove_segments(
             .checked_add(1)
             .ok_or(CliError::ProgressMismatch("segment counter overflow"))?;
         write_progress(args, identities, builder, prover)?;
+        let phases = native_proof_phase_metrics().since(phases_before);
         println!(
-            "segment={} steps={} total_steps={} spool_bytes={} elapsed_seconds={:.3}",
+            "segment={} steps={} total_steps={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} commit_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
             prover.segment_count() - 1,
             segment_steps,
             prover.relation_step_count(),
             prover.spooled_bytes(),
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            phases.setup().as_secs_f64(),
+            phases.commit().as_secs_f64(),
+            phases.sumcheck().as_secs_f64(),
+            phases.opening().as_secs_f64(),
+            phases.encode().as_secs_f64()
         );
     }
     Ok(())
