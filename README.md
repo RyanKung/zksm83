@@ -103,6 +103,10 @@ The current protocol is transparent and is not witness-hiding. The project may
 not claim zero knowledge until a separate hiding construction, leakage tests,
 and security review exist.
 
+Multi-group PCS batching is a prospective version 2 change, not an unclaimed
+version 1 optimization. Its isolated, 30-second decision gate is specified in
+[pcs-v2-evaluation.md](docs/pcs-v2-evaluation.md).
+
 ## License
 
 The workspace is licensed under [GPL-3.0-only](LICENSE).
