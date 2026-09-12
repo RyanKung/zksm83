@@ -56,6 +56,49 @@ fn statement_wire_is_canonical_and_binds_every_field() -> Result<(), Box<dyn std
 }
 
 #[test]
+fn statement_decoder_rejects_every_single_byte_mutation_and_truncation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let statement = structural_statement()?;
+    let bytes = statement.to_bytes()?;
+    for index in 0..bytes.len() {
+        let mut changed = bytes.clone();
+        let byte = changed.get_mut(index).ok_or("statement mutation index")?;
+        *byte ^= 1;
+        assert!(NativeStatement::from_bytes(&changed).is_err());
+    }
+    for length in 0..bytes.len() {
+        let truncated = bytes.get(..length).ok_or("statement truncation range")?;
+        assert!(NativeStatement::from_bytes(truncated).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_decoders_reject_deterministic_noise_and_hostile_lengths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let expected = structural_statement()?;
+    let mut state = 0x7d36_51a9_204b_f83d_u64;
+    for length in [0, 1, 7, 8, 15, 16, 31, 64, 255, 1024, 4096] {
+        let mut bytes = vec![0_u8; length];
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = u8::try_from(state & 0xff)?;
+        }
+        assert!(NativeReceipt::from_bytes(&bytes).is_err());
+        assert!(verify_native_receipt_reader(Cursor::new(&bytes), &expected).is_err());
+    }
+
+    let mut hostile = b"ZKSM83R1".to_vec();
+    hostile.extend_from_slice(&super::NATIVE_RECEIPT_VERSION.to_le_bytes());
+    hostile.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(NativeReceipt::from_bytes(&hostile).is_err());
+    assert!(verify_native_receipt_reader(Cursor::new(hostile), &expected).is_err());
+    Ok(())
+}
+
+#[test]
 fn zero_cursor_requires_the_unique_empty_log_identity() -> Result<(), Box<dyn std::error::Error>> {
     let statement = structural_statement()?;
     let mut boundary = statement.initial.clone();

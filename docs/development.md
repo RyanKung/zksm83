@@ -22,6 +22,9 @@ Git ignores the following classes deliberately:
   schedules;
 - `backup/`: historical implementation material;
 - `jolt-zksm83/`: local backend experiments not integrated into the workspace;
+- `fuzz/corpus/`, `fuzz/artifacts/`: generated decoder inputs and failures;
+- `*.evidence.json`, `*.metrics.json`, `*.folded`, `*.pprof`: local audit and
+  profiler output;
 - `tmp/`, `target/`, coverage output, editor state, and local environment files.
 
 Do not weaken these rules by force-adding generated or third-party data. If a

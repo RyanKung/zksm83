@@ -44,6 +44,9 @@ mod timer;
 mod timer_tests;
 mod word;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use akita_pcs::Ring;
 use thiserror::Error;
 
@@ -73,6 +76,8 @@ use crate::{
 
 /// Number of relation slots; unused tail slots are canonical zero identities.
 pub const CPU_STRUCTURAL_CONSTRAINT_COUNT: usize = 6144;
+// Keep the 789-slot zero tail explicit while guarding every real constraint push.
+const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5355;
 /// Maximum algebraic degree of one CPU/device constraint before equality weighting.
 pub const CPU_STRUCTURAL_MAX_DEGREE: usize = 18;
 
@@ -360,45 +365,114 @@ impl UniformRelation for CpuStructuralRelation {
         {
             return Err(UniformError::Shape);
         }
-        constraints.fill(NativeField::from_u64(0));
-        let view = RowView { row };
-        let mut sink = ConstraintSink::new(constraints);
-        constrain_selectors(&view, &mut sink)?;
-        constrain_cpu_ranges(&view, &mut sink)?;
-        constrain_mapper_ranges(&view, &mut sink)?;
-        devices::constrain_interrupt_control(&view, &mut sink)?;
-        apu::constrain_apu(&view, &mut sink)?;
-        constrain_isa(&view, &mut sink)?;
-        constrain_cycles_and_frames(&view, &mut sink)?;
-        constrain_bus(&view, &mut sink)?;
-        logs::constrain_cursors_and_log_events(&view, &mut sink)?;
-        mmio::constrain_mmio_events(&view, &mut sink)?;
-        registers::constrain_visible_registers(&view, &mut sink)?;
-        serial::constrain_serial(&view, &mut sink)?;
-        timer::constrain_timer(&view, &mut sink)?;
-        ppu::constrain_ppu(&view, &mut sink)?;
-        joypad::constrain_joypad(&view, &mut sink)?;
-        memory::constrain_memory_events(&view, &mut sink)?;
-        mbc3::constrain_mapper_and_rom(&view, &mut sink)?;
-        semantics::constrain_byte_arithmetic(&view, &mut sink)?;
-        control::constrain_instruction_flow(&view, &mut sink)?;
-        data::constrain_data_and_simple_operations(&view, &mut sink)?;
-        word::constrain_word_operations(&view, &mut sink)?;
-        stack::constrain_stack_operations(&view, &mut sink)?;
-        bit::constrain_rotate_and_bit_operations(&view, &mut sink)?;
-        daa::constrain_decimal_adjust(&view, &mut sink)?;
-        machine::constrain_machine_cpu(&view, &mut sink)?;
+        let used = evaluate_constraints(row, constraints)?;
+        if used != CPU_STRUCTURAL_USED_CONSTRAINT_COUNT {
+            return Err(UniformError::Shape);
+        }
         Ok(())
     }
 }
 
+fn evaluate_constraints(
+    row: &[NativeField],
+    constraints: &mut [NativeField],
+) -> Result<usize, UniformError> {
+    let view = RowView::new(row);
+    evaluate_constraints_for_view(&view, constraints)
+}
+
+#[cfg(test)]
+fn evaluate_constraints_with_access(
+    row: &[NativeField],
+    constraints: &mut [NativeField],
+    accessed: &[Cell<bool>],
+) -> Result<usize, UniformError> {
+    let view = RowView::tracked(row, accessed)?;
+    evaluate_constraints_for_view(&view, constraints)
+}
+
+fn evaluate_constraints_for_view(
+    view: &RowView<'_>,
+    constraints: &mut [NativeField],
+) -> Result<usize, UniformError> {
+    constraints.fill(NativeField::from_u64(0));
+    let mut sink = ConstraintSink::new(constraints);
+    constrain_selectors(view, &mut sink)?;
+    constrain_cpu_ranges(view, &mut sink)?;
+    constrain_mapper_ranges(view, &mut sink)?;
+    devices::constrain_interrupt_control(view, &mut sink)?;
+    apu::constrain_apu(view, &mut sink)?;
+    constrain_isa(view, &mut sink)?;
+    constrain_cycles_and_frames(view, &mut sink)?;
+    constrain_bus(view, &mut sink)?;
+    logs::constrain_cursors_and_log_events(view, &mut sink)?;
+    mmio::constrain_mmio_events(view, &mut sink)?;
+    registers::constrain_visible_registers(view, &mut sink)?;
+    serial::constrain_serial(view, &mut sink)?;
+    timer::constrain_timer(view, &mut sink)?;
+    ppu::constrain_ppu(view, &mut sink)?;
+    joypad::constrain_joypad(view, &mut sink)?;
+    memory::constrain_memory_events(view, &mut sink)?;
+    mbc3::constrain_mapper_and_rom(view, &mut sink)?;
+    semantics::constrain_byte_arithmetic(view, &mut sink)?;
+    control::constrain_instruction_flow(view, &mut sink)?;
+    data::constrain_data_and_simple_operations(view, &mut sink)?;
+    word::constrain_word_operations(view, &mut sink)?;
+    stack::constrain_stack_operations(view, &mut sink)?;
+    bit::constrain_rotate_and_bit_operations(view, &mut sink)?;
+    daa::constrain_decimal_adjust(view, &mut sink)?;
+    machine::constrain_machine_cpu(view, &mut sink)?;
+    Ok(sink.used())
+}
+
 pub(super) struct RowView<'a> {
     row: &'a [NativeField],
+    #[cfg(test)]
+    accessed: Option<&'a [Cell<bool>]>,
 }
 
 impl RowView<'_> {
+    fn new(row: &[NativeField]) -> RowView<'_> {
+        RowView {
+            row,
+            #[cfg(test)]
+            accessed: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked<'a>(
+        row: &'a [NativeField],
+        accessed: &'a [Cell<bool>],
+    ) -> Result<RowView<'a>, UniformError> {
+        if row.len() != accessed.len() {
+            return Err(UniformError::Shape);
+        }
+        Ok(RowView {
+            row,
+            accessed: Some(accessed),
+        })
+    }
+
     pub(super) fn value(&self, index: usize) -> Result<NativeField, UniformError> {
-        self.row.get(index).copied().ok_or(UniformError::Shape)
+        let value = self.row.get(index).copied().ok_or(UniformError::Shape)?;
+        #[cfg(test)]
+        if let Some(accessed) = self.accessed {
+            accessed.get(index).ok_or(UniformError::Shape)?.set(true);
+        }
+        Ok(value)
+    }
+
+    fn values(&self, start: usize, count: usize) -> Result<&[NativeField], UniformError> {
+        let end = start.checked_add(count).ok_or(UniformError::Shape)?;
+        let values = self.row.get(start..end).ok_or(UniformError::Shape)?;
+        #[cfg(test)]
+        if let Some(accessed) = self.accessed {
+            for marker in accessed.get(start..end).ok_or(UniformError::Shape)? {
+                marker.set(true);
+            }
+        }
+        Ok(values)
     }
 
     pub(super) fn before(&self, index: usize) -> Result<NativeField, UniformError> {
@@ -439,6 +513,10 @@ impl<'a> ConstraintSink<'a> {
         *target = value;
         self.cursor = self.cursor.checked_add(1).ok_or(UniformError::Shape)?;
         Ok(())
+    }
+
+    const fn used(&self) -> usize {
+        self.cursor
     }
 }
 
@@ -789,10 +867,7 @@ pub(super) fn bus_kind_bits<'a>(
     let start = bus_slot_start(slot)?
         .checked_add(1)
         .ok_or(UniformError::Shape)?;
-    let end = start
-        .checked_add(TRACE_BUS_KIND_BITS)
-        .ok_or(UniformError::Shape)?;
-    view.row.get(start..end).ok_or(UniformError::Shape)
+    view.values(start, TRACE_BUS_KIND_BITS)
 }
 
 fn bus_category(view: &RowView<'_>, codes: &[u8]) -> Result<NativeField, UniformError> {

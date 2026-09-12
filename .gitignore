@@ -37,6 +37,8 @@ coverage/
 *.benchmark.json
 *.benchmark.csv
 *.verification.json
+*.evidence.json
+*.metrics.json
 *.proof
 *.srs
 *.aks
@@ -48,6 +50,8 @@ coverage/
 !/crates/zksm83-jolt/protocol/akita/fp128_dense_bounded_nv17_p128.aks
 /benchmark-runs/
 /proof-cache/
+/fuzz/artifacts/
+/fuzz/corpus/
 
 # Temporary work and local environment
 /tmp/
@@ -55,6 +59,8 @@ coverage/
 *.partial
 *.ips
 *.dSYM/
+*.folded
+*.pprof
 .env
 .env.*
 !.env.example

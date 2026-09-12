@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use akita_pcs::Ring;
 use zksm83_core::{BusWitness, ImeState, Registers, StepInput, VmState};
 use zksm83_memory::{MemoryImage, RomImage};
@@ -6,12 +8,14 @@ use zksm83_trace::{TraceBuilder, TraceRow};
 use super::test_fixtures::*;
 use super::{
     BUS_PHYSICAL_ADDRESS_OFFSET, BUS_VALUE_OFFSET, CPU_STRUCTURAL_CONSTRAINT_COUNT,
-    CpuStructuralRelation, STATE_MBC3_ROM_BANK,
+    CpuStructuralRelation, STATE_MBC3_ROM_BANK, evaluate_constraints,
+    evaluate_constraints_with_access,
 };
 use crate::{
-    NativeField, NativeTraceWitness, TRACE_ACTIVE, TRACE_AFTER_ROM_BANK_BITS_START,
-    TRACE_AFTER_STATE_START, TRACE_BUS_PHYSICAL_BITS_START, TRACE_BUS_SLOT_WIDTH, TRACE_BUS_START,
-    TRACE_BUS_VALUE_BITS_START, UniformError, UniformRelation,
+    NATIVE_TRACE_COLUMN_COUNT, NativeField, NativeTraceWitness, TRACE_ACTIVE,
+    TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_STATE_START, TRACE_BUS_PHYSICAL_BITS_START,
+    TRACE_BUS_SLOT_WIDTH, TRACE_BUS_START, TRACE_BUS_VALUE_BITS_START, UniformError,
+    UniformRelation,
 };
 
 #[test]
@@ -54,6 +58,39 @@ fn validated_nop_and_padding_satisfy_structural_relation() -> Result<(), Box<dyn
         .get_mut(crate::TRACE_ROM_VALUE_START)
         .ok_or(UniformError::Shape)? = 1;
     assert_native_row_rejected(&relation, &tampered_rom_value)?;
+    Ok(())
+}
+
+#[test]
+fn structural_relation_used_slot_count_is_stable() -> Result<(), Box<dyn std::error::Error>> {
+    let trace = single_opcode_trace(0x00)?;
+    let row = native_row(&trace, 0)?
+        .into_iter()
+        .map(NativeField::from_u64)
+        .collect::<Vec<_>>();
+    let mut constraints = vec![NativeField::from_u64(0); CPU_STRUCTURAL_CONSTRAINT_COUNT];
+    assert_eq!(evaluate_constraints(&row, &mut constraints)?, 5355);
+    Ok(())
+}
+
+#[test]
+fn structural_relation_reads_every_native_trace_column() -> Result<(), Box<dyn std::error::Error>> {
+    let trace = single_opcode_trace(0x00)?;
+    let row = native_row(&trace, 0)?
+        .into_iter()
+        .map(NativeField::from_u64)
+        .collect::<Vec<_>>();
+    let accessed = (0..NATIVE_TRACE_COLUMN_COUNT)
+        .map(|_| Cell::new(false))
+        .collect::<Vec<_>>();
+    let mut constraints = vec![NativeField::from_u64(0); CPU_STRUCTURAL_CONSTRAINT_COUNT];
+    evaluate_constraints_with_access(&row, &mut constraints, &accessed)?;
+    let unread = accessed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (!value.get()).then_some(index))
+        .collect::<Vec<_>>();
+    assert!(unread.is_empty(), "unread native trace columns: {unread:?}");
     Ok(())
 }
 
