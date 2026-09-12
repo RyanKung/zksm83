@@ -5,11 +5,13 @@ use akita_pcs::{
     AkitaCommitmentScheme, AkitaSerialize, AkitaTranscript, BasisMode, ComputeBackendSetup,
     CpuBackend, OpeningClaims, PolynomialGroupClaims, UniformProverStack,
 };
-use akita_prover::{DensePoly, SelectedProverOpeningData};
+use akita_prover::{
+    DensePoly, NttExecutionRequirements, SelectedProverOpeningData, prewarm_ntt_requirements,
+};
 use akita_serialization::SerializationError;
 use akita_types::{
-    AkitaBatchedProof, AkitaCommitmentHint, CommittedGroup, GroupBatchStatement,
-    OpeningScheduleSelection,
+    AkitaBatchedProof, AkitaCommitmentHint, AkitaScheduleLookupKey, CommittedGroup, FoldSchedule,
+    GroupBatchStatement, OpeningScheduleSelection, PolynomialGroupLayout,
 };
 use jolt_field::{CanonicalBytes, Ring};
 use sha2::{Digest, Sha256};
@@ -185,6 +187,7 @@ pub(crate) fn commit_field_columns(
     let backend = CpuBackend::DEFAULT;
     let prepared = backend.prepare_setup(&setup)?;
     let stack = UniformProverStack::uniform(&backend, &prepared, setup.expanded.as_ref())?;
+    prewarm_root_commit(layout, &scheme, &stack)?;
     let zero_column = vec![NativeField::from_u64(0); row_count];
     let group_count = field_columns.len().div_ceil(layout.group_columns);
     let mut groups = Vec::with_capacity(group_count);
@@ -215,6 +218,45 @@ pub(crate) fn commit_field_columns(
         commitments,
         batches,
     })
+}
+
+fn prewarm_root_commit(
+    layout: PcsLayout,
+    scheme: &AkitaCommitmentScheme<Config>,
+    stack: &UniformProverStack<'_, NativeField, CpuBackend>,
+) -> Result<(), PcsError> {
+    let group = PolynomialGroupLayout::new(layout.num_variables, layout.group_columns);
+    let key = AkitaScheduleLookupKey::single(group);
+    let schedule = scheme.schedules().resolve_key(&key)?.schedule();
+    let requirements = root_commit_requirements(schedule)?;
+    prewarm_ntt_requirements::<NativeField, _>(stack, &requirements)?;
+    Ok(())
+}
+
+fn root_commit_requirements(schedule: &FoldSchedule) -> Result<NttExecutionRequirements, PcsError> {
+    let complete = NttExecutionRequirements::from_commit_and_prove_schedule(schedule)?;
+    let prove = NttExecutionRequirements::from_prove_schedule(schedule)?;
+    let mut root_entries = complete.entries().to_vec();
+    for prove_entry in prove.entries() {
+        let index = root_entries
+            .iter()
+            .position(|entry| entry == prove_entry)
+            .ok_or(PcsError::Shape)?;
+        root_entries.remove(index);
+    }
+    if root_entries.is_empty() {
+        return Err(PcsError::Shape);
+    }
+    let mut requirements = NttExecutionRequirements::default();
+    for entry in root_entries {
+        requirements.add_matrix(
+            entry.fold_level,
+            entry.cluster,
+            entry.key,
+            entry.routing_extent,
+        )?;
+    }
+    Ok(requirements)
 }
 
 pub(crate) fn prove_opening(
@@ -442,4 +484,59 @@ fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), PcsError> {
     push_usize(bytes, value.len())?;
     bytes.extend_from_slice(value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AkitaScheduleLookupKey, PcsLayout, PolynomialGroupLayout, root_commit_requirements, scheme,
+    };
+
+    const DOMAIN: &[u8] = b"zksm83/pcs-prewarm-test/v1";
+    const ROM_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv20_p1.aks");
+    const ROM_SCHEDULE: &[u8] = ROM_FILE.split_at(ROM_FILE.len() - 1).0;
+    const MEMORY_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv17_p1.aks");
+    const MEMORY_SCHEDULE: &[u8] = MEMORY_FILE.split_at(MEMORY_FILE.len() - 1).0;
+    const LOG_FILE: &[u8] = include_bytes!("../protocol/akita/fp128_dense_bounded_nv17_p128.aks");
+    const LOG_SCHEDULE: &[u8] = LOG_FILE.split_at(LOG_FILE.len() - 1).0;
+
+    #[test]
+    fn every_pinned_layout_has_explicit_root_commit_prewarm_requirements()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for layout in layouts() {
+            let scheme = scheme(layout)?;
+            let group = PolynomialGroupLayout::new(layout.num_variables, layout.group_columns);
+            let key = AkitaScheduleLookupKey::single(group);
+            let schedule = scheme.schedules().resolve_key(&key)?.schedule();
+            assert!(!root_commit_requirements(schedule)?.entries().is_empty());
+        }
+        Ok(())
+    }
+
+    fn layouts() -> [PcsLayout; 6] {
+        [
+            layout(
+                14,
+                128,
+                include_bytes!("../protocol/akita/fp128_dense_bounded_nv14_p128.aks"),
+            ),
+            layout(
+                9,
+                128,
+                include_bytes!("../protocol/akita/fp128_dense_bounded_nv9_p128.aks"),
+            ),
+            layout(20, 1, ROM_SCHEDULE),
+            layout(17, 1, MEMORY_SCHEDULE),
+            layout(17, 128, LOG_SCHEDULE),
+            layout(
+                14,
+                1,
+                include_bytes!("../protocol/akita/fp128_dense_bounded.aks"),
+            ),
+        ]
+    }
+
+    const fn layout(variables: usize, columns: usize, schedule: &'static [u8]) -> PcsLayout {
+        PcsLayout::new(variables, columns, schedule, DOMAIN, DOMAIN)
+    }
 }
