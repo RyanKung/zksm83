@@ -105,7 +105,8 @@ and security review exist.
 
 Multi-group PCS batching is a prospective version 2 change, not an unclaimed
 version 1 optimization. Its isolated, 30-second decision gate is specified in
-[pcs-v2-evaluation.md](docs/pcs-v2-evaluation.md).
+[pcs-v2-evaluation.md](docs/pcs-v2-evaluation.md). The gate runs only through
+the explicit `zksm83-pcs-batch-gate` binary and is absent from default tests.
 
 ## License
 

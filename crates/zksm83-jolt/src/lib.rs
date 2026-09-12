@@ -12,6 +12,7 @@ mod logs;
 mod memory;
 mod metrics;
 mod pcs;
+mod pcs_batch_gate;
 mod receipt;
 mod rom_lookup;
 mod state;
@@ -91,6 +92,10 @@ pub use memory::{
     verify_mutable_memory,
 };
 pub use metrics::{NativeProofPhaseMetrics, native_proof_phase_metrics};
+pub use pcs_batch_gate::{
+    PcsBatchGateError, PcsBatchGateMode, PcsBatchPathReport, PcsBatchTamperReport,
+    run_pcs_batch_gate_worker,
+};
 pub use receipt::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
     MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,

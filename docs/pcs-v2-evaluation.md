@@ -55,3 +55,36 @@ Proceed to a larger candidate only if the two-group batch:
 Failure or timeout keeps independent version 1 openings. A successful micro
 gate permits schedule planning for four groups, then 26 groups, but does not by
 itself authorize a protocol migration or a full-path proof.
+
+## Reproducible bounded runner
+
+Generate the candidate from the exact pinned Akita revision in a fresh local
+directory. The resulting `.aks` remains ignored and is not a version-one
+protocol artifact:
+
+```sh
+cargo run --release -p akita-planner --features catalog-gen \
+  --bin gen_schedule_artifacts -- /absolute/path/to/local-candidate \
+  --final-group fp128_dense_bounded:9:128 \
+  --precommitted-group fp128_dense_bounded:9:128
+```
+
+Run the comparison from this repository:
+
+```sh
+cargo run --release -p zksm83-jolt --bin zksm83-pcs-batch-gate -- \
+  --candidate-schedule /absolute/path/to/local-candidate/fp128_dense_bounded.aks \
+  --timeout-seconds 30
+```
+
+The controller runs the independent and batched paths in separate child
+processes, samples their resident memory, and kills either child at its hard
+deadline. Direct worker invocation is rejected. Each path records cold and
+warm setup/prewarm, commitment, opening, canonical encode/decode, verification,
+payload bytes, and total worker time. The batched path also rejects swapped
+groups, changed commitments, values, points, and schedule selection. The final
+JSON sets `accepted_for_larger_candidate` only when every gate above passes.
+
+The command performs a real PCS micro-opening but never executes or proves an
+SM83 transition. It is not part of default tests, fast CI, receipt version 1,
+or any claim about the complete Blue path.
