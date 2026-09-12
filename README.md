@@ -18,9 +18,10 @@ commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
 The complete 611-segment Pokémon Blue receipt is still unfinished. Synthetic
-single- and two-segment receipt gates have passed, as did two adjacent real
-Blue segments on the pre-cutover revision. Those artifacts are migration
-evidence only; the final path must restart from the frozen native-only revision.
+single- and two-segment receipt gates have passed. A fresh native-only run from
+the frozen `2b342e7` revision produced and recovery-verified four adjacent real
+Blue segments before the operator deliberately stopped the long proof run.
+That prefix is bounded recovery evidence, not a complete-path receipt.
 See [implementation status](docs/completion-report.md), the
 [validation map](docs/validation.md), and the
 [native milestone contract](docs/native-jolt-plan.md).

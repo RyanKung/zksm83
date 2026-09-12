@@ -231,6 +231,19 @@ resident memory and zero swap. At the observed two-segment average, a purely
 serial 611-segment run projects to about 54.5 hours and 10.77 GiB; that is an
 estimate, not a completed path result.
 
+A fresh native-only run initially exposed a separate Akita startup race: the
+parallel root-commit workers could contend on one lazily initialized NTT slot.
+Revision `2b342e7` derives and prewarms only the root-commit NTT requirements
+from each pinned schedule before parallel fan-out. Four adjacent real segments
+then completed in 335.488, 336.909, 334.381, and 328.288 seconds, producing a
+75,559,650-byte checkpointed spool for 65,536 rows. After the run was stopped,
+a fresh process verified the four frames and exact checkpoint in 10.109
+seconds. Short negative checks rejected a spool shorter than its checkpoint and
+a changed checkpoint CPU state. A byte appended beyond the checkpointed length
+was discarded as an uncommitted crash tail; it was not parsed as a receipt
+frame. The full 611-segment run was deliberately deferred, so these figures are
+prefix and recovery evidence only.
+
 The prover never finalizes a partial path as the declared Blue statement. A
 bounded engineering run uses `--segment-limit`; `--resume --segment-limit 0`
 only verifies recovery state. Omitting the limit continues toward the exact

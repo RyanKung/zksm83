@@ -396,5 +396,15 @@ The adjacent second segment proved in 325.733 seconds, bringing the spool to
 both frames and the exact checkpoint in 17.74 seconds. A serial extrapolation
 from both real segments is about 54.5 hours and 10.77 GiB, not a completed
 Blue-path measurement. Those two frames predate the witness-auth cutover and
-are not resumed into the final artifact. M7 remains open until a fresh
-native-only run proves all 611 frames and the exact endpoint verifies.
+are not resumed into the final artifact.
+
+The first fresh native-only launch at `c49b110` then exposed an Akita lazy-NTT
+startup race in parallel root commitment. Revision `2b342e7` derives the exact
+root-commit requirements from the pinned schedule and prewarms those cache
+entries before worker fan-out. Four adjacent post-cutover segments completed in
+335.488, 336.909, 334.381, and 328.288 seconds, yielding 65,536 rows and a
+75,559,650-byte checkpointed spool. A fresh process verified every frame and
+the exact recovery state in 10.109 seconds. The operator explicitly stopped the
+run before segment five and deferred all long-running proof tests. M7 therefore
+remains open until a later authorized run proves all 611 frames, emits the
+receipt and expected statement, and the independent verifier accepts them.

@@ -21,10 +21,13 @@ verifies one segment frame at a time.
 
 The resumable prover writes each complete proof frame to a seekable spool,
 syncs it, and atomically replaces an exact SM83 state plus 128-KiB memory
-checkpoint. Resume verifies every persisted proof, rejects noncanonical or
-shorter data, discards only an uncheckpointed partial tail, and checks the exact
-semantic and canonical memory boundary before executing another row. Proving
-and encoding remain inside a named large-stack Rayon pool.
+checkpoint. Resume verifies every checkpointed proof and rejects noncanonical
+or shorter data. Bytes beyond the checkpoint-declared spool length are an
+uncommitted crash tail: resume discards them without parsing or accepting them,
+then checks the exact semantic and canonical memory boundary before executing
+another row. Final receipts use a different immutable format whose verifier
+rejects every trailing byte. Proving and encoding remain inside a named
+large-stack Rayon pool.
 
 ## Cutover status
 
@@ -71,6 +74,22 @@ recovery, not a complete game-path receipt. Because the witness-auth scheme
 changed during native-only cutover, that old progress checkpoint is not resumed
 into the final artifact.
 
+The first post-cutover launch at `c49b110` exposed a startup race in Akita's
+lazy NTT cache: parallel root commitments could wait on the same initialization
+slot. Revision `2b342e7` prewarms the exact root-commit requirements selected by
+each pinned schedule before parallel commitment. From that frozen revision,
+four adjacent real Blue segments completed in 335.488, 336.909, 334.381, and
+328.288 seconds. The checkpointed prefix contains 65,536 rows in 75,559,650
+bytes and a fresh process reverified all four frames plus the exact state and
+memory checkpoint in 10.109 seconds. The operator then stopped the long run;
+no final receipt or statement was emitted. The available measurement did not
+capture a reliable peak-RSS value, so none is claimed for this revision.
+
+```text
+four-frame spool SHA-256      ab8fda32c28dbeec22aa0b38e3dee7387cd5a82130da234bc565499fcdd8c7ab
+progress checkpoint SHA-256  979279bbcfeb6c2706a3f0de9958861649ef9820cd0a07b16f320665f5264dd1
+```
+
 ## Pokémon Blue boundary
 
 Current preflight pins:
@@ -87,9 +106,10 @@ ROM witness-auth root          ff453435441a975fb1d1df3a74cf306477a0e0108506892bd
 endpoint memory witness root   5732c1ae44d4f657093dc5ce9427f0d94ee29878fcbe9f0e5179c729f10a1ccd
 ```
 
-The observed pre-cutover two-segment average projects a serial 611-segment run
-at roughly 54.5 hours and 10.77 GiB. That is only a revision-specific linear
-estimate. The full native-only chain has not completed.
+The observed post-cutover four-segment average projects a serial 611-segment
+run at roughly 56.6 hours and 10.75 GiB. That is only a revision-specific linear
+estimate. The full native-only chain was explicitly deferred before segment
+five and has not completed.
 
 ## Completion condition
 

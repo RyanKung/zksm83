@@ -291,6 +291,25 @@ struct InputIdentities {
 
 type FileProver<'a> = NativeReceiptStreamProver<'a, File>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpoolRecovery {
+    Exact,
+    DiscardUncheckpointedTail,
+}
+
+fn spool_recovery(actual: u64, checkpointed: u64) -> Result<SpoolRecovery, CliError> {
+    if actual < checkpointed {
+        return Err(CliError::ProgressMismatch(
+            "spool is shorter than checkpoint",
+        ));
+    }
+    if actual == checkpointed {
+        Ok(SpoolRecovery::Exact)
+    } else {
+        Ok(SpoolRecovery::DiscardUncheckpointedTail)
+    }
+}
+
 fn start<'a>(
     args: &Args,
     rom_bytes: &[u8],
@@ -331,12 +350,9 @@ fn resume<'a>(
         .metadata()
         .map_err(|source| io_error("inspect", &args.spool, source))?
         .len();
-    if actual_length < progress.spool_bytes {
-        return Err(CliError::ProgressMismatch(
-            "spool is shorter than checkpoint",
-        ));
-    }
-    if actual_length > progress.spool_bytes {
+    if spool_recovery(actual_length, progress.spool_bytes)?
+        == SpoolRecovery::DiscardUncheckpointedTail
+    {
         spool
             .set_len(progress.spool_bytes)
             .map_err(|source| io_error("truncate uncheckpointed tail of", &args.spool, source))?;
@@ -685,8 +701,8 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> CliError
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, ROM_BYTE_LENGTH,
-        validate_endpoint, validate_expected_artifact,
+        CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, ROM_BYTE_LENGTH,
+        SpoolRecovery, spool_recovery, validate_endpoint, validate_expected_artifact,
     };
     use zksm83_core::{
         CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3State, VmState,
@@ -716,6 +732,21 @@ mod tests {
         let (expected, _, _, _, _) = fixture()?;
         assert!(validate_expected_artifact(&expected, &[0]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn spool_length_policy_rejects_loss_and_discards_only_uncheckpointed_tail() {
+        assert!(matches!(spool_recovery(8, 8), Ok(SpoolRecovery::Exact)));
+        assert!(matches!(
+            spool_recovery(9, 8),
+            Ok(SpoolRecovery::DiscardUncheckpointedTail)
+        ));
+        assert!(matches!(
+            spool_recovery(7, 8),
+            Err(CliError::ProgressMismatch(
+                "spool is shorter than checkpoint"
+            ))
+        ));
     }
 
     fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
