@@ -2,7 +2,6 @@
 
 use std::{array::TryFromSliceError, cell::RefCell, collections::HashMap};
 
-use pasta_curves::Fp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -53,7 +52,7 @@ thread_local! {
     /// Performance-only memoization of fully authenticated immutable witnesses.
     ///
     /// A hit is accepted only when the complete value and twenty-sibling path
-    /// equal a witness that was already checked with the normal Poseidon
+    /// equal a witness that was already checked with the normal Merkle
     /// derivation. The cache therefore cannot expand the accepted relation.
     static ROM_VERIFICATION_CACHE: RefCell<HashMap<RomVerificationKey, VerifiedRomWitness>> =
         RefCell::new(HashMap::new());
@@ -85,7 +84,7 @@ impl MerklePath {
     /// ROM and memory argument.
     #[must_use]
     pub fn lookup_placeholder() -> Self {
-        Self::new([CommitmentRoot::from_field(Fp::zero()); 20])
+        Self::new([CommitmentRoot::zero(); 20])
     }
 
     /// Iterates over sibling nodes from leaf level to root level.
@@ -397,19 +396,18 @@ pub(crate) fn derive_root(
     value: u8,
     path: MerklePath,
 ) -> CommitmentRoot {
-    let value_field = Fp::from(u64::from(value));
-    let mut current = crate::hash_elements(leaf_domain, value_field, Fp::zero());
+    let mut current = crate::hash_parts(leaf_domain, &[value], &[]);
     let mut address_bits = address;
     for (level, sibling) in (0_u8..20).zip(path.siblings()) {
         let (left, right) = if address_bits & 1 == 0 {
-            (current, sibling.field())
+            (current, sibling)
         } else {
-            (sibling.field(), current)
+            (sibling, current)
         };
-        current = crate::hash_elements(node_domain(level), left, right);
+        current = crate::hash_parts(node_domain(level), &left.to_bytes(), &right.to_bytes());
         address_bits >>= 1;
     }
-    CommitmentRoot::from_field(current)
+    current
 }
 
 fn mutable_root(address: u32, value: u8, path: MerklePath) -> CommitmentRoot {

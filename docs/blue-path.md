@@ -30,6 +30,11 @@ authenticated ROM bytes and mapper state.
 | `1c:770a` | `SaveMenu` | in-game save flow entered |
 | `1c:7848` | `SaveGameData` | SRAM-writing routine entered |
 
+The current exact cartridge has SHA-256 witness-auth root
+`ff453435441a975fb1d1df3a74cf306477a0e0108506892bd8b5a82744386174`.
+That value gates Blue-specific execution summaries; the receipt separately
+binds the full one-MiB ROM through its verifier-checked Akita commitment.
+
 Relevant committed WRAM/HRAM observations include `wOnSGB = cf1b`,
 `wSaveFileStatus = d088`, `wPlayerName = d158`, `wRivalName = d34a`,
 `wPlayerID = d359`, `wCurMap = d35e`, `hJoyPressed = ffb3`, and

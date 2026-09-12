@@ -239,7 +239,7 @@ impl CpuState {
         }
     }
 
-    /// Returns the fixed initial CPU state for `sm83-core-v1`.
+    /// Returns the fixed initial CPU state for the minimal core profile.
     #[must_use]
     pub const fn profile_initial() -> Self {
         Self::new(

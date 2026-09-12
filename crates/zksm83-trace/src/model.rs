@@ -383,6 +383,10 @@ impl ExecutionMetrics {
             StepKind::InterruptDispatch(_) => increment(&mut self.interrupt_dispatches)?,
             StepKind::DmaByte => increment(&mut self.dma_byte_steps)?,
         }
+        self.record_bus_events(row)
+    }
+
+    fn record_bus_events(&mut self, row: &TraceRow) -> Result<(), TraceError> {
         for event in row.effects().bus_events() {
             increment(&mut self.bus_events)?;
             match event {

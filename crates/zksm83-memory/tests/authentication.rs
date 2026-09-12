@@ -2,7 +2,7 @@
 
 use zksm83_memory::{
     HashDomain, MemoryImage, MemoryRead, MemoryTranscript, MemoryTranscriptError, MemoryWrite,
-    MerklePath, RomImage, RomImageError, RomRead, RomReadError, hash_elements,
+    MerklePath, RomImage, RomImageError, RomRead, RomReadError, hash_parts,
 };
 
 const ONE_MIB: usize = 1_048_576;
@@ -139,22 +139,20 @@ fn roots_have_canonical_round_trip_encoding() -> Result<(), Box<dyn std::error::
     let image = RomImage::new(vec![0x00])?;
     let encoded = image.root().to_bytes();
     assert_eq!(
-        zksm83_memory::CommitmentRoot::from_bytes(encoded)?,
+        zksm83_memory::CommitmentRoot::from_bytes(encoded),
         image.root()
     );
     Ok(())
 }
 
 #[test]
-fn poseidon_cache_keys_bind_domain_and_both_inputs() {
-    let zero = pasta_curves::Fp::from(0_u64);
-    let one = pasta_curves::Fp::from(1_u64);
-    let expected = hash_elements(HashDomain::RomLeaf, zero, zero);
+fn witness_hash_binds_domain_and_both_inputs() {
+    let expected = hash_parts(HashDomain::RomLeaf, &[0], &[0]);
 
-    assert_eq!(hash_elements(HashDomain::RomLeaf, zero, zero), expected);
-    assert_ne!(hash_elements(HashDomain::MemoryLeaf, zero, zero), expected);
-    assert_ne!(hash_elements(HashDomain::RomLeaf, one, zero), expected);
-    assert_ne!(hash_elements(HashDomain::RomLeaf, zero, one), expected);
+    assert_eq!(hash_parts(HashDomain::RomLeaf, &[0], &[0]), expected);
+    assert_ne!(hash_parts(HashDomain::MemoryLeaf, &[0], &[0]), expected);
+    assert_ne!(hash_parts(HashDomain::RomLeaf, &[1], &[0]), expected);
+    assert_ne!(hash_parts(HashDomain::RomLeaf, &[0], &[1]), expected);
 }
 
 #[test]

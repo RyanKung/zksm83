@@ -13,7 +13,7 @@ mod transcript;
 
 pub use address::{AddressOwner, INPUT_PORT, OUTPUT_PORT, dmg_owner, owner};
 pub use bus_transcript::{BusTranscriptAccumulator, BusTranscriptError, BusTranscriptEvent};
-pub use commitment::{CommitmentRoot, HashDomain, RootEncodingError, hash_elements};
+pub use commitment::{CommitmentRoot, HashDomain, hash_parts};
 pub use image::{MemoryImage, MemoryImageError, RomImage, RomImageError};
 pub use isa_transcript::{IsaTranscriptAccumulator, IsaTranscriptError};
 pub use log::{LogAccumulator, LogError, LogKind};

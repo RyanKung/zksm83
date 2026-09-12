@@ -1,6 +1,6 @@
 //! Address ownership for the first clean machine profile.
 
-/// Typed owner of one address in `sm83-core-v1`.
+/// Typed owner of one address in the native SM83 memory map.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressOwner {
     /// Immutable committed program ROM.
@@ -19,13 +19,13 @@ pub enum AddressOwner {
     Unowned,
 }
 
-/// Input port address in `sm83-core-v1`.
+/// Input port address in the minimal core profile.
 pub const INPUT_PORT: u16 = 0xfff0;
 
-/// Output port address in `sm83-core-v1`.
+/// Output port address in the minimal core profile.
 pub const OUTPUT_PORT: u16 = 0xfff1;
 
-/// Returns the unique owner of an address in `sm83-core-v1`.
+/// Returns the unique owner of an address in the minimal core profile.
 #[must_use]
 pub const fn owner(address: u16) -> AddressOwner {
     match address {

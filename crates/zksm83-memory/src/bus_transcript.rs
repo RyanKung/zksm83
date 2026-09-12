@@ -1,24 +1,14 @@
 //! Ordered commitment to the bus events consumed by the proof relation.
 
-use ff::Field;
-use pasta_curves::Fp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CommitmentRoot, HashDomain, hash_elements};
-
-const ADDRESS_SHIFT: u64 = 5;
-const PHYSICAL_ADDRESS_SHIFT: u64 = 21;
-const BEFORE_SHIFT: u64 = 41;
-const AUXILIARY_SHIFT: u64 = 49;
-const VALUE_SHIFT: u64 = 57;
-const EVENT_INDEX_SHIFT: u64 = 65;
-const TRANSCRIPT_INDEX_SHIFT: u64 = 129;
+use crate::{CommitmentRoot, HashDomain, hash_parts};
 
 /// Canonical event tuple committed by the native and recursive relations.
 ///
-/// The fields occupy 193 non-overlapping bits after packing, below the Pasta
-/// field modulus. Authentication paths are deliberately excluded: the event
+/// Fields use an unambiguous fixed-width byte encoding. Authentication paths
+/// are deliberately excluded: the event
 /// describes the logical read or write that a later lookup-memory audit must
 /// check, rather than committing to the temporary Merkle proof mechanism.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,15 +30,17 @@ pub struct BusTranscriptEvent {
 }
 
 impl BusTranscriptEvent {
-    fn packed(self, transcript_index: u64) -> Fp {
-        Fp::from(u64::from(self.kind))
-            + shifted(u64::from(self.address), ADDRESS_SHIFT)
-            + shifted(u64::from(self.physical_address), PHYSICAL_ADDRESS_SHIFT)
-            + shifted(u64::from(self.before), BEFORE_SHIFT)
-            + shifted(u64::from(self.auxiliary), AUXILIARY_SHIFT)
-            + shifted(u64::from(self.value), VALUE_SHIFT)
-            + shifted(self.index, EVENT_INDEX_SHIFT)
-            + shifted(transcript_index, TRANSCRIPT_INDEX_SHIFT)
+    fn canonical_bytes(self, transcript_index: u64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(26);
+        bytes.push(self.kind);
+        bytes.extend_from_slice(&self.address.to_le_bytes());
+        bytes.extend_from_slice(&self.physical_address.to_le_bytes());
+        bytes.push(self.before);
+        bytes.push(self.auxiliary);
+        bytes.push(self.value);
+        bytes.extend_from_slice(&self.index.to_le_bytes());
+        bytes.extend_from_slice(&transcript_index.to_le_bytes());
+        bytes
     }
 }
 
@@ -65,11 +57,7 @@ impl BusTranscriptAccumulator {
     pub fn empty() -> Self {
         Self {
             next_index: 0,
-            root: CommitmentRoot::from_field(hash_elements(
-                HashDomain::BusTranscriptEmpty,
-                Fp::zero(),
-                Fp::zero(),
-            )),
+            root: hash_parts(HashDomain::BusTranscriptEmpty, &[], &[]),
         }
     }
 
@@ -82,12 +70,12 @@ impl BusTranscriptAccumulator {
             .next_index
             .checked_add(1)
             .ok_or(BusTranscriptError::IndexOverflow)?;
-        let packed = event.packed(self.next_index);
-        let root = CommitmentRoot::from_field(hash_elements(
+        let encoded = event.canonical_bytes(self.next_index);
+        let root = hash_parts(
             HashDomain::BusTranscriptElement,
-            self.root.field(),
-            packed,
-        ));
+            &self.root.to_bytes(),
+            &encoded,
+        );
         Ok(Self { next_index, root })
     }
 
@@ -113,10 +101,6 @@ pub enum BusTranscriptError {
     /// A tuple field exceeds the fixed protocol bit allocation.
     #[error("bus transcript event is not canonically encodable")]
     NonCanonicalEvent,
-}
-
-fn shifted(value: u64, shift: u64) -> Fp {
-    Fp::from(value) * Fp::from(2).pow_vartime([shift, 0, 0, 0])
 }
 
 #[cfg(test)]

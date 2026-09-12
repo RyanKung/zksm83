@@ -1,10 +1,9 @@
-//! Ordered field-native input and output commitments.
+//! Ordered input and output commitments.
 
-use pasta_curves::Fp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CommitmentRoot, HashDomain, hash_elements};
+use crate::{CommitmentRoot, HashDomain, hash_parts};
 
 /// Domain of an ordered byte-log commitment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,7 +33,7 @@ impl LogAccumulator {
         Self {
             kind,
             next_index: 0,
-            root: CommitmentRoot::from_field(hash_elements(domain, Fp::zero(), Fp::zero())),
+            root: hash_parts(domain, &[], &[]),
         }
     }
 
@@ -48,8 +47,10 @@ impl LogAccumulator {
             LogKind::Input => HashDomain::InputElement,
             LogKind::Output => HashDomain::OutputElement,
         };
-        let packed = Fp::from(self.next_index) * Fp::from(256) + Fp::from(u64::from(value));
-        let root = CommitmentRoot::from_field(hash_elements(domain, self.root.field(), packed));
+        let mut element = Vec::with_capacity(9);
+        element.extend_from_slice(&self.next_index.to_le_bytes());
+        element.push(value);
+        let root = hash_parts(domain, &self.root.to_bytes(), &element);
         Ok(Self {
             kind: self.kind,
             next_index,

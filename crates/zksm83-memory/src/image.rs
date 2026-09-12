@@ -1,6 +1,5 @@
 //! Prover-side ROM and mutable-memory images that produce authentication paths.
 
-use pasta_curves::Fp;
 use thiserror::Error;
 
 use crate::{
@@ -497,19 +496,11 @@ impl MerkleTree {
 struct TreeShapeError;
 
 fn leaf(kind: TreeKind, value: u8) -> CommitmentRoot {
-    CommitmentRoot::from_field(crate::hash_elements(
-        kind.leaf_domain(),
-        Fp::from(u64::from(value)),
-        Fp::zero(),
-    ))
+    crate::hash_parts(kind.leaf_domain(), &[value], &[])
 }
 
 fn node(kind: TreeKind, level: u8, left: CommitmentRoot, right: CommitmentRoot) -> CommitmentRoot {
-    CommitmentRoot::from_field(crate::hash_elements(
-        kind.node_domain(level),
-        left.field(),
-        right.field(),
-    ))
+    crate::hash_parts(kind.node_domain(level), &left.to_bytes(), &right.to_bytes())
 }
 
 fn validate_mutable_address(address: u16) -> Result<(), MemoryImageError> {

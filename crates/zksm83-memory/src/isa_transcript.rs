@@ -1,11 +1,9 @@
 //! Ordered commitment to ISA-alignment rows consumed by the proof relation.
 
-use ff::{Field, PrimeField};
-use pasta_curves::Fp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CommitmentRoot, HashDomain, hash_elements};
+use crate::{CommitmentRoot, HashDomain, hash_parts};
 
 const PACKED_ROW_BITS: u64 = 106;
 const PACKED_ROW_LIMIT: u128 = 1_u128 << PACKED_ROW_BITS;
@@ -23,11 +21,7 @@ impl IsaTranscriptAccumulator {
     pub fn empty() -> Self {
         Self {
             next_index: 0,
-            root: CommitmentRoot::from_field(hash_elements(
-                HashDomain::IsaTranscriptEmpty,
-                Fp::zero(),
-                Fp::zero(),
-            )),
+            root: hash_parts(HashDomain::IsaTranscriptEmpty, &[], &[]),
         }
     }
 
@@ -40,13 +34,14 @@ impl IsaTranscriptAccumulator {
             .next_index
             .checked_add(1)
             .ok_or(IsaTranscriptError::IndexOverflow)?;
-        let packed = Fp::from_u128(packed_row)
-            + Fp::from(self.next_index) * Fp::from(2).pow_vartime([PACKED_ROW_BITS, 0, 0, 0]);
-        let root = CommitmentRoot::from_field(hash_elements(
+        let mut row = Vec::with_capacity(24);
+        row.extend_from_slice(&self.next_index.to_le_bytes());
+        row.extend_from_slice(&packed_row.to_le_bytes());
+        let root = hash_parts(
             HashDomain::IsaTranscriptElement,
-            self.root.field(),
-            packed,
-        ));
+            &self.root.to_bytes(),
+            &row,
+        );
         Ok(Self { next_index, root })
     }
 

@@ -4,38 +4,35 @@ members = [
     "crates/zksm83-core",
     "crates/zksm83-memory",
     "crates/zksm83-trace",
-    "crates/zksm83-proof",
-    "crates/zksm83-receipt",
-    "crates/zksm83-cli",
-    "crates/zksm83-audit",
+    "crates/zksm83-jolt",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
+akita-config = { git = "https://github.com/LayerZero-Labs/akita.git", rev = "69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc", default-features = false, features = ["transcript-blake2b"] }
+akita-pcs = { git = "https://github.com/LayerZero-Labs/akita.git", rev = "69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc", default-features = false, features = ["parallel", "transcript-blake2b"] }
+akita-prover = { git = "https://github.com/LayerZero-Labs/akita.git", rev = "69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc", default-features = false, features = ["parallel", "transcript-blake2b"] }
+akita-serialization = { git = "https://github.com/LayerZero-Labs/akita.git", rev = "69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc" }
+akita-types = { git = "https://github.com/LayerZero-Labs/akita.git", rev = "69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc", default-features = false, features = ["parallel", "transcript-blake2b"] }
 clap = { version = "4.6.5", features = ["derive"] }
-ff = "0.13.1"
-halo2_gadgets = "0.5.0"
-halo2_proofs = "0.3.5"
 hex = "0.4.3"
-pasta_curves = { version = "0.5.2", features = ["serde"] }
-rand_core = { version = "0.6.4", features = ["getrandom"] }
+jolt-field = { git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = ["asm", "parallel", "solinas"] }
+rayon = "1.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 thiserror = "2.0.20"
 
 zksm83-core = { path = "crates/zksm83-core" }
+zksm83-jolt = { path = "crates/zksm83-jolt" }
 zksm83-isa = { path = "crates/zksm83-isa" }
 zksm83-memory = { path = "crates/zksm83-memory" }
-zksm83-audit = { path = "crates/zksm83-audit" }
-zksm83-proof = { path = "crates/zksm83-proof" }
-zksm83-receipt = { path = "crates/zksm83-receipt" }
 zksm83-trace = { path = "crates/zksm83-trace" }
 
 [workspace.lints.rust]

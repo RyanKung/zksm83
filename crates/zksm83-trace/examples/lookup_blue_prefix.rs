@@ -1,10 +1,10 @@
 //! Measures lookup-backed Blue prefix construction without per-access Merkle paths.
 
-use std::{env, error::Error, fs, io, path::PathBuf, time::Instant};
+use std::{env, error::Error, ffi::OsString, fs, io, path::PathBuf, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
-use zksm83_memory::{CommitmentRoot, LogAccumulator, MemoryImage, RomImage};
+use zksm83_memory::{CommitmentRoot, LogAccumulator, LogKind, MemoryImage, RomImage};
 use zksm83_trace::{ExecutionMetrics, LookupTraceBuilder, ProgramCounterCount};
 
 const INPUT_SCHEDULE_V1: &str = "zksm83-input-schedule/v1";
@@ -35,8 +35,10 @@ struct ExpectedState {
     cpu: CpuState,
     mbc3: Mbc3State,
     dmg_devices: DmgDeviceState,
-    rom_root: CommitmentRoot,
-    memory_root: CommitmentRoot,
+    #[serde(rename = "rom_root")]
+    _legacy_rom_root: CommitmentRoot,
+    #[serde(rename = "memory_root")]
+    _legacy_memory_root: CommitmentRoot,
     input_log: LogAccumulator,
     output_log: LogAccumulator,
 }
@@ -70,17 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let input_path = arguments.next().map(PathBuf::from);
     let checkpoint_path = arguments.next().map(PathBuf::from);
     let profile_path = arguments.next().map(PathBuf::from);
-    let profile_limit = arguments
-        .next()
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| io::Error::other("profile limit is not UTF-8"))?
-                .parse::<usize>()
-                .map_err(|error| io::Error::other(error.to_string()))
-        })
-        .transpose()?
-        .unwrap_or(100);
+    let profile_limit = parse_profile_limit(arguments.next())?;
     if arguments.next().is_some() {
         return Err(io::Error::other(
             "usage: lookup_blue_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
@@ -104,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut builder = LookupTraceBuilder::new_dmg_post_boot_mbc3(
         rom_bytes,
         memory_bytes,
-        private_input,
+        private_input.clone(),
         rom_root,
         memory_root,
     )?;
@@ -120,7 +112,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let final_memory_root = MemoryImage::from_checkpoint_bytes(builder.checkpoint_memory())?.root();
     let final_root_milliseconds = final_root_started.elapsed().as_millis();
     let checkpoint_matches = checkpoint_path
-        .map(|path| validate_checkpoint(&path, boundary.final_state(), builder.checkpoint_memory()))
+        .map(|path| {
+            validate_checkpoint(
+                &path,
+                boundary.final_state(),
+                builder.checkpoint_memory(),
+                rom_root,
+                &private_input,
+            )
+        })
         .transpose()?
         .unwrap_or(false);
     if let (Some(path), Some(profile)) = (profile_path, profile) {
@@ -145,6 +145,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         checkpoint_matches,
     );
     Ok(())
+}
+
+fn parse_profile_limit(value: Option<OsString>) -> Result<usize, Box<dyn Error>> {
+    value
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| io::Error::other("profile limit is not UTF-8"))?
+                .parse::<usize>()
+                .map_err(|error| io::Error::other(error.to_string()))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(100))
+        .map_err(Into::into)
 }
 
 fn load_input_schedule(path: PathBuf) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -177,17 +191,25 @@ fn validate_checkpoint(
     path: &PathBuf,
     actual: VmState,
     actual_memory: Vec<u8>,
+    rom_root: CommitmentRoot,
+    input: &[u8],
 ) -> Result<bool, Box<dyn Error>> {
     let expected: TraceCheckpoint = serde_json::from_slice(&fs::read(path)?)?;
     let expected_memory = hex::decode(expected.memory_hex)?;
     let actual_memory_root = MemoryImage::from_checkpoint_bytes(actual_memory.clone())?.root();
+    let input_length = usize::try_from(expected.state.input_log.next_index())?;
+    let Some(input_prefix) = input.get(..input_length) else {
+        return Ok(false);
+    };
+    let input_log = LogAccumulator::commit(LogKind::Input, input_prefix)?;
     let logical_state_matches = actual.profile() == expected.state.profile
         && actual.cpu() == expected.state.cpu
         && actual.mbc3() == expected.state.mbc3
         && actual.dmg_devices() == expected.state.dmg_devices
-        && actual.rom_root() == expected.state.rom_root
-        && actual_memory_root == expected.state.memory_root
-        && actual.input_log() == expected.state.input_log
-        && actual.output_log() == expected.state.output_log;
+        && actual.rom_root() == rom_root
+        && actual.memory_root() == actual_memory_root
+        && actual.input_log() == input_log
+        && expected.state.output_log.next_index() == 0
+        && actual.output_log() == LogAccumulator::empty(LogKind::Output);
     Ok(logical_state_matches && actual_memory == expected_memory)
 }

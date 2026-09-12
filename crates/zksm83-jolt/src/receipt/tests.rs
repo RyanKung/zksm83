@@ -1,0 +1,311 @@
+use std::io::Cursor;
+
+use zksm83_memory::{MemoryImage, RomImage};
+use zksm83_trace::{TraceBuilder, TraceRow};
+
+use super::{
+    CommitmentIdentity, CommitmentKind, NativeBoundary, NativeReceipt, NativeReceiptStreamProver,
+    NativeSegmentWitness, NativeStatement, ProtocolLogIdentities, verify_native_receipt,
+    verify_native_receipt_bytes, verify_native_receipt_reader,
+};
+use crate::{MEMORY_IMAGE_BYTES, NativeStateBoundary, NativeTraceWitness, ROM_IMAGE_BYTES};
+
+#[test]
+fn commitment_kind_codes_are_stable_and_reject_unknown_values() {
+    let cases = [
+        (CommitmentKind::Rom, 0),
+        (CommitmentKind::MutableMemory, 1),
+        (CommitmentKind::InputLog, 2),
+        (CommitmentKind::OutputLog, 3),
+        (CommitmentKind::BusLog, 4),
+        (CommitmentKind::IsaLog, 5),
+    ];
+    for (kind, code) in cases {
+        assert_eq!(kind.code(), code);
+        assert_eq!(CommitmentKind::from_code(code), Some(kind));
+    }
+    assert_eq!(CommitmentKind::from_code(6), None);
+}
+
+#[test]
+fn statement_decoder_rejects_wrong_magic() {
+    assert!(NativeStatement::from_bytes(b"not-a-native-statement").is_err());
+}
+
+#[test]
+fn stream_reader_rejects_truncated_header() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = structural_statement()?;
+    assert!(verify_native_receipt_reader(Cursor::new(b"ZKSM83R1"), &expected).is_err());
+    Ok(())
+}
+
+#[test]
+fn statement_wire_is_canonical_and_binds_every_field() -> Result<(), Box<dyn std::error::Error>> {
+    let statement = structural_statement()?;
+    let bytes = statement.to_bytes()?;
+    assert_eq!(NativeStatement::from_bytes(&bytes)?, statement);
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(NativeStatement::from_bytes(&trailing).is_err());
+
+    let mut tampered = statement.clone();
+    tampered.statement_id[0] ^= 1;
+    assert!(NativeStatement::from_bytes(&tampered.to_bytes()?).is_err());
+    Ok(())
+}
+
+#[test]
+fn zero_cursor_requires_the_unique_empty_log_identity() -> Result<(), Box<dyn std::error::Error>> {
+    let statement = structural_statement()?;
+    let mut boundary = statement.initial.clone();
+    boundary.logs.bus.digest[0] ^= 1;
+    assert!(boundary.validate().is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "expensive complete native receipt, canonical wire, and tamper matrix gate"]
+fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let (trace, rom_bytes, initial_bytes, final_bytes) = receipt_trace()?;
+    let rom = crate::commit_rom(&rom_bytes)?;
+    let initial_memory = crate::commit_memory(&initial_bytes)?;
+    let final_memory = crate::commit_memory(&final_bytes)?;
+    eprintln!("receipt gate commitments: {:.2?}", started.elapsed());
+    let witness = NativeSegmentWitness::new(&trace, &initial_memory, &final_memory);
+    let mut prover = NativeReceiptStreamProver::new(&rom, Cursor::new(Vec::new()))?;
+    prover.append(witness)?;
+    let mut bytes = Vec::new();
+    let statement = prover.finish(&mut bytes)?;
+    eprintln!("receipt gate proof: {:.2?}", started.elapsed());
+    let expected = NativeStatement::from_bytes(&statement.to_bytes()?)?;
+    eprintln!(
+        "receipt gate encoded: {:.2?}, {} bytes",
+        started.elapsed(),
+        bytes.len()
+    );
+    let decoded = NativeReceipt::from_bytes(&bytes)?;
+    assert_eq!(decoded.to_bytes()?, bytes);
+    eprintln!("receipt gate decoded: {:.2?}", started.elapsed());
+    assert_eq!(
+        verify_native_receipt(&decoded, &expected)?.segment_count(),
+        1
+    );
+    eprintln!("receipt gate parsed verify: {:.2?}", started.elapsed());
+    assert_eq!(
+        verify_native_receipt_bytes(&bytes, &expected)?.statement_id(),
+        expected.statement_id()
+    );
+    assert_eq!(
+        verify_native_receipt_reader(Cursor::new(&bytes), &expected)?.statement_id(),
+        expected.statement_id()
+    );
+    eprintln!("receipt gate byte verify: {:.2?}", started.elapsed());
+
+    let mut wrong = expected.clone();
+    wrong.relation_step_count = wrong
+        .relation_step_count
+        .checked_add(1)
+        .ok_or("step count overflow")?;
+    wrong.statement_id = wrong.compute_id();
+    assert!(verify_native_receipt(&decoded, &wrong).is_err());
+
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(verify_native_receipt_bytes(&trailing, &expected).is_err());
+
+    let mut changed_proof = bytes;
+    let last = changed_proof.last_mut().ok_or("empty receipt")?;
+    *last ^= 1;
+    assert!(verify_native_receipt_bytes(&changed_proof, &expected).is_err());
+
+    let mut omitted = decoded.clone();
+    omitted.segments.clear();
+    assert!(verify_native_receipt(&omitted, &expected).is_err());
+
+    let mut duplicated = decoded.clone();
+    let segment = duplicated
+        .segments
+        .first()
+        .cloned()
+        .ok_or("missing segment")?;
+    duplicated.segments.push(segment);
+    assert!(verify_native_receipt(&duplicated, &expected).is_err());
+
+    let mut reordered = decoded;
+    let first = reordered.segments.first_mut().ok_or("missing segment")?;
+    first.segment_index = 1;
+    assert!(verify_native_receipt(&reordered, &expected).is_err());
+    eprintln!("receipt gate tamper matrix: {:.2?}", started.elapsed());
+    Ok(())
+}
+
+#[test]
+#[ignore = "expensive two-segment native receipt and exact boundary-chain gate"]
+fn two_segment_receipt_authenticates_exact_shared_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let (traces, rom_bytes, memories) = two_segment_trace()?;
+    let rom = crate::commit_rom(&rom_bytes)?;
+    let committed_memories = memories
+        .iter()
+        .map(|memory| crate::commit_memory(memory))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_trace = traces.first().ok_or("missing first trace")?;
+    let second_trace = traces.get(1).ok_or("missing second trace")?;
+    let initial_memory = committed_memories.first().ok_or("missing initial memory")?;
+    let middle_memory = committed_memories.get(1).ok_or("missing middle memory")?;
+    let final_memory = committed_memories.get(2).ok_or("missing final memory")?;
+    let mut prover = NativeReceiptStreamProver::new(&rom, Cursor::new(Vec::new()))?;
+    prover.append(NativeSegmentWitness::new(
+        first_trace,
+        initial_memory,
+        middle_memory,
+    ))?;
+    eprintln!("two-segment first frame: {:.2?}", started.elapsed());
+    prover.append(NativeSegmentWitness::new(
+        second_trace,
+        middle_memory,
+        final_memory,
+    ))?;
+    eprintln!("two-segment receipt proof: {:.2?}", started.elapsed());
+    let mut receipt_bytes = Vec::new();
+    let statement = prover.finish(&mut receipt_bytes)?;
+    let expected = NativeStatement::from_bytes(&statement.to_bytes()?)?;
+    assert_eq!(expected.segment_count(), 2);
+    assert_eq!(expected.relation_step_count(), 2);
+    assert_eq!(
+        verify_native_receipt_reader(Cursor::new(&receipt_bytes), &expected)?.segment_count(),
+        2
+    );
+    let receipt = NativeReceipt::from_bytes(&receipt_bytes)?;
+    assert_eq!(
+        verify_native_receipt(&receipt, &expected)?.segment_count(),
+        2
+    );
+
+    let mut broken_link = receipt.clone();
+    let wrong_boundary = broken_link
+        .segments
+        .first()
+        .map(|segment| segment.initial.clone())
+        .ok_or("missing first segment")?;
+    let second = broken_link
+        .segments
+        .get_mut(1)
+        .ok_or("missing second segment")?;
+    second.initial = wrong_boundary;
+    assert!(verify_native_receipt(&broken_link, &expected).is_err());
+
+    let mut reordered = receipt;
+    reordered.segments.swap(0, 1);
+    assert!(verify_native_receipt(&reordered, &expected).is_err());
+    eprintln!("two-segment receipt gate: {:.2?}", started.elapsed());
+    Ok(())
+}
+
+fn structural_statement() -> Result<NativeStatement, Box<dyn std::error::Error>> {
+    let mut scalars = [0_u64; crate::STATE_SCALAR_COUNT];
+    scalars[20] = 1;
+    let state = NativeStateBoundary::from_scalars(scalars);
+    let memory = super::identity::direct_identity(
+        CommitmentKind::MutableMemory,
+        u64::try_from(MEMORY_IMAGE_BYTES)?,
+        b"structural-memory-commitment",
+    )?;
+    let boundary = NativeBoundary {
+        state,
+        memory,
+        logs: ProtocolLogIdentities::empty(),
+    };
+    let rom = super::identity::direct_identity(
+        CommitmentKind::Rom,
+        u64::try_from(ROM_IMAGE_BYTES)?,
+        b"structural-rom-commitment",
+    )?;
+    NativeStatement::new(rom, boundary.clone(), boundary, 1, 1).map_err(Into::into)
+}
+
+type ReceiptTrace = (NativeTraceWitness, Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn receipt_trace() -> Result<ReceiptTrace, Box<dyn std::error::Error>> {
+    let mut rom_bytes = vec![0_u8; ROM_IMAGE_BYTES];
+    let program = [
+        0x3e, 0x5a, // LD A,0x5a
+        0xea, 0x00, 0xc0, // LD (0xc000),A
+        0xfa, 0x00, 0xc0, // LD A,(0xc000)
+        0x76, // HALT
+    ];
+    let target = rom_bytes
+        .get_mut(0x100..0x100 + program.len())
+        .ok_or("ROM fixture")?;
+    target.copy_from_slice(&program);
+    let rom = RomImage::new(rom_bytes.clone())?;
+    let memory = MemoryImage::zeroed()?;
+    let mut builder = TraceBuilder::new_dmg_post_boot_mbc3(rom, memory, Vec::new());
+    let initial = builder.checkpoint_memory();
+    let mut rows = Vec::<TraceRow>::new();
+    for _ in 0..4 {
+        rows.push(builder.step()?);
+    }
+    let final_memory = builder.checkpoint_memory();
+    let references = rows.iter().collect::<Vec<_>>();
+    Ok((
+        crate::NativeTraceWitness::from_rows(&references)?,
+        rom_bytes,
+        initial,
+        final_memory,
+    ))
+}
+
+type TwoSegmentTrace = ([NativeTraceWitness; 2], Vec<u8>, [Vec<u8>; 3]);
+
+fn two_segment_trace() -> Result<TwoSegmentTrace, Box<dyn std::error::Error>> {
+    let mut rom_bytes = vec![0_u8; ROM_IMAGE_BYTES];
+    let program = [
+        0x3e, 0x5a, // LD A,0x5a
+        0xea, 0x00, 0xc0, // LD (0xc000),A
+    ];
+    let target = rom_bytes
+        .get_mut(0x100..0x100 + program.len())
+        .ok_or("ROM fixture")?;
+    target.copy_from_slice(&program);
+    let rom = RomImage::new(rom_bytes.clone())?;
+    let memory = MemoryImage::zeroed()?;
+    let mut builder = TraceBuilder::new_dmg_post_boot_mbc3(rom, memory, Vec::new());
+    let initial = builder.checkpoint_memory();
+    let first = builder.step()?;
+    let middle = builder.checkpoint_memory();
+    let second = builder.step()?;
+    let final_memory = builder.checkpoint_memory();
+    let traces = [
+        NativeTraceWitness::from_rows(&[&first])?,
+        NativeTraceWitness::from_rows(&[&second])?,
+    ];
+    Ok((traces, rom_bytes, [initial, middle, final_memory]))
+}
+
+#[test]
+fn direct_commitment_identities_are_typed_and_layout_separated()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rom_identity: CommitmentIdentity = super::identity::direct_identity(
+        CommitmentKind::Rom,
+        u64::try_from(ROM_IMAGE_BYTES)?,
+        b"same-commitment-bytes",
+    )?;
+    let memory_identity = super::identity::direct_identity(
+        CommitmentKind::MutableMemory,
+        u64::try_from(MEMORY_IMAGE_BYTES)?,
+        b"same-commitment-bytes",
+    )?;
+    assert_eq!(rom_identity.kind(), CommitmentKind::Rom);
+    assert_eq!(memory_identity.kind(), CommitmentKind::MutableMemory);
+    assert_ne!(
+        rom_identity.layout_digest(),
+        memory_identity.layout_digest()
+    );
+    assert_ne!(rom_identity.digest(), memory_identity.digest());
+    Ok(())
+}
