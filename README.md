@@ -1,14 +1,22 @@
 # zksm83
 
-`zksm83` is a native SM83 proof-system research workspace. It executes and
-proves the SM83 transition relation directly.
+`zksm83` is an experimental native SM83 verifiable-execution workspace. It
+models and proves the SM83 transition relation directly instead of compiling a
+Game Boy emulator through RV64.
 
-The only proof pipeline is `zksm83-jolt`: a transparent Akita lattice-PCS
-receipt over a shared native witness. It binds the complete SM83 CPU/ISA
-relation, a one-MiB immutable ROM, ordered 128-KiB mutable memory, no-RTC MBC3,
-the modeled DMG devices, segment continuity, and ordered bus/input/output/ISA
-logs. The standalone verifier receives a separately pinned public statement
-and no emulator, trace, ROM image, memory image, or private log values.
+> **Status:** v2-only research implementation. The default CI validates the
+> Rust workspace and proof-free semantic relations; expensive end-to-end proof
+> tests are opt-in and are not part of CI. There is not yet a supported
+> performance or real-time-proving claim.
+
+The only proof pipeline is `zksm83-jolt`: a Jolt-like lookup-and-sumcheck
+architecture with transparent Akita lattice polynomial commitments over a
+shared native witness. It is a native SM83 construction, not an upstream Jolt
+RV64 guest. It binds the complete SM83 CPU/ISA relation, a one-MiB immutable
+ROM, ordered 128-KiB mutable memory, no-RTC MBC3, the modeled DMG devices,
+segment continuity, and ordered bus/input/output/ISA logs. The standalone
+verifier receives a separately pinned public statement and no emulator, trace,
+ROM image, memory image, or private log values.
 
 Halo2/Pasta, the MOVA-era audit implementation, and their old CLI/receipt crates
 have been removed. Witness-side execution authentication now uses
@@ -131,14 +139,14 @@ not affect the protocol identity.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 Default tests are self-contained. Expensive cryptographic gates are ignored
-and must be invoked explicitly. ROMs, saves, input schedules, checkpoints,
-spools, receipts, statements, traces, benchmarks, and temporary proof data are
-local-only; see [development.md](docs/development.md).
+and must be invoked explicitly; CI never produces a proof. ROMs, saves, input
+schedules, checkpoints, spools, receipts, statements, traces, benchmarks, and
+temporary proof data are local-only; see [development.md](docs/development.md).
 
 ## Privacy boundary
 

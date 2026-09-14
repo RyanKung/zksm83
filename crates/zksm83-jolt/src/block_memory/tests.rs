@@ -29,8 +29,8 @@ fn packed_memory_chronology_binds_repeated_wram_events() -> Result<(), Box<dyn s
 }
 
 #[test]
-fn packed_protocol_io_indices_follow_boundary_cursors() -> Result<(), Box<dyn std::error::Error>> {
-    let program = [0xfa, 0xf0, 0xff, 0xea, 0xf1, 0xff];
+fn packed_joypad_input_index_follows_boundary_cursor() -> Result<(), Box<dyn std::error::Error>> {
+    let program = [0xfa, 0x00, 0xff];
     let mut bytes = vec![0_u8; 0x100 + program.len()];
     bytes
         .get_mut(0x100..)
@@ -45,18 +45,30 @@ fn packed_protocol_io_indices_follow_boundary_cursors() -> Result<(), Box<dyn st
         rom.root(),
         memory.root(),
     )?;
-    let blocks = pack_witness_basic_blocks(builder.run_exact_steps(2)?)?;
+    let blocks = pack_witness_basic_blocks(builder.run_exact_steps(1)?)?;
+    let (block_index, input_slot) = blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block_index, block)| {
+            block
+                .rows()
+                .flat_map(|row| row.effects().ordered_bus_events())
+                .position(|event| event.kind() == BusEventKind::DmgJoypadRead)
+                .map(|slot| (block_index, slot))
+        })
+        .ok_or(UniformError::Shape)?;
     let witness = BlockMemoryWitness::from_blocks(&blocks)?;
     validate_uniform_witness(&BlockMemoryRelation, witness.columns())?;
 
     let mut mutated = witness.columns().to_vec();
     let event_index_column = BLOCK_ISA_CONTROL_COLUMN_COUNT
-        .checked_add(crate::block_bus::slot_index_column(3)?)
+        .checked_add(crate::block_bus::slot_index_column(input_slot)?)
         .ok_or(UniformError::Shape)?;
-    *mutated
+    let event_index = mutated
         .get_mut(event_index_column)
-        .and_then(|column| column.get_mut(0))
-        .ok_or(UniformError::Shape)? = 1;
+        .and_then(|column| column.get_mut(block_index))
+        .ok_or(UniformError::Shape)?;
+    *event_index = event_index.checked_add(1).ok_or(UniformError::Shape)?;
     assert!(validate_uniform_witness(&BlockMemoryRelation, &mutated).is_err());
     Ok(())
 }

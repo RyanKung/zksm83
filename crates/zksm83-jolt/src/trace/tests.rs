@@ -20,7 +20,7 @@ fn trace_column_families_partition_v2_layout() {
     let device_start = TRACE_MEMORY_START + TRACE_BUS_SLOTS * TRACE_MEMORY_SLOT_WIDTH;
     let families = [
         ("state", 0, TRACE_ACTIVE, 76),
-        ("control and ISA", TRACE_ACTIVE, TRACE_BUS_START, 75),
+        ("control and ISA", TRACE_ACTIVE, TRACE_BUS_START, 64),
         (
             "bus tuples",
             TRACE_BUS_START,
@@ -102,7 +102,7 @@ fn validated_rows_encode_and_padding_is_canonical() -> Result<(), Box<dyn std::e
     assert_eq!(
         witness
             .columns()
-            .get(TRACE_MODE_START + 6)
+            .get(TRACE_MODE_START + super::TRACE_MODE_COUNT - 1)
             .ok_or_else(missing)?
             .get(1),
         Some(&1)

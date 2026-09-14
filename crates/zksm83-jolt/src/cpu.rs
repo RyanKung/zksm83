@@ -73,8 +73,8 @@ use selectors::{argument_selector, operation_selector};
 
 /// Number of relation slots; unused tail slots are canonical zero identities.
 pub const CPU_STRUCTURAL_CONSTRAINT_COUNT: usize = 6144;
-// Keep the 876-slot zero tail explicit while guarding every real constraint push.
-const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5263;
+// Keep the 892-slot zero tail explicit while guarding every real constraint push.
+const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5252;
 /// Maximum algebraic degree of one CPU/device constraint before equality weighting.
 pub const CPU_STRUCTURAL_MAX_DEGREE: usize = 18;
 

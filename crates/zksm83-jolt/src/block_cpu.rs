@@ -544,13 +544,15 @@ mod tests {
         let witness = BlockCpuWitness::from_blocks(&blocks)?;
 
         let mut register_mutation = witness.columns().to_vec();
-        let after_b = BLOCK_ROUTING_COLUMN_COUNT
-            .checked_add(local_state_column(1, 1).ok_or(UniformError::Shape)?)
-            .ok_or(UniformError::Shape)?;
-        *register_mutation
-            .get_mut(after_b)
-            .and_then(|column| column.first_mut())
-            .ok_or(UniformError::Shape)? ^= 1;
+        for boundary in 1..=BASIC_BLOCK_INSTRUCTION_BOUND {
+            let after_b = BLOCK_ROUTING_COLUMN_COUNT
+                .checked_add(local_state_column(boundary, 1).ok_or(UniformError::Shape)?)
+                .ok_or(UniformError::Shape)?;
+            *register_mutation
+                .get_mut(after_b)
+                .and_then(|column| column.first_mut())
+                .ok_or(UniformError::Shape)? ^= 1;
+        }
         let memory_prefix = register_mutation
             .get(..BLOCK_MEMORY_COLUMN_COUNT)
             .ok_or(UniformError::Shape)?;
@@ -576,18 +578,19 @@ mod tests {
         validate_uniform_witness(&BlockMemoryRelation, memory_prefix)?;
         assert!(validate_uniform_witness(&BlockCpuRelation, &boundary_bit_mutation).is_err());
 
-        let mut helper_mutation = witness.columns().to_vec();
+        let mut lookup_mutation = witness.columns().to_vec();
         assert!(packed_cpu_aux_offset(TRACE_RESULT_VALUE, 0).is_none());
-        let result_bit = BLOCK_MEMORY_COLUMN_COUNT
-            .checked_add(
-                packed_cpu_aux_offset(TRACE_RESULT_BITS_START, 0).ok_or(UniformError::Shape)?,
-            )
+        assert!(packed_cpu_aux_offset(TRACE_RESULT_BITS_START, 0).is_none());
+        let result_bit = BlockCpuWitness::execution_lookup_columns(0, 0)?
+            .output_bits()
+            .first()
+            .copied()
             .ok_or(UniformError::Shape)?;
-        *helper_mutation
+        *lookup_mutation
             .get_mut(result_bit)
             .and_then(|column| column.first_mut())
             .ok_or(UniformError::Shape)? ^= 1;
-        assert!(validate_uniform_witness(&BlockCpuRelation, &helper_mutation).is_err());
+        assert!(validate_uniform_witness(&BlockCpuRelation, &lookup_mutation).is_err());
 
         let mut bus_match_mutation = witness.columns().to_vec();
         let first_bus_match = BLOCK_MEMORY_COLUMN_COUNT

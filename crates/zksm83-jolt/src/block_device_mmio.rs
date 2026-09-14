@@ -533,8 +533,8 @@ fn constrain_packed_register_tuples(
     for (address, high_pack, byte, visible_high) in [
         (0x01, false, 0, 0_u64),
         (0x02, false, 1, 0),
-        (0x05, false, 2, 0),
-        (0x06, false, 3, 0xf8),
+        (0x06, false, 2, 0),
+        (0x07, false, 3, 0xf8),
         (0x40, false, 4, 0),
         (0x42, false, 6, 0),
         (0x43, false, 7, 0),
@@ -587,8 +587,8 @@ fn constrain_stable_packed_registers(
 ) -> Result<(), UniformError> {
     for (address, high_pack, byte, write_mask) in [
         (0x02, false, 1, 0xff_u8),
-        (0x05, false, 2, 0xff),
-        (0x06, false, 3, 0x07),
+        (0x06, false, 2, 0xff),
+        (0x07, false, 3, 0x07),
         (0x40, false, 4, 0xff),
         (0x41, false, 5, 0x78),
         (0x42, false, 6, 0xff),

@@ -72,7 +72,7 @@ fn structural_relation_used_slot_count_is_stable() -> Result<(), Box<dyn std::er
         .collect::<Vec<_>>();
     let mut constraints = vec![NativeField::from_u64(1); CPU_STRUCTURAL_CONSTRAINT_COUNT];
     let used = evaluate_constraints(&row, &mut constraints)?;
-    assert_eq!(used, 5268);
+    assert_eq!(used, super::CPU_STRUCTURAL_USED_CONSTRAINT_COUNT);
     assert!(
         constraints
             .get(used..)

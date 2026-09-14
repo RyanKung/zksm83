@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 use zksm83_core::{
-    BusEventKind, BusWitness, CpuState, DmgDeviceState, Flags, ImeState, MachineContext,
-    MachineProfile, Mbc3State, Registers, RunState, StepInput, VmState,
+    BusEventKind, CpuState, DmgDeviceState, Flags, ImeState, MachineContext, MachineProfile,
+    Mbc3State, Registers, RunState, VmState,
 };
 use zksm83_memory::{
     LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -161,13 +161,16 @@ pub(crate) fn increment_witness_cell(
 fn halt_idle_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let rom = RomImage::new(vec![0])?;
     let memory = MemoryImage::zeroed()?;
-    execute_empty(machine_state(
-        DmgDeviceState::dmg_post_boot(),
-        ImeState::Disabled,
-        RunState::Halted,
-        &rom,
+    execute_empty(
+        machine_state(
+            DmgDeviceState::dmg_post_boot(),
+            ImeState::Disabled,
+            RunState::Halted,
+            &rom,
+            &memory,
+        )?,
         &memory,
-    )?)
+    )
 }
 
 fn halt_until_vblank_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
@@ -176,13 +179,10 @@ fn halt_until_vblank_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let mut devices = DmgDeviceState::dmg_post_boot();
     let _prior = devices.write_mmio(0xff0f, 0);
     let _prior = devices.write_mmio(0xffff, 0x01);
-    execute_empty(machine_state(
-        devices,
-        ImeState::Enabled,
-        RunState::Halted,
-        &rom,
+    execute_empty(
+        machine_state(devices, ImeState::Enabled, RunState::Halted, &rom, &memory)?,
         &memory,
-    )?)
+    )
 }
 
 fn halt_wake_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
@@ -191,56 +191,52 @@ fn halt_wake_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let mut devices = DmgDeviceState::dmg_post_boot();
     let _prior = devices.write_mmio(0xff0f, 0x01);
     let _prior = devices.write_mmio(0xffff, 0x01);
-    execute_empty(machine_state(
-        devices,
-        ImeState::Disabled,
-        RunState::Halted,
-        &rom,
+    execute_empty(
+        machine_state(devices, ImeState::Disabled, RunState::Halted, &rom, &memory)?,
         &memory,
-    )?)
+    )
 }
 
 fn interrupt_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let rom = RomImage::new(vec![0])?;
-    let mut memory = MemoryImage::zeroed()?;
+    let memory = MemoryImage::zeroed()?;
     let mut devices = DmgDeviceState::dmg_post_boot();
     let _prior = devices.write_mmio(0xff0f, 0x01);
     let _prior = devices.write_mmio(0xffff, 0x01);
     let before = machine_state(devices, ImeState::Enabled, RunState::Running, &rom, &memory)?;
-    let high = memory.write_mapped(0xfffd, 0xfffd, 0)?;
-    let low = memory.write_mapped(0xfffc, 0xfffc, 0)?;
-    TraceRow::execute(
-        before,
-        StepInput::new(vec![
-            BusWitness::MemoryWrite(high),
-            BusWitness::MemoryWrite(low),
-        ]),
-    )
-    .map_err(Into::into)
+    execute_lookup(before, memory.checkpoint_bytes())
 }
 
 fn dma_byte_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let rom = RomImage::new(vec![0])?;
-    let mut memory = MemoryImage::zeroed()?;
+    let memory = MemoryImage::zeroed()?;
     let mut devices = DmgDeviceState::dmg_post_boot();
     let _prior = devices.write_mmio(0xff46, 0);
-    let before = machine_state(
-        devices,
-        ImeState::Disabled,
-        RunState::Running,
-        &rom,
-        &memory,
+    let before = VmState::from_profile_parts(
+        MachineContext::new(MachineProfile::DmgPostBootMbc3V1, devices),
+        CpuState::new(
+            Registers::default(),
+            Flags::default(),
+            0xff80,
+            0xfffe,
+            ImeState::Disabled,
+            RunState::Running,
+            0,
+        ),
+        Mbc3State::profile_initial(),
+        rom.root(),
+        memory.root(),
+        LogAccumulator::empty(LogKind::Input),
+        LogAccumulator::empty(LogKind::Output),
     )?;
-    let scheduled = TraceRow::execute(before, StepInput::new(vec![BusWitness::Rom(rom.read(0)?)]))?;
-    let write = memory.write_mapped(0xfe00, 0xfe00, 0)?;
-    TraceRow::execute(
-        scheduled.after(),
-        StepInput::new(vec![
-            BusWitness::Rom(rom.read(0)?),
-            BusWitness::MemoryWrite(write),
-        ]),
-    )
-    .map_err(Into::into)
+    let mut builder = LookupTraceBuilder::resume_dmg_post_boot_mbc3(
+        vec![0],
+        memory.checkpoint_bytes(),
+        Vec::new(),
+        before,
+    )?;
+    let _scheduled = builder.step()?;
+    builder.step().map_err(Into::into)
 }
 
 fn halt_until_serial_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
@@ -252,13 +248,10 @@ fn halt_until_serial_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let _prior = devices.write_mmio(0xff40, 0);
     let _prior = devices.write_mmio(0xff01, 0x42);
     let _prior = devices.write_mmio(0xff02, 0x81);
-    execute_empty(machine_state(
-        devices,
-        ImeState::Enabled,
-        RunState::Halted,
-        &rom,
+    execute_empty(
+        machine_state(devices, ImeState::Enabled, RunState::Halted, &rom, &memory)?,
         &memory,
-    )?)
+    )
 }
 
 fn halt_until_timer_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
@@ -272,17 +265,23 @@ fn halt_until_timer_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     let _prior = devices.write_mmio(0xff05, 0xff);
     let _prior = devices.write_mmio(0xff06, 0x42);
     let _prior = devices.write_mmio(0xff07, 0x05);
-    execute_empty(machine_state(
-        devices,
-        ImeState::Enabled,
-        RunState::Halted,
-        &rom,
+    execute_empty(
+        machine_state(devices, ImeState::Enabled, RunState::Halted, &rom, &memory)?,
         &memory,
-    )?)
+    )
 }
 
-fn execute_empty(state: VmState) -> Result<TraceRow, Box<dyn std::error::Error>> {
-    TraceRow::execute(state, StepInput::new(Vec::new())).map_err(Into::into)
+fn execute_empty(
+    state: VmState,
+    memory: &MemoryImage,
+) -> Result<TraceRow, Box<dyn std::error::Error>> {
+    execute_lookup(state, memory.checkpoint_bytes())
+}
+
+fn execute_lookup(state: VmState, memory: Vec<u8>) -> Result<TraceRow, Box<dyn std::error::Error>> {
+    let mut builder =
+        LookupTraceBuilder::resume_dmg_post_boot_mbc3(vec![0], memory, Vec::new(), state)?;
+    builder.step().map_err(Into::into)
 }
 
 fn machine_state(
