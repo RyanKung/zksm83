@@ -1,9 +1,13 @@
 //! Experimental CUDA primitives for the native SM83 prover.
 //!
-//! This crate does not change the proof protocol or verifier. Its first slice
-//! provides a portable `sm_70+` field-fold kernel and an exact CPU oracle. The
-//! CUDA runtime probes the selected device and retains its actual compute
-//! capability instead of fixing the implementation to one GPU generation.
+//! This crate does not change the proof protocol, receipt bytes, or backend
+//! digest. Its first device slice provides a portable `sm_70+` field-fold
+//! kernel and an exact CPU oracle. `zksm83-jolt` routes the wider native backend
+//! boundary across witness construction, relation evaluation, Akita
+//! commitment/opening, encoding, and verification, with non-fold phases kept
+//! byte-equivalent to the CPU path until dedicated kernels land. The CUDA
+//! runtime probes the selected device and retains its actual compute capability
+//! instead of fixing the implementation to one GPU generation.
 
 #![deny(missing_docs)]
 #![deny(unsafe_code)]

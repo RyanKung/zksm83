@@ -2,9 +2,15 @@ use akita_pcs::Ring;
 use jolt_field::Field;
 
 use crate::{
-    NativeField, NativeProtocolVersion, TRACE_BUS_SLOTS, UNIFORM_NUM_VARIABLES, WitnessCommitments,
-    pcs::{ColumnCommitments, OpeningProof, prove_opening, verify_opening},
-    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
+    NativeField, NativeProtocolVersion, NativeProverBackend, TRACE_BUS_SLOTS,
+    UNIFORM_NUM_VARIABLES, WitnessCommitments,
+    pcs::{
+        ColumnCommitments, OpeningProof, prove_opening_with_backend, verify_opening_with_backend,
+    },
+    uniform::{
+        CommittedWitness, prove_witness_opening_with_backend,
+        verify_witness_opening_for_protocol_with_backend,
+    },
 };
 
 use super::{
@@ -30,6 +36,7 @@ pub(super) fn prove(
     initial: &CommittedMemoryColumns,
     final_memory: &CommittedMemoryColumns,
     full_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<MultisetSumProof, MutableMemoryError> {
     let descriptor = descriptor(full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
@@ -43,20 +50,28 @@ pub(super) fn prove(
     let initial_values = evaluate_columns(initial, &memory_point)?;
     let final_values = evaluate_columns(final_memory, &memory_point)?;
     check_equality(&trace_values, &initial_values, &final_values)?;
-    let trace_opening = prove_witness_opening(trace, &trace_point, &trace_values, &descriptor)?;
-    let initial_opening = prove_opening(
+    let trace_opening = prove_witness_opening_with_backend(
+        trace,
+        &trace_point,
+        &trace_values,
+        &descriptor,
+        backend,
+    )?;
+    let initial_opening = prove_opening_with_backend(
         MEMORY_LAYOUT,
         &initial.inner,
         &memory_point,
         &initial_values,
         &descriptor,
+        backend,
     )?;
-    let final_opening = prove_opening(
+    let final_opening = prove_opening_with_backend(
         MEMORY_LAYOUT,
         &final_memory.inner,
         &memory_point,
         &final_values,
         &descriptor,
+        backend,
     )?;
     Ok(MultisetSumProof {
         trace_values,
@@ -75,33 +90,37 @@ pub(super) fn verify(
     final_memory: &ColumnCommitments,
     full_descriptor: &[u8],
     proof: &MultisetSumProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), MutableMemoryError> {
     let descriptor = descriptor(full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let memory_point = half_point(MEMORY_TABLE_NUM_VARIABLES)?;
-    verify_witness_opening_for_protocol(
+    verify_witness_opening_for_protocol_with_backend(
         protocol,
         trace,
         &trace_point,
         &proof.trace_values,
         &descriptor,
         &proof.trace_opening,
+        backend,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         MEMORY_LAYOUT,
         initial,
         &memory_point,
         &proof.initial_values,
         &descriptor,
         &proof.initial_opening,
+        backend,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         MEMORY_LAYOUT,
         final_memory,
         &memory_point,
         &proof.final_values,
         &descriptor,
         &proof.final_opening,
+        backend,
     )?;
     check_equality(
         &proof.trace_values,

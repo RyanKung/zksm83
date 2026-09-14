@@ -1,12 +1,12 @@
 use akita_pcs::Transcript;
 
 use crate::{
-    NativeField, NativeProtocolVersion, TRACE_ROW_BIT_COUNT, UNIFORM_NUM_VARIABLES,
-    WitnessCommitments,
+    NativeField, NativeProtocolVersion, NativeProverBackend, TRACE_ROW_BIT_COUNT,
+    UNIFORM_NUM_VARIABLES, WitnessCommitments,
     pcs::OpeningProof,
     uniform::{
-        CommittedWitness, prove_witness_selected_opening,
-        verify_witness_selected_opening_for_protocol,
+        CommittedWitness, prove_witness_selected_opening_with_backend,
+        verify_witness_selected_opening_for_protocol_with_backend,
     },
 };
 
@@ -24,12 +24,18 @@ pub(super) fn prove_at(
     trace: &CommittedWitness,
     phase_one: &[u8],
     row_bits_start: usize,
+    backend: &NativeProverBackend,
 ) -> Result<ClockProof, MutableMemoryError> {
     let descriptor = descriptor(phase_one)?;
     let point = point(&descriptor);
     let selected_columns = row_bit_columns(row_bits_start)?;
-    let (values, opening) =
-        prove_witness_selected_opening(trace, &point, &selected_columns, &descriptor)?;
+    let (values, opening) = prove_witness_selected_opening_with_backend(
+        trace,
+        &point,
+        &selected_columns,
+        &descriptor,
+        backend,
+    )?;
     check_row_bits(&values, &point, row_bits_start)?;
     Ok(ClockProof { values, opening })
 }
@@ -40,11 +46,12 @@ pub(super) fn verify_at(
     phase_one: &[u8],
     proof: &ClockProof,
     row_bits_start: usize,
+    backend: &NativeProverBackend,
 ) -> Result<(), MutableMemoryError> {
     let descriptor = descriptor(phase_one)?;
     let point = point(&descriptor);
     let selected_columns = row_bit_columns(row_bits_start)?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace,
         &point,
@@ -52,6 +59,7 @@ pub(super) fn verify_at(
         &selected_columns,
         &descriptor,
         &proof.opening,
+        backend,
     )?;
     check_row_bits(&proof.values, &point, row_bits_start)
 }

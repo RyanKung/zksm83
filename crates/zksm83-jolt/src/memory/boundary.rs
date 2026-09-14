@@ -5,7 +5,10 @@ use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use crate::{
     NativeField, NativeProverBackend,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
-    pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
+    pcs::{
+        ColumnCommitments, CommittedColumns, OpeningProof, prove_opening_with_backend,
+        verify_opening_with_backend,
+    },
     sumcheck::{SumOfProductsSumcheckProof, SumcheckFactor},
 };
 
@@ -85,11 +88,12 @@ pub(super) fn prove(
     if claim != NativeField::from_u64(0) {
         return Err(MutableMemoryError::Unsatisfied);
     }
-    let initial_value = open_columns(&initial.inner, &opening_point, &descriptor)?;
-    let final_value = open_columns(&final_memory.inner, &opening_point, &descriptor)?;
-    let final_timestamp = open_columns(&timestamps.inner, &opening_point, &descriptor)?;
-    let initial_inverse = open_columns(&initial_inverse.inner, &opening_point, &descriptor)?;
-    let final_inverse = open_columns(&final_inverse.inner, &opening_point, &descriptor)?;
+    let initial_value = open_columns(&initial.inner, &opening_point, &descriptor, backend)?;
+    let final_value = open_columns(&final_memory.inner, &opening_point, &descriptor, backend)?;
+    let final_timestamp = open_columns(&timestamps.inner, &opening_point, &descriptor, backend)?;
+    let initial_inverse =
+        open_columns(&initial_inverse.inner, &opening_point, &descriptor, backend)?;
+    let final_inverse = open_columns(&final_inverse.inner, &opening_point, &descriptor, backend)?;
     check_terminal(
         &sumcheck,
         &row_point,
@@ -124,6 +128,7 @@ pub(super) fn verify(
     challenges: MemoryChallenges,
     full_descriptor: &[u8],
     proof: &BoundaryProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), MutableMemoryError> {
     let descriptor = descriptor(full_descriptor)?;
     let mut transcript = relation_transcript(&descriptor, TranscriptSide::Verifier);
@@ -144,30 +149,35 @@ pub(super) fn verify(
         &opening_point,
         &descriptor,
         &proof.initial_value,
+        backend,
     )?;
     verify_columns(
         &final_memory.inner,
         &opening_point,
         &descriptor,
         &proof.final_value,
+        backend,
     )?;
     verify_columns(
         timestamps,
         &opening_point,
         &descriptor,
         &proof.final_timestamp,
+        backend,
     )?;
     verify_columns(
         initial_inverse,
         &opening_point,
         &descriptor,
         &proof.initial_inverse,
+        backend,
     )?;
     verify_columns(
         final_inverse,
         &opening_point,
         &descriptor,
         &proof.final_inverse,
+        backend,
     )?;
     check_terminal(
         &proof.sumcheck,
@@ -370,6 +380,7 @@ fn open_columns(
     columns: &CommittedColumns,
     point: &[NativeField],
     descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<ColumnOpening, MutableMemoryError> {
     let field_columns = columns.field_columns()?;
     let values = field_columns
@@ -377,7 +388,8 @@ fn open_columns(
         .iter()
         .map(|column| super::evaluate_field_column(column, point))
         .collect::<Result<Vec<_>, _>>()?;
-    let proof = prove_opening(MEMORY_LAYOUT, columns, point, &values, descriptor)?;
+    let proof =
+        prove_opening_with_backend(MEMORY_LAYOUT, columns, point, &values, descriptor, backend)?;
     Ok(ColumnOpening { values, proof })
 }
 
@@ -386,14 +398,16 @@ fn verify_columns(
     point: &[NativeField],
     descriptor: &[u8],
     opening: &ColumnOpening,
+    backend: &NativeProverBackend,
 ) -> Result<(), MutableMemoryError> {
-    verify_opening(
+    verify_opening_with_backend(
         MEMORY_LAYOUT,
         commitment,
         point,
         &opening.values,
         descriptor,
         &opening.proof,
+        backend,
     )?;
     Ok(())
 }

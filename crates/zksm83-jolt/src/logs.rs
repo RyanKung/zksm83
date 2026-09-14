@@ -12,9 +12,9 @@ use jolt_field::CanonicalBytes;
 use thiserror::Error;
 
 use crate::{
-    AkitaWorkerError, FieldFoldError, NativeField, NativeProtocolVersion, UniformError,
-    WitnessCommitments,
-    pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
+    AkitaWorkerError, FieldFoldError, NativeField, NativeProtocolVersion, NativeProverBackend,
+    UniformError, WitnessCommitments,
+    pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns_with_backend},
     sumcheck::ProductSumcheckError,
 };
 
@@ -72,10 +72,11 @@ struct LogEntries {
     isa: Vec<[u64; ISA_WIDTH - 1]>,
 }
 
-pub(crate) use packed::verify_packed_protocol_logs_for_protocol;
+pub(crate) use packed::verify_packed_protocol_logs_for_protocol_with_backend;
 pub use packed::{
     PackedProtocolLogClaim, PackedProtocolLogProof, commit_packed_protocol_logs,
-    prove_packed_protocol_logs, verify_packed_protocol_logs,
+    commit_packed_protocol_logs_with_backend, prove_packed_protocol_logs,
+    verify_packed_protocol_logs,
 };
 pub(crate) use packed::{
     prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs_with_backend,
@@ -291,7 +292,10 @@ fn scalar_delta(
         .ok_or(ProtocolLogError::Shape)
 }
 
-fn commit_log_columns(columns: &[Vec<u64>]) -> Result<CommittedLogColumns, ProtocolLogError> {
+fn commit_log_columns(
+    columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<CommittedLogColumns, ProtocolLogError> {
     if columns.is_empty()
         || columns
             .iter()
@@ -301,7 +305,7 @@ fn commit_log_columns(columns: &[Vec<u64>]) -> Result<CommittedLogColumns, Proto
     }
     on_worker(|| {
         Ok(CommittedLogColumns {
-            inner: commit_columns(LOG_LAYOUT, columns)?,
+            inner: commit_columns_with_backend(LOG_LAYOUT, columns, backend)?,
         })
     })
 }

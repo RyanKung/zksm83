@@ -5,7 +5,10 @@ use akita_pcs::{Ring, Transcript};
 use crate::{
     NativeField, NativeProverBackend,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
-    pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
+    pcs::{
+        ColumnCommitments, CommittedColumns, OpeningProof, prove_opening_with_backend,
+        verify_opening_with_backend,
+    },
     sumcheck::{SumOfProductsSumcheckProof, SumcheckFactor},
 };
 
@@ -54,8 +57,8 @@ pub(super) fn prove(
     if claim != NativeField::from_u64(0) {
         return Err(ProtocolLogError::Unsatisfied);
     }
-    let logs = open_columns(logs, &opening_point, &descriptor)?;
-    let inverses = open_columns(&inverses.inner, &opening_point, &descriptor)?;
+    let logs = open_columns(logs, &opening_point, &descriptor, backend)?;
+    let inverses = open_columns(&inverses.inner, &opening_point, &descriptor, backend)?;
     check_terminal(
         &sumcheck,
         &row_point,
@@ -78,6 +81,7 @@ pub(super) fn verify(
     challenges: LogChallenges,
     full_descriptor: &[u8],
     proof: &TableRelationProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), ProtocolLogError> {
     let descriptor = descriptor(full_descriptor)?;
     let mut transcript = transcript(RELATION_DOMAIN, &descriptor);
@@ -93,8 +97,14 @@ pub(super) fn verify(
         FACTOR_COUNT,
         &mut transcript,
     )?;
-    verify_columns(logs, &opening_point, &descriptor, &proof.logs)?;
-    verify_columns(inverses, &opening_point, &descriptor, &proof.inverses)?;
+    verify_columns(logs, &opening_point, &descriptor, &proof.logs, backend)?;
+    verify_columns(
+        inverses,
+        &opening_point,
+        &descriptor,
+        &proof.inverses,
+        backend,
+    )?;
     check_terminal(
         &proof.sumcheck,
         &row_point,
@@ -391,6 +401,7 @@ fn open_columns(
     columns: &CommittedColumns,
     point: &[NativeField],
     descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<ColumnOpening, ProtocolLogError> {
     let field_columns = columns.field_columns()?;
     let values = field_columns
@@ -398,7 +409,8 @@ fn open_columns(
         .iter()
         .map(|column| super::evaluate_field_column(column, point))
         .collect::<Result<Vec<_>, _>>()?;
-    let proof = prove_opening(LOG_LAYOUT, columns, point, &values, descriptor)?;
+    let proof =
+        prove_opening_with_backend(LOG_LAYOUT, columns, point, &values, descriptor, backend)?;
     Ok(ColumnOpening { values, proof })
 }
 
@@ -407,14 +419,16 @@ fn verify_columns(
     point: &[NativeField],
     descriptor: &[u8],
     opening: &ColumnOpening,
+    backend: &NativeProverBackend,
 ) -> Result<(), ProtocolLogError> {
-    verify_opening(
+    verify_opening_with_backend(
         LOG_LAYOUT,
         commitment,
         point,
         &opening.values,
         descriptor,
         &opening.proof,
+        backend,
     )?;
     Ok(())
 }

@@ -15,12 +15,14 @@ use crate::{
     UniformError, UniformRelation, WitnessCommitments,
     block_boundary::{BLOCK_LOCAL_STATE_SCALAR_COUNT, device_state_column, local_state_column},
     block_memory::BLOCK_MEMORY_ROW_BITS_START,
+    commit_witness_with_backend,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::OpeningProof,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
-        prove_uniform_composite_with_backend, prove_witness_opening,
-        verify_uniform_composite_for_protocol, verify_witness_opening_for_protocol,
+        prove_uniform_composite_with_backend, prove_witness_opening_with_backend,
+        verify_uniform_composite_for_protocol_with_backend,
+        verify_witness_opening_for_protocol_with_backend,
     },
 };
 
@@ -185,19 +187,16 @@ pub fn prove_packed_continuity(
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
 ) -> Result<PackedContinuityProof, ContinuityError> {
-    let prepared = prepare_packed_continuity(trace, trace_witness, claim)?;
-    prove_prepared_packed_continuity_with_backend(
-        prepared,
-        trace_witness,
-        claim,
-        &NativeProverBackend::cpu(),
-    )
+    let backend = NativeProverBackend::cpu();
+    let prepared = prepare_packed_continuity(trace, trace_witness, claim, &backend)?;
+    prove_prepared_packed_continuity_with_backend(prepared, trace_witness, claim, &backend)
 }
 
 pub(crate) fn prepare_packed_continuity(
     trace: &BlockCpuWitness,
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
+    backend: &NativeProverBackend,
 ) -> Result<PreparedPackedContinuity, ContinuityError> {
     let protocol = NativeProtocolVersion::current();
     let layout = ContinuityLayout::Packed;
@@ -205,7 +204,7 @@ pub(crate) fn prepare_packed_continuity(
     let phase_one = phase_one_descriptor(protocol, layout, trace_witness.commitments(), claim)?;
     let challenges = challenges(protocol, layout, &phase_one)?;
     let inverse_columns = inverse_columns(trace.columns(), layout, challenges)?;
-    let inverses = crate::commit_witness(&inverse_columns)?;
+    let inverses = commit_witness_with_backend(&inverse_columns, backend)?;
     Ok(PreparedPackedContinuity {
         inverses,
         phase_one,
@@ -234,7 +233,11 @@ pub(crate) fn prove_prepared_packed_continuity_with_backend(
     let relation_proof =
         prove_uniform_composite_with_backend(&relation, trace_witness, &inverses, backend)?;
     let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
-    let sum = on_worker(|| prove_sum(protocol, layout, &inverses, claim, challenges, &full))?;
+    let sum = on_worker(|| {
+        prove_sum(
+            protocol, layout, &inverses, claim, challenges, &full, backend,
+        )
+    })?;
     Ok(PackedContinuityProof {
         inverse_commitments: inverses.into_commitments(),
         relation: relation_proof,
@@ -257,6 +260,22 @@ pub(crate) fn verify_packed_continuity_for_protocol(
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<(), ContinuityError> {
+    verify_packed_continuity_for_protocol_with_backend(
+        protocol,
+        proof,
+        trace,
+        claim,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_packed_continuity_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    proof: &PackedContinuityProof,
+    trace: &WitnessCommitments,
+    claim: &NativeExecutionClaim,
+    backend: &NativeProverBackend,
+) -> Result<(), ContinuityError> {
     verify_for_layout(
         protocol,
         ContinuityLayout::Packed,
@@ -265,6 +284,7 @@ pub(crate) fn verify_packed_continuity_for_protocol(
         &proof.sum,
         trace,
         claim,
+        backend,
     )
 }
 
@@ -276,6 +296,7 @@ fn verify_for_layout(
     sum: &ContinuitySumProof,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
+    backend: &NativeProverBackend,
 ) -> Result<(), ContinuityError> {
     claim.validate()?;
     let phase_one = phase_one_descriptor(protocol, layout, trace, claim)?;
@@ -285,12 +306,13 @@ fn verify_for_layout(
         layout.trace_column_count(),
         layout.trace_columns()?,
     )?;
-    verify_uniform_composite_for_protocol(
+    verify_uniform_composite_for_protocol_with_backend(
         protocol,
         &relation,
         trace,
         inverse_commitments,
         relation_proof,
+        backend,
     )?;
     let full = full_descriptor(protocol, &phase_one, inverse_commitments)?;
     on_worker(|| {
@@ -302,6 +324,7 @@ fn verify_for_layout(
             claim,
             challenges,
             &full,
+            backend,
         )
     })
 }
@@ -562,6 +585,7 @@ fn prove_sum(
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<ContinuitySumProof, ContinuityError> {
     let descriptor = sum_descriptor(protocol, layout, full_descriptor)?;
     let point = half_point()?;
@@ -572,7 +596,8 @@ fn prove_sum(
         .map(|column| evaluate_field_column(column, &point))
         .collect::<Result<Vec<_>, _>>()?;
     check_sum(layout, &values, claim, challenges)?;
-    let opening = prove_witness_opening(inverses, &point, &values, &descriptor)?;
+    let opening =
+        prove_witness_opening_with_backend(inverses, &point, &values, &descriptor, backend)?;
     Ok(ContinuitySumProof { values, opening })
 }
 
@@ -584,16 +609,18 @@ fn verify_sum(
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<(), ContinuityError> {
     let descriptor = sum_descriptor(protocol, layout, full_descriptor)?;
     let point = half_point()?;
-    verify_witness_opening_for_protocol(
+    verify_witness_opening_for_protocol_with_backend(
         protocol,
         inverses,
         &point,
         &proof.values,
         &descriptor,
         &proof.opening,
+        backend,
     )?;
     check_sum(layout, &proof.values, claim, challenges)
 }

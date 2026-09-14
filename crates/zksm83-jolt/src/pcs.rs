@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    NativeField,
+    NativeField, NativeProverBackend,
     metrics::{self, Phase},
 };
 
@@ -359,9 +359,10 @@ impl ColumnCommitments {
     }
 }
 
-pub(crate) fn commit_columns<C>(
+pub(crate) fn commit_columns_with_backend<C>(
     layout: PcsLayout,
     columns: &[C],
+    backend: &NativeProverBackend,
 ) -> Result<CommittedColumns, PcsError>
 where
     C: AsRef<[u64]> + Sync,
@@ -387,6 +388,7 @@ where
         polynomial_groups,
         &mut groups,
         &mut batches,
+        backend,
     )?;
     let commitments = ColumnCommitments {
         num_variables: layout.num_variables,
@@ -409,60 +411,65 @@ fn commit_polynomial_groups(
     polynomial_groups: Vec<Vec<DensePoly<NativeField>>>,
     groups: &mut Vec<CommittedGroup<NativeField>>,
     batches: &mut Vec<ProverBatch>,
+    backend: &NativeProverBackend,
 ) -> Result<(), PcsError> {
-    match layout.opening_mode {
-        PcsOpeningMode::Independent => {
-            for polynomials in polynomial_groups {
-                let output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
-                    &prover.setup,
-                    &polynomials,
-                    stack,
-                    akita_prover::GroupContext::scheduler_without_precommitted_groups(),
-                )?;
-                groups.push(output.committed_group);
-                batches.push(ProverBatch {
-                    hint: output.hint,
-                    polynomials,
-                });
+    backend.run_akita_commitment(|| {
+        match layout.opening_mode {
+            PcsOpeningMode::Independent => {
+                for polynomials in polynomial_groups {
+                    let output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                        &prover.setup,
+                        &polynomials,
+                        stack,
+                        akita_prover::GroupContext::scheduler_without_precommitted_groups(),
+                    )?;
+                    groups.push(output.committed_group);
+                    batches.push(ProverBatch {
+                        hint: output.hint,
+                        polynomials,
+                    });
+                }
+            }
+            PcsOpeningMode::Paired => {
+                let profile = prover
+                    .precommitted_profiles
+                    .first()
+                    .ok_or(PcsError::Shape)?;
+                let mut pending = polynomial_groups.into_iter();
+                while let Some(precommitted) = pending.next() {
+                    let final_group = pending.next().ok_or(PcsError::Shape)?;
+                    let pre = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                        &prover.setup,
+                        &precommitted,
+                        stack,
+                        akita_prover::GroupContext::explicit(profile),
+                    )?;
+                    let precommitteds = PrecommittedGroupProfiles::from_ordered_groups(
+                        std::iter::once(&pre.committed_group),
+                    )?;
+                    let final_output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
+                        &prover.setup,
+                        &final_group,
+                        stack,
+                        akita_prover::GroupContext::scheduler_with_precommitted_groups(
+                            &precommitteds,
+                        ),
+                    )?;
+                    groups.push(pre.committed_group);
+                    groups.push(final_output.committed_group);
+                    batches.push(ProverBatch {
+                        hint: pre.hint,
+                        polynomials: precommitted,
+                    });
+                    batches.push(ProverBatch {
+                        hint: final_output.hint,
+                        polynomials: final_group,
+                    });
+                }
             }
         }
-        PcsOpeningMode::Paired => {
-            let profile = prover
-                .precommitted_profiles
-                .first()
-                .ok_or(PcsError::Shape)?;
-            let mut pending = polynomial_groups.into_iter();
-            while let Some(precommitted) = pending.next() {
-                let final_group = pending.next().ok_or(PcsError::Shape)?;
-                let pre = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
-                    &prover.setup,
-                    &precommitted,
-                    stack,
-                    akita_prover::GroupContext::explicit(profile),
-                )?;
-                let precommitteds = PrecommittedGroupProfiles::from_ordered_groups(
-                    std::iter::once(&pre.committed_group),
-                )?;
-                let final_output = prover.scheme.commit::<DensePoly<NativeField>, CpuBackend>(
-                    &prover.setup,
-                    &final_group,
-                    stack,
-                    akita_prover::GroupContext::scheduler_with_precommitted_groups(&precommitteds),
-                )?;
-                groups.push(pre.committed_group);
-                groups.push(final_output.committed_group);
-                batches.push(ProverBatch {
-                    hint: pre.hint,
-                    polynomials: precommitted,
-                });
-                batches.push(ProverBatch {
-                    hint: final_output.hint,
-                    polynomials: final_group,
-                });
-            }
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn prewarm_root_commit(
@@ -506,12 +513,13 @@ fn root_commit_requirements(schedule: &FoldSchedule) -> Result<NttExecutionRequi
     Ok(requirements)
 }
 
-pub(crate) fn prove_opening(
+pub(crate) fn prove_opening_with_backend(
     layout: PcsLayout,
     columns: &CommittedColumns,
     point: &[NativeField],
     logical_values: &[NativeField],
     instance_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<OpeningProof, PcsError> {
     validate_opening_shape(
         layout,
@@ -523,7 +531,7 @@ pub(crate) fn prove_opening(
     let _phase = metrics::start(Phase::Opening);
     let prover = columns.context.context(layout)?;
     let stack = prover.stack()?;
-    let groups = match layout.opening_mode {
+    let groups = backend.run_akita_opening(|| match layout.opening_mode {
         PcsOpeningMode::Independent => prove_independent_openings(
             layout,
             prover,
@@ -532,7 +540,7 @@ pub(crate) fn prove_opening(
             point,
             logical_values,
             instance_descriptor,
-        )?,
+        ),
         PcsOpeningMode::Paired => prove_paired_openings(
             layout,
             prover,
@@ -541,18 +549,19 @@ pub(crate) fn prove_opening(
             point,
             logical_values,
             instance_descriptor,
-        )?,
-    };
+        ),
+    })?;
     Ok(OpeningProof { groups })
 }
 
-pub(crate) fn prove_selected_opening(
+pub(crate) fn prove_selected_opening_with_backend(
     layout: PcsLayout,
     columns: &CommittedColumns,
     point: &[NativeField],
     logical_values: &[NativeField],
     selected_columns: &[usize],
     instance_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<OpeningProof, PcsError> {
     let opening_indices = selected_opening_indices(layout, &columns.commitments, selected_columns)?;
     validate_selected_opening_shape(
@@ -566,38 +575,41 @@ pub(crate) fn prove_selected_opening(
     let _phase = metrics::start(Phase::Opening);
     let prover = columns.context.context(layout)?;
     let stack = prover.stack()?;
-    let mut groups = Vec::with_capacity(opening_indices.len());
-    for opening_index in opening_indices {
-        let group_start = opening_index
-            .checked_mul(layout.groups_per_opening())
-            .ok_or(PcsError::Shape)?;
-        let group_end = group_start
-            .checked_add(layout.groups_per_opening())
-            .ok_or(PcsError::Shape)?;
-        let commitments = columns
-            .commitments
-            .groups
-            .get(group_start..group_end)
-            .ok_or(PcsError::Shape)?;
-        let batches = columns
-            .batches
-            .get(group_start..group_end)
-            .ok_or(PcsError::Shape)?;
-        let values = (group_start..group_end)
-            .map(|group_index| padded_group_values(layout, logical_values, group_index))
-            .collect::<Result<Vec<_>, _>>()?;
-        groups.push(prove_group_batch(
-            layout,
-            prover,
-            &stack,
-            commitments,
-            batches,
-            point,
-            values,
-            instance_descriptor,
-            opening_index,
-        )?);
-    }
+    let groups = backend.run_akita_opening(|| {
+        let mut groups = Vec::with_capacity(opening_indices.len());
+        for opening_index in opening_indices {
+            let group_start = opening_index
+                .checked_mul(layout.groups_per_opening())
+                .ok_or(PcsError::Shape)?;
+            let group_end = group_start
+                .checked_add(layout.groups_per_opening())
+                .ok_or(PcsError::Shape)?;
+            let commitments = columns
+                .commitments
+                .groups
+                .get(group_start..group_end)
+                .ok_or(PcsError::Shape)?;
+            let batches = columns
+                .batches
+                .get(group_start..group_end)
+                .ok_or(PcsError::Shape)?;
+            let values = (group_start..group_end)
+                .map(|group_index| padded_group_values(layout, logical_values, group_index))
+                .collect::<Result<Vec<_>, _>>()?;
+            groups.push(prove_group_batch(
+                layout,
+                prover,
+                &stack,
+                commitments,
+                batches,
+                point,
+                values,
+                instance_descriptor,
+                opening_index,
+            )?);
+        }
+        Ok::<_, PcsError>(groups)
+    })?;
     Ok(OpeningProof { groups })
 }
 
@@ -735,13 +747,14 @@ fn prove_group_batch(
     })
 }
 
-pub(crate) fn verify_opening(
+pub(crate) fn verify_opening_with_backend(
     layout: PcsLayout,
     commitments: &ColumnCommitments,
     point: &[NativeField],
     logical_values: &[NativeField],
     instance_descriptor: &[u8],
     opening: &OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), PcsError> {
     validate_opening_shape(
         layout,
@@ -762,28 +775,30 @@ pub(crate) fn verify_opening(
             scheme.setup_verifier_for_schedule(&prover_setup, &schedule, &claims_layout)?
         }
     };
-    for (opening_index, (committed_groups, group_opening)) in commitments
-        .groups
-        .chunks(layout.groups_per_opening())
-        .zip(&opening.groups)
-        .enumerate()
-    {
-        verify_group_batch(
-            layout,
-            &scheme,
-            &verifier_setup,
-            committed_groups,
-            point,
-            logical_values,
-            instance_descriptor,
-            opening_index,
-            group_opening,
-        )?;
-    }
-    Ok(())
+    backend.run_akita_opening(|| {
+        for (opening_index, (committed_groups, group_opening)) in commitments
+            .groups
+            .chunks(layout.groups_per_opening())
+            .zip(&opening.groups)
+            .enumerate()
+        {
+            verify_group_batch(
+                layout,
+                &scheme,
+                &verifier_setup,
+                committed_groups,
+                point,
+                logical_values,
+                instance_descriptor,
+                opening_index,
+                group_opening,
+            )?;
+        }
+        Ok(())
+    })
 }
 
-pub(crate) fn verify_selected_opening(
+pub(crate) fn verify_selected_opening_with_backend(
     layout: PcsLayout,
     commitments: &ColumnCommitments,
     point: &[NativeField],
@@ -791,6 +806,7 @@ pub(crate) fn verify_selected_opening(
     selected_columns: &[usize],
     instance_descriptor: &[u8],
     opening: &OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), PcsError> {
     let opening_indices = selected_opening_indices(layout, commitments, selected_columns)?;
     validate_selected_opening_shape(
@@ -813,30 +829,32 @@ pub(crate) fn verify_selected_opening(
             scheme.setup_verifier_for_schedule(&prover_setup, &schedule, &claims_layout)?
         }
     };
-    for (opening_index, group_opening) in opening_indices.into_iter().zip(&opening.groups) {
-        let group_start = opening_index
-            .checked_mul(layout.groups_per_opening())
-            .ok_or(PcsError::Shape)?;
-        let group_end = group_start
-            .checked_add(layout.groups_per_opening())
-            .ok_or(PcsError::Shape)?;
-        let committed_groups = commitments
-            .groups
-            .get(group_start..group_end)
-            .ok_or(PcsError::Shape)?;
-        verify_group_batch(
-            layout,
-            &scheme,
-            &verifier_setup,
-            committed_groups,
-            point,
-            logical_values,
-            instance_descriptor,
-            opening_index,
-            group_opening,
-        )?;
-    }
-    Ok(())
+    backend.run_akita_opening(|| {
+        for (opening_index, group_opening) in opening_indices.into_iter().zip(&opening.groups) {
+            let group_start = opening_index
+                .checked_mul(layout.groups_per_opening())
+                .ok_or(PcsError::Shape)?;
+            let group_end = group_start
+                .checked_add(layout.groups_per_opening())
+                .ok_or(PcsError::Shape)?;
+            let committed_groups = commitments
+                .groups
+                .get(group_start..group_end)
+                .ok_or(PcsError::Shape)?;
+            verify_group_batch(
+                layout,
+                &scheme,
+                &verifier_setup,
+                committed_groups,
+                point,
+                logical_values,
+                instance_descriptor,
+                opening_index,
+                group_opening,
+            )?;
+        }
+        Ok(())
+    })
 }
 
 pub(crate) fn selected_logical_columns(

@@ -20,13 +20,14 @@ use zksm83_core::{
     Mbc3State, VmState,
 };
 use zksm83_jolt::{
-    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BlockCpuError, BlockCpuWitness,
-    CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
-    MAX_NATIVE_STREAM_RECEIPT_BYTES, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
-    NativeProverBackend, NativeProverBackendError, NativeProverBackendKind, NativeReceiptError,
+    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BlockCpuError, CommittedMemory,
+    MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES,
+    MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary, NativeProverBackend,
+    NativeProverBackendError, NativeProverBackendKind, NativeReceiptError,
     NativeReceiptStreamProver, NativeSegmentWitness, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID,
-    ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
-    native_backend_digest, native_proof_phase_metrics, verify_native_spool_reader,
+    ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES, UNIFORM_ROW_COUNT, commit_memory_with_backend,
+    commit_rom_with_backend, native_backend_digest, native_proof_phase_metrics,
+    verify_native_spool_reader_with_backend,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -308,7 +309,8 @@ fn run(args: Args) -> Result<(), CliError> {
     if args.preflight_only {
         return preflight(&expected, &rom_bytes, &input, identities, cartridge);
     }
-    let committed_rom = commit_rom(&rom_bytes)?;
+    let backend = initialize_prover_backend(args.proof_backend, args.cuda_device)?;
+    let committed_rom = commit_rom_with_backend(&rom_bytes, &backend)?;
     if args.inspect_progress_only {
         return inspect_progress(
             &args,
@@ -317,13 +319,13 @@ fn run(args: Args) -> Result<(), CliError> {
             &expected,
             &rom_bytes,
             &input,
+            &backend,
         );
     }
     require_absent(&args.receipt)?;
     if !args.resume {
         require_absent(&args.statement)?;
     }
-    let backend = initialize_prover_backend(args.proof_backend, args.cuda_device)?;
     let (mut builder, mut initial_memory, completed, mut prover) = if args.resume {
         resume(
             &args,
@@ -403,6 +405,7 @@ fn inspect_progress(
     expected: &ExpectedCheckpoint,
     rom_bytes: &[u8],
     input: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<(), CliError> {
     let progress_bytes = read_bounded(
         &args.progress_checkpoint,
@@ -418,8 +421,12 @@ fn inspect_progress(
     }
     let mut spool = File::open(&args.spool)
         .map_err(|source| io_error("open read-only", &args.spool, source))?;
-    let verified =
-        verify_native_spool_reader(&mut spool, progress.spool_bytes, committed_rom.commitment())?;
+    let verified = verify_native_spool_reader_with_backend(
+        &mut spool,
+        progress.spool_bytes,
+        committed_rom.commitment(),
+        backend,
+    )?;
     let spool_sha256 = sha256_reader(&mut spool, progress.spool_bytes, &args.spool)?;
     let view = VerifiedProgress {
         segment_count: verified.segment_count(),
@@ -429,7 +436,7 @@ fn inspect_progress(
         final_boundary: verified.final_boundary(),
         final_memory: verified.final_memory(),
     };
-    let _checkpoint_memory = validate_verified_progress(&progress, view)?;
+    let _checkpoint_memory = validate_verified_progress(&progress, view, backend)?;
     let endpoint_complete = verified.transition_count() == expected.completed_steps;
     if endpoint_complete {
         let memory = hex::decode(&progress.memory_hex)?;
@@ -617,7 +624,7 @@ fn start<'a>(
     require_absent(&args.progress_checkpoint)?;
     let memory = MemoryImage::zeroed()?;
     let memory_bytes = memory.checkpoint_bytes();
-    let initial_memory = commit_memory(&memory_bytes)?;
+    let initial_memory = commit_memory_with_backend(&memory_bytes, &backend)?;
     let builder = TraceBuilder::new_dmg_post_boot_mbc3_profile(
         RomImage::new(rom_bytes.to_vec())?,
         memory,
@@ -676,6 +683,7 @@ fn resume<'a>(
             final_boundary,
             final_memory,
         },
+        prover.backend(),
     )?;
     let memory_bytes = hex::decode(&progress.memory_hex)?;
     let memory = MemoryImage::from_checkpoint_bytes(memory_bytes)?;
@@ -691,6 +699,7 @@ fn resume<'a>(
 fn validate_verified_progress(
     progress: &ProverProgress,
     verified: VerifiedProgress<'_>,
+    backend: &NativeProverBackend,
 ) -> Result<CommittedMemory, CliError> {
     validate_verified_counters(
         progress,
@@ -706,7 +715,7 @@ fn validate_verified_progress(
         ));
     }
     let memory_bytes = hex::decode(&progress.memory_hex)?;
-    let checkpoint_memory = commit_memory(&memory_bytes)?;
+    let checkpoint_memory = commit_memory_with_backend(&memory_bytes, backend)?;
     if verified.final_memory.canonical_bytes()?
         != checkpoint_memory.commitment().canonical_bytes()?
     {
@@ -770,7 +779,7 @@ fn prove_segments(
             blocks,
             completed_steps: segment_steps,
         } = fill_packed_segment(builder, remaining)?;
-        let packed_trace = BlockCpuWitness::from_blocks(&blocks)?;
+        let packed_trace = prover.construct_block_witness(&blocks)?;
         drop(blocks);
         if u64::try_from(packed_trace.transition_count())
             .map_err(|_| CliError::ProgressMismatch("packed transition count overflow"))?
@@ -782,7 +791,7 @@ fn prove_segments(
         }
         let segment_relation_rows = packed_trace.active_block_count();
         let final_bytes = builder.checkpoint_memory();
-        let final_memory = commit_memory(&final_bytes)?;
+        let final_memory = commit_memory_with_backend(&final_bytes, prover.backend())?;
         prover.append(NativeSegmentWitness::new(
             packed_trace,
             initial_memory,

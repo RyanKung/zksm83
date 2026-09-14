@@ -18,7 +18,10 @@ use crate::{
     sumcheck::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
-    uniform::{prove_witness_selected_opening, verify_witness_selected_opening_for_protocol},
+    uniform::{
+        prove_witness_selected_opening_with_backend,
+        verify_witness_selected_opening_for_protocol_with_backend,
+    },
 };
 
 const PACKED_TABLE_NUM_VARIABLES: usize = EXECUTION_LOOKUP_ADDRESS_BIT_COUNT;
@@ -104,12 +107,13 @@ pub(crate) fn prove_execution_lookups_with_backend(
     on_worker(|| prove_execution_lookups_on_worker(witness, backend))
 }
 
-pub(crate) fn verify_execution_lookups_for_protocol(
+pub(crate) fn verify_execution_lookups_for_protocol_with_backend(
     protocol: NativeProtocolVersion,
     trace_commitments: &WitnessCommitments,
     proof: &ExecutionLookupProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), ExecutionLookupProofError> {
-    on_worker(|| verify_execution_lookups_on_worker(protocol, trace_commitments, proof))
+    on_worker(|| verify_execution_lookups_on_worker(protocol, trace_commitments, proof, backend))
 }
 
 fn prove_execution_lookups_on_worker(
@@ -162,8 +166,13 @@ fn prove_execution_lookups_on_worker(
         return Err(ExecutionLookupProofError::AddressBindingMismatch);
     }
     let cycle_columns = selected_output_columns(&layouts)?;
-    let (trace_cycle_values, trace_cycle_opening) =
-        prove_witness_selected_opening(witness, &cycle_point, &cycle_columns, &descriptor)?;
+    let (trace_cycle_values, trace_cycle_opening) = prove_witness_selected_opening_with_backend(
+        witness,
+        &cycle_point,
+        &cycle_columns,
+        &descriptor,
+        backend,
+    )?;
     require_mixed_trace_output(
         &trace_cycle_values,
         &layouts,
@@ -172,7 +181,13 @@ fn prove_execution_lookups_on_worker(
     )?;
     let address_columns = selected_address_columns(&layouts)?;
     let (trace_address_values, trace_address_opening) =
-        prove_witness_selected_opening(witness, &address_point, &address_columns, &descriptor)?;
+        prove_witness_selected_opening_with_backend(
+            witness,
+            &address_point,
+            &address_columns,
+            &descriptor,
+            backend,
+        )?;
     verify_address_terminal(
         &address_sumcheck,
         &layouts,
@@ -197,6 +212,7 @@ fn verify_execution_lookups_on_worker(
     protocol: NativeProtocolVersion,
     trace_commitments: &WitnessCommitments,
     proof: &ExecutionLookupProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), ExecutionLookupProofError> {
     let layouts = canonical_layouts()?;
     validate_layouts(&layouts, trace_commitments.column_count())?;
@@ -226,7 +242,7 @@ fn verify_execution_lookups_on_worker(
         &mut transcript,
     )?;
     let cycle_columns = selected_output_columns(&layouts)?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &cycle_point,
@@ -234,6 +250,7 @@ fn verify_execution_lookups_on_worker(
         &cycle_columns,
         &descriptor,
         &proof.trace_cycle_opening,
+        backend,
     )?;
     require_mixed_trace_output(
         &proof.trace_cycle_values,
@@ -242,7 +259,7 @@ fn verify_execution_lookups_on_worker(
         proof.claimed_output,
     )?;
     let address_columns = selected_address_columns(&layouts)?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &address_point,
@@ -250,6 +267,7 @@ fn verify_execution_lookups_on_worker(
         &address_columns,
         &descriptor,
         &proof.trace_address_opening,
+        backend,
     )?;
     verify_address_terminal(
         &proof.address_sumcheck,
