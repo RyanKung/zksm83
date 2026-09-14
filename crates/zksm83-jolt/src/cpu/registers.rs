@@ -3,11 +3,10 @@
 use akita_pcs::Ring;
 
 use super::{
-    BUS_BEFORE_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, RowView, bit_selector, boolean, bus_field,
-    bus_kind_bits, packed_bits,
+    BUS_BEFORE_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, RowView, boolean, bus_field, packed_bits,
 };
 use crate::{
-    NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, UniformError,
+    NativeField, TRACE_BUS_SLOTS, UniformError,
     trace::device::{
         TRACE_AFTER_DMG_HIGH_BITS_START, TRACE_AFTER_DMG_LOW_BITS_START,
         TRACE_BEFORE_DMA_BITS_START, TRACE_BEFORE_DMG_HIGH_BITS_START,
@@ -398,20 +397,11 @@ fn low_selector(
     slot: usize,
     expected: u8,
 ) -> Result<NativeField, UniformError> {
-    let start = TRACE_BUS_ADDRESS_BITS_START + slot * 16;
-    let one = NativeField::from_u64(1);
-    (0..8).try_fold(one, |selector, bit| {
-        let actual = view.value(start + bit)?;
-        Ok(if (expected >> bit) & 1 == 1 {
-            selector * actual
-        } else {
-            selector * (one - actual)
-        })
-    })
+    view.low_address_selector(slot, expected)
 }
 
 fn bus_kind(view: &RowView<'_>, slot: usize, code: u8) -> Result<NativeField, UniformError> {
-    bit_selector(bus_kind_bits(view, slot)?, code)
+    view.bus_kind_selector(slot, code)
 }
 
 fn or(left: NativeField, right: NativeField) -> NativeField {

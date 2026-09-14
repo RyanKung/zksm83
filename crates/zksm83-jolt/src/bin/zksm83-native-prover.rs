@@ -626,9 +626,12 @@ fn prove_segments(
         let remaining = expected.completed_steps - completed_steps;
         let started = Instant::now();
         let phases_before = native_proof_phase_metrics();
-        let planned = fill_packed_segment(builder, remaining)?;
-        let segment_steps = planned.completed_steps;
-        let packed_trace = BlockCpuWitness::from_blocks(&planned.blocks)?;
+        let PackedSegment {
+            blocks,
+            completed_steps: segment_steps,
+        } = fill_packed_segment(builder, remaining)?;
+        let packed_trace = BlockCpuWitness::from_blocks(&blocks)?;
+        drop(blocks);
         if u64::try_from(packed_trace.transition_count())
             .map_err(|_| CliError::ProgressMismatch("packed transition count overflow"))?
             != segment_steps
@@ -641,7 +644,7 @@ fn prove_segments(
         let final_bytes = builder.checkpoint_memory();
         let final_memory = commit_memory(&final_bytes)?;
         prover.append(NativeSegmentWitness::new(
-            &packed_trace,
+            packed_trace,
             initial_memory,
             &final_memory,
         ))?;

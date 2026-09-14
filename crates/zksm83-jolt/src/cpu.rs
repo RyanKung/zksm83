@@ -221,6 +221,8 @@ pub(super) struct RowView<'a> {
     native: Option<&'a [NativeField]>,
     packed: Option<packed::PackedProjection<'a>>,
     selectors: selectors::IsaSelectorCache,
+    bus_selectors: selectors::BusSelectorCache,
+    low_address_selectors: selectors::LowAddressSelectorCache,
     #[cfg(test)]
     accessed: Option<&'a [Cell<bool>]>,
 }
@@ -231,6 +233,8 @@ impl<'a> RowView<'a> {
             native: Some(row),
             packed: None,
             selectors: selectors::IsaSelectorCache::new(),
+            bus_selectors: selectors::BusSelectorCache::new(),
+            low_address_selectors: selectors::LowAddressSelectorCache::new(),
             #[cfg(test)]
             accessed: None,
         }
@@ -248,6 +252,8 @@ impl<'a> RowView<'a> {
             native: Some(row),
             packed: None,
             selectors: selectors::IsaSelectorCache::new(),
+            bus_selectors: selectors::BusSelectorCache::new(),
+            low_address_selectors: selectors::LowAddressSelectorCache::new(),
             accessed: Some(accessed),
         })
     }
@@ -257,6 +263,8 @@ impl<'a> RowView<'a> {
             native: None,
             packed: Some(packed::PackedProjection::new(row, lane)?),
             selectors: selectors::IsaSelectorCache::new(),
+            bus_selectors: selectors::BusSelectorCache::new(),
+            low_address_selectors: selectors::LowAddressSelectorCache::new(),
             #[cfg(test)]
             accessed: None,
         })
@@ -319,11 +327,11 @@ impl<'a> RowView<'a> {
     }
 
     fn bus_kind_selector(&self, slot: usize, code: u8) -> Result<NativeField, UniformError> {
-        match (self.native, self.packed.as_ref()) {
-            (Some(_), None) => bit_selector(bus_kind_bits(self, slot)?, code),
-            (None, Some(projection)) => projection.bus_kind_selector(slot, code),
-            _ => Err(UniformError::Shape),
-        }
+        self.bus_selectors.select(self, slot, code)
+    }
+
+    fn low_address_selector(&self, slot: usize, expected: u8) -> Result<NativeField, UniformError> {
+        self.low_address_selectors.select(self, slot, expected)
     }
 }
 

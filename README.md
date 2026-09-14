@@ -17,7 +17,7 @@ domain-separated SHA-256; verifier-visible ROM/RAM/log claims remain Akita
 commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
-New statements and receipts use a hard-cut native receipt v2. Its 4,505-column
+New statements and receipts use a hard-cut native receipt v2. Its 4,565-column
 packed CPU plane forms 36 ordered commitment groups opened as 18
 schedule-bound adjacent pairs. High-level encoders and decoders reject v1;
 there is no legacy receipt fallback.

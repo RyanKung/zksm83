@@ -11,7 +11,9 @@ use crate::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
         prove_opening, verify_opening,
     },
-    sumcheck::{MultiProductSumcheckProof, ProductSumcheckError, ProductSumcheckProof},
+    sumcheck::{
+        MultiProductSumcheckProof, ProductSumcheckError, ProductSumcheckProof, SumcheckFactor,
+    },
     uniform::{
         CommittedWitness, WitnessCommitments, prove_witness_opening,
         verify_witness_opening_for_protocol,
@@ -198,7 +200,25 @@ pub fn prove_isa_lookup(
     layout: IsaLookupColumns,
     witness: &CommittedWitness,
 ) -> Result<IsaLookupProof, IsaLookupError> {
-    on_worker(|| prove_isa_lookup_on_worker(layout, witness))
+    on_worker(|| {
+        let table = commit_fixed_table()?;
+        prove_isa_lookup_on_worker(layout, witness, &table)
+    })
+}
+
+pub(crate) fn prove_isa_lookups<const N: usize>(
+    layouts: [IsaLookupColumns; N],
+    witness: &CommittedWitness,
+) -> Result<[IsaLookupProof; N], IsaLookupError> {
+    on_worker(|| {
+        let table = commit_fixed_table()?;
+        layouts
+            .into_iter()
+            .map(|layout| prove_isa_lookup_on_worker(layout, witness, &table))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| IsaLookupError::Shape)
+    })
 }
 
 /// Verifies an ISA lookup without receiving trace addresses or output columns.
@@ -227,9 +247,9 @@ pub(crate) fn verify_isa_lookup_for_protocol(
 fn prove_isa_lookup_on_worker(
     layout: IsaLookupColumns,
     witness: &CommittedWitness,
+    table: &CommittedColumns,
 ) -> Result<IsaLookupProof, IsaLookupError> {
     layout.validate(witness.commitments().column_count())?;
-    let table = commit_fixed_table()?;
     let table_commitments = FixedIsaCommitments {
         inner: table.commitments().clone(),
     };
@@ -273,7 +293,7 @@ fn prove_isa_lookup_on_worker(
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        MultiProductSumcheckProof::prove(&address_factors, &mut transcript)?;
+        MultiProductSumcheckProof::prove(address_factors, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(IsaLookupError::AddressBindingMismatch);
     }
@@ -296,7 +316,7 @@ fn prove_isa_lookup_on_worker(
     )?;
     let table_opening = prove_opening(
         ISA_TABLE_LAYOUT,
-        &table,
+        table,
         &table_point,
         &table_values,
         &descriptor,
@@ -492,18 +512,18 @@ fn read_address_table(
     Ok(read_address)
 }
 
-fn address_binding_factors(
-    cycle_weights: &[NativeField],
-    columns: &[impl AsRef<[NativeField]>],
+fn address_binding_factors<'a>(
+    cycle_weights: &'a [NativeField],
+    columns: &'a [impl AsRef<[NativeField]>],
     address_bits: &[usize; ISA_ADDRESS_BIT_COUNT],
     table_point: &[NativeField],
-) -> Result<Vec<Vec<NativeField>>, IsaLookupError> {
+) -> Result<Vec<SumcheckFactor<'a>>, IsaLookupError> {
     if table_point.len() != ISA_ADDRESS_BIT_COUNT {
         return Err(IsaLookupError::Shape);
     }
     let one = NativeField::from_u64(1);
     let mut factors = Vec::with_capacity(ISA_ADDRESS_BIT_COUNT + 1);
-    factors.push(cycle_weights.to_vec());
+    factors.push(SumcheckFactor::borrowed(cycle_weights));
     for (column_index, point) in address_bits.iter().copied().zip(table_point) {
         let column = columns
             .get(column_index)
@@ -512,12 +532,11 @@ fn address_binding_factors(
         if column.len() != cycle_weights.len() {
             return Err(IsaLookupError::Shape);
         }
-        factors.push(
-            column
-                .iter()
-                .map(|bit| *bit * *point + (one - *bit) * (one - *point))
-                .collect(),
-        );
+        factors.push(SumcheckFactor::affine(
+            column,
+            NativeField::from_u64(2) * *point - one,
+            one - *point,
+        ));
     }
     Ok(factors)
 }
@@ -700,24 +719,7 @@ fn evaluate_mle(
     evaluations: &[NativeField],
     point: &[NativeField],
 ) -> Result<NativeField, IsaLookupError> {
-    let expected_len = 1_usize
-        .checked_shl(u32::try_from(point.len()).map_err(|_| IsaLookupError::Shape)?)
-        .ok_or(IsaLookupError::Shape)?;
-    if evaluations.len() != expected_len {
-        return Err(IsaLookupError::Shape);
-    }
-    let mut folded = evaluations.to_vec();
-    for challenge in point {
-        fold(&mut folded, *challenge)?;
-    }
-    folded.first().copied().ok_or(IsaLookupError::Shape)
-}
-
-fn fold(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), IsaLookupError> {
-    if values.len() <= 1 || !values.len().is_multiple_of(2) {
-        return Err(IsaLookupError::Shape);
-    }
-    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| IsaLookupError::Shape)
+    crate::field_fold::evaluate_mle(evaluations, point).map_err(|_| IsaLookupError::Shape)
 }
 
 fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {

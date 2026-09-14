@@ -2,7 +2,8 @@ use akita_pcs::Ring;
 
 use super::{
     ConstraintOutput, NativeField, UNIFORM_ROW_COUNT, UniformError, UniformRelation,
-    combined_relation_with_scratch, prove_uniform, relation::trim_zero_suffix, sumcheck_round,
+    combined_relation_with_scratch, parallel_sumcheck_round, prove_uniform,
+    relation::trim_zero_suffix, sumcheck_round,
 };
 
 struct BooleanColumn;
@@ -124,6 +125,39 @@ fn sumcheck_round_reuses_relation_scratch() -> Result<(), UniformError> {
     assert_eq!(message, expected);
     assert_eq!(row_scratch.as_ptr(), row_allocation);
     assert_eq!(constraint_scratch.as_ptr(), constraint_allocation);
+    Ok(())
+}
+
+#[test]
+fn parallel_sumcheck_round_matches_sequential_message() -> Result<(), UniformError> {
+    let columns = vec![
+        (0..256)
+            .map(|value| NativeField::from_u64(value % 2))
+            .collect::<Vec<_>>(),
+    ];
+    let weights = (0..256)
+        .map(|value| NativeField::from_u64(value + 1))
+        .collect::<Vec<_>>();
+    let zero = NativeField::from_u64(0);
+    let mut row = vec![zero; 1];
+    let mut constraints = vec![zero; 1];
+    let sequential = sumcheck_round(
+        &BooleanColumn,
+        &columns,
+        &weights,
+        NativeField::from_u64(7),
+        4,
+        &mut row,
+        &mut constraints,
+    )?;
+    let parallel = parallel_sumcheck_round(
+        &BooleanColumn,
+        &columns,
+        &weights,
+        NativeField::from_u64(7),
+        4,
+    )?;
+    assert_eq!(parallel, sequential);
     Ok(())
 }
 

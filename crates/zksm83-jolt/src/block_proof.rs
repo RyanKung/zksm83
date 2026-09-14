@@ -5,18 +5,28 @@ use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlockLaneIndex};
 
 use crate::{
     BlockCpuRelation, BlockCpuWitness, BlockFrontendError, CommittedMemory, CommittedProtocolLogs,
-    CommittedRom, CommittedWitness, ContinuityError, IsaLookupError, IsaLookupProof,
-    MemoryCommitment, MutableMemoryError, NativeExecutionClaim, NativeProtocolVersion,
-    PackedContinuityProof, PackedMutableMemoryProof, PackedProtocolLogClaim,
-    PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError, RomCommitment,
-    RomLookupError, RomLookupProof, UniformError, UniformRelationProof, WitnessCommitments,
-    commit_witness, prove_isa_lookup, prove_packed_continuity, prove_packed_mutable_memory,
-    prove_packed_protocol_logs, prove_rom_lookup, prove_uniform_committed,
+    CommittedRom, ContinuityError, IsaLookupError, IsaLookupProof, MemoryCommitment,
+    MutableMemoryError, NativeExecutionClaim, NativeProtocolVersion, PackedContinuityProof,
+    PackedMutableMemoryProof, PackedProtocolLogClaim, PackedProtocolLogProof,
+    ProtocolLogCommitments, ProtocolLogError, RomCommitment, RomLookupError, RomLookupProof,
+    UniformError, UniformRelationProof, WitnessCommitments, commit_witness, prove_rom_lookup,
+    prove_uniform_committed,
 };
 use crate::{
-    continuity::verify_packed_continuity_for_protocol, isa_lookup::verify_isa_lookup_for_protocol,
-    logs::verify_packed_protocol_logs_for_protocol,
-    memory::verify_packed_mutable_memory_for_protocol, rom_lookup::verify_rom_lookup_for_protocol,
+    continuity::{
+        prepare_packed_continuity, prove_prepared_packed_continuity,
+        verify_packed_continuity_for_protocol,
+    },
+    isa_lookup::{prove_isa_lookups, verify_isa_lookup_for_protocol},
+    logs::{
+        prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs,
+        verify_packed_protocol_logs_for_protocol,
+    },
+    memory::{
+        prepare_packed_mutable_memory, prove_prepared_packed_mutable_memory,
+        verify_packed_mutable_memory_for_protocol,
+    },
+    rom_lookup::verify_rom_lookup_for_protocol,
     uniform::verify_uniform_committed_for_protocol,
 };
 
@@ -98,7 +108,7 @@ impl PackedBlockProof {
 /// validation. Callers that only need bounded relation checking should use
 /// [`crate::validate_uniform_witness`] with [`BlockCpuRelation`].
 pub fn prove_packed_block_components(
-    trace: &BlockCpuWitness,
+    trace: BlockCpuWitness,
     claim: &NativeExecutionClaim,
     log_claim: PackedProtocolLogClaim,
     logs: &CommittedProtocolLogs,
@@ -107,17 +117,29 @@ pub fn prove_packed_block_components(
     final_memory: &CommittedMemory,
 ) -> Result<PackedBlockProof, PackedBlockProofError> {
     let witness = commit_witness(trace.columns())?;
+    let prepared_memory =
+        prepare_packed_mutable_memory(&trace, &witness, initial_memory, final_memory)?;
+    let prepared_continuity = prepare_packed_continuity(&trace, &witness, claim)?;
+    let prepared_logs = prepare_packed_protocol_logs(&trace, &witness, logs, claim, log_claim)?;
+    drop(trace);
+    let memory = prove_prepared_packed_mutable_memory(
+        prepared_memory,
+        &witness,
+        initial_memory,
+        final_memory,
+    )?;
+    let continuity = prove_prepared_packed_continuity(prepared_continuity, &witness, claim)?;
+    let logs =
+        prove_prepared_packed_protocol_logs(prepared_logs, &witness, logs, claim, log_claim)?;
     let relation = prove_uniform_committed(&BlockCpuRelation, &witness)?;
-    let isa_lookups = [
-        prove_lane_lookup(BasicBlockLaneIndex::Lane0, &witness)?,
-        prove_lane_lookup(BasicBlockLaneIndex::Lane1, &witness)?,
-        prove_lane_lookup(BasicBlockLaneIndex::Lane2, &witness)?,
-        prove_lane_lookup(BasicBlockLaneIndex::Lane3, &witness)?,
-    ];
+    let isa_layouts = PACKED_LANES
+        .map(BlockCpuWitness::lane_isa_lookup_columns)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| BlockFrontendError::Shape)?;
+    let isa_lookups = prove_isa_lookups(isa_layouts, &witness)?;
     let rom_lookup = prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?;
-    let memory = prove_packed_mutable_memory(trace, &witness, initial_memory, final_memory)?;
-    let continuity = prove_packed_continuity(trace, &witness, claim)?;
-    let logs = prove_packed_protocol_logs(trace, &witness, logs, claim, log_claim)?;
     Ok(PackedBlockProof {
         commitments: witness.into_commitments(),
         relation,
@@ -201,12 +223,4 @@ pub(crate) fn verify_packed_block_components_for_protocol(
         inputs.log_claim,
     )?;
     Ok(())
-}
-
-fn prove_lane_lookup(
-    lane: BasicBlockLaneIndex,
-    witness: &CommittedWitness,
-) -> Result<IsaLookupProof, PackedBlockProofError> {
-    let layout = BlockCpuWitness::lane_isa_lookup_columns(lane)?;
-    prove_isa_lookup(layout, witness).map_err(Into::into)
 }

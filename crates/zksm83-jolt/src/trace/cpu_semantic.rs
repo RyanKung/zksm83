@@ -1,7 +1,7 @@
 //! Compact single-row helper projection for packed instruction lanes.
 
 use zksm83_core::{StepKind, VmState};
-use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, TraceRow};
+use zksm83_trace::{BASIC_BLOCK_BUS_EVENT_BOUND, BASIC_BLOCK_INSTRUCTION_BOUND, TraceRow};
 
 use super::{
     ArithmeticWitness, NativeTraceError, TRACE_AFTER_CPU_BYTE_BITS_START,
@@ -44,14 +44,23 @@ pub(crate) const CPU_BOUNDARY_AUX_COLUMN_COUNT: usize =
     CPU_BOUNDARY_STATE_BIT_COUNT + CPU_BOUNDARY_MAPPER_BIT_COUNT;
 pub(crate) const CPU_LANE_AUX_COLUMN_COUNT: usize =
     CPU_SEMANTIC_LOCAL_END - TRACE_OPERAND_VALUE - PACKED_CPU_DERIVED_SCALAR_COUNT;
-pub(crate) const PACKED_CPU_AUX_COLUMN_COUNT: usize = CPU_SHARED_BOUNDARY_COUNT
+pub(crate) const PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT: usize = CPU_SHARED_BOUNDARY_COUNT
     * CPU_BOUNDARY_AUX_COLUMN_COUNT
     + BASIC_BLOCK_INSTRUCTION_BOUND * CPU_LANE_AUX_COLUMN_COUNT;
+const PACKED_CPU_BUS_MATCH_COLUMNS_PER_LANE: usize =
+    BASIC_BLOCK_BUS_EVENT_BOUND * (BASIC_BLOCK_BUS_EVENT_BOUND + 1) / 2;
+pub(crate) const PACKED_CPU_BUS_MATCH_COLUMN_COUNT: usize =
+    BASIC_BLOCK_INSTRUCTION_BOUND * PACKED_CPU_BUS_MATCH_COLUMNS_PER_LANE;
+pub(crate) const PACKED_CPU_AUX_COLUMN_COUNT: usize =
+    PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT + PACKED_CPU_BUS_MATCH_COLUMN_COUNT;
 
 const _: () = assert!(CPU_SEMANTIC_AUX_COLUMN_COUNT == 300);
 const _: () = assert!(CPU_BOUNDARY_AUX_COLUMN_COUNT == 106);
 const _: () = assert!(CPU_LANE_AUX_COLUMN_COUNT == 82);
-const _: () = assert!(PACKED_CPU_AUX_COLUMN_COUNT == 858);
+const _: () = assert!(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT == 858);
+const _: () = assert!(PACKED_CPU_BUS_MATCH_COLUMNS_PER_LANE == 15);
+const _: () = assert!(PACKED_CPU_BUS_MATCH_COLUMN_COUNT == 60);
+const _: () = assert!(PACKED_CPU_AUX_COLUMN_COUNT == 918);
 
 /// Reusable single-row encoder for the compact packed-lane CPU helper plane.
 pub(crate) struct CpuSemanticAuxEncoder {
@@ -194,6 +203,27 @@ pub(crate) fn packed_cpu_aux_offset(legacy_column: usize, lane: usize) -> Option
             .and_then(|offset| offset.checked_sub(skipped));
     }
     None
+}
+
+pub(crate) fn packed_cpu_bus_match_offset(
+    lane: usize,
+    local_slot: usize,
+    shared_slot: usize,
+) -> Option<usize> {
+    if lane >= BASIC_BLOCK_INSTRUCTION_BOUND
+        || local_slot >= BASIC_BLOCK_BUS_EVENT_BOUND
+        || shared_slot < local_slot
+        || shared_slot >= BASIC_BLOCK_BUS_EVENT_BOUND
+    {
+        return None;
+    }
+    let preceding = local_slot
+        .checked_mul(BASIC_BLOCK_BUS_EVENT_BOUND)?
+        .checked_sub(local_slot.checked_mul(local_slot.saturating_sub(1))? / 2)?;
+    PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT
+        .checked_add(lane.checked_mul(PACKED_CPU_BUS_MATCH_COLUMNS_PER_LANE)?)
+        .and_then(|offset| offset.checked_add(preceding))
+        .and_then(|offset| offset.checked_add(shared_slot - local_slot))
 }
 
 fn packed_pc_aux_offset(

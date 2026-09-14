@@ -191,18 +191,57 @@ impl Wire for [NativeField; 3] {
 
 impl Wire for [IsaLookupProof; crate::PACKED_BLOCK_ISA_LOOKUP_COUNT] {
     fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
+        let table_commitments = &self.first().ok_or(WireError::Shape)?.table_commitments;
+        table_commitments.encode(writer)?;
         for proof in self {
-            proof.encode(writer)?;
+            if proof.table_commitments != *table_commitments {
+                return Err(WireError::Shape);
+            }
+            encode_isa_lookup_body(proof, writer)?;
         }
         Ok(())
     }
 
     fn decode(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        let table_commitments = FixedIsaCommitments::decode(reader)?;
         let proofs = (0..crate::PACKED_BLOCK_ISA_LOOKUP_COUNT)
-            .map(|_| IsaLookupProof::decode(reader))
+            .map(|_| decode_isa_lookup_body(reader, table_commitments.clone()))
             .collect::<Result<Vec<_>, _>>()?;
         proofs.try_into().map_err(|_| WireError::Shape)
     }
+}
+
+fn encode_isa_lookup_body(
+    proof: &IsaLookupProof,
+    writer: &mut WireWriter,
+) -> Result<(), WireError> {
+    proof.claimed_output.encode(writer)?;
+    proof.table_sumcheck.encode(writer)?;
+    proof.address_sumcheck.encode(writer)?;
+    proof.table_values.encode(writer)?;
+    proof.trace_cycle_values.encode(writer)?;
+    proof.trace_address_values.encode(writer)?;
+    proof.table_opening.encode(writer)?;
+    proof.trace_cycle_opening.encode(writer)?;
+    proof.trace_address_opening.encode(writer)
+}
+
+fn decode_isa_lookup_body(
+    reader: &mut WireReader<'_>,
+    table_commitments: FixedIsaCommitments,
+) -> Result<IsaLookupProof, WireError> {
+    Ok(IsaLookupProof {
+        table_commitments,
+        claimed_output: NativeField::decode(reader)?,
+        table_sumcheck: ProductSumcheckProof::decode(reader)?,
+        address_sumcheck: MultiProductSumcheckProof::decode(reader)?,
+        table_values: Vec::decode(reader)?,
+        trace_cycle_values: Vec::decode(reader)?,
+        trace_address_values: Vec::decode(reader)?,
+        table_opening: OpeningProof::decode(reader)?,
+        trace_cycle_opening: OpeningProof::decode(reader)?,
+        trace_address_opening: OpeningProof::decode(reader)?,
+    })
 }
 
 impl Wire for CommittedGroup<NativeField> {
@@ -315,18 +354,6 @@ wire_struct!(CompositeUniformRelationProof {
     right_opening,
 });
 wire_struct!(FixedIsaCommitments { inner });
-wire_struct!(IsaLookupProof {
-    table_commitments,
-    claimed_output,
-    table_sumcheck,
-    address_sumcheck,
-    table_values,
-    trace_cycle_values,
-    trace_address_values,
-    table_opening,
-    trace_cycle_opening,
-    trace_address_opening,
-});
 wire_struct!(RomCommitment { inner });
 wire_struct!(RomLookupProof {
     claimed_output,

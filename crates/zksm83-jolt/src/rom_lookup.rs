@@ -10,7 +10,9 @@ use crate::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
         prove_opening, verify_opening,
     },
-    sumcheck::{ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof},
+    sumcheck::{
+        ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
+    },
     uniform::{
         CommittedWitness, WitnessCommitments, prove_witness_opening,
         verify_witness_opening_for_protocol,
@@ -216,9 +218,8 @@ pub fn commit_rom(image: &[u8]) -> Result<CommittedRom, RomLookupError> {
             expected: ROM_IMAGE_BYTES,
         });
     }
-    let bytes = image.to_vec();
-    on_worker(move || {
-        let column = bytes.into_iter().map(u64::from).collect::<Vec<_>>();
+    on_worker(|| {
+        let column = image.iter().copied().map(u64::from).collect::<Vec<_>>();
         let inner = commit_columns(ROM_LAYOUT, &[column])?;
         let commitment = RomCommitment {
             inner: inner.commitments().clone(),
@@ -280,7 +281,7 @@ fn prove_on_worker(
     let claimed_output = evaluate_mle(&mixed_trace, &cycle_point)?;
     transcript.append_field(b"rom-claimed-output", &claimed_output);
     let cycle_weights = equality_evaluations(&cycle_point);
-    let read_address = read_address_table(
+    let read_address = read_address_entries(
         trace_columns.as_slice(),
         layout,
         &coefficients,
@@ -290,8 +291,12 @@ fn prove_on_worker(
         .as_slice()
         .first()
         .ok_or(RomLookupError::Shape)?;
-    let (table_sumcheck, actual_claim, table_point) =
-        ProductSumcheckProof::prove(&read_address, table, &mut transcript)?;
+    let (table_sumcheck, actual_claim, table_point) = ProductSumcheckProof::prove_sparse_left(
+        read_address,
+        ROM_IMAGE_BYTES,
+        table,
+        &mut transcript,
+    )?;
     if actual_claim != claimed_output {
         return Err(RomLookupError::OutputClaimMismatch);
     }
@@ -305,7 +310,7 @@ fn prove_on_worker(
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        SumOfProductsSumcheckProof::prove(&terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(terms, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(RomLookupError::AddressBindingMismatch);
     }
@@ -418,13 +423,17 @@ fn verify_on_worker(
     )
 }
 
-fn read_address_table(
+fn read_address_entries(
     columns: &[impl AsRef<[NativeField]>],
     layout: RomLookupColumns,
     coefficients: &[NativeField; TRACE_BUS_SLOTS],
     cycle_weights: &[NativeField],
-) -> Result<Vec<NativeField>, RomLookupError> {
-    let mut reads = vec![NativeField::from_u64(0); ROM_IMAGE_BYTES];
+) -> Result<Vec<(usize, NativeField)>, RomLookupError> {
+    let capacity = cycle_weights
+        .len()
+        .checked_mul(TRACE_BUS_SLOTS)
+        .ok_or(RomLookupError::Shape)?;
+    let mut reads = Vec::with_capacity(capacity);
     for ((selector_index, address_bits), coefficient) in layout
         .selectors
         .iter()
@@ -436,8 +445,9 @@ fn read_address_table(
         let addresses = trace_addresses(columns, address_bits, cycle_weights.len())?;
         for ((selector, address), weight) in selectors.iter().zip(addresses).zip(cycle_weights) {
             require_boolean(*selector)?;
-            let target = reads.get_mut(address).ok_or(RomLookupError::Shape)?;
-            *target += *weight * *coefficient * *selector;
+            if *selector != NativeField::from_u64(0) {
+                reads.push((address, *weight * *coefficient * *selector));
+            }
         }
     }
     Ok(reads)
@@ -461,13 +471,13 @@ fn trace_addresses(
     Ok(addresses)
 }
 
-fn address_binding_terms(
-    columns: &[impl AsRef<[NativeField]>],
+fn address_binding_terms<'a>(
+    columns: &'a [impl AsRef<[NativeField]>],
     layout: RomLookupColumns,
     coefficients: &[NativeField; TRACE_BUS_SLOTS],
-    cycle_weights: &[NativeField],
+    cycle_weights: &'a [NativeField],
     table_point: &[NativeField],
-) -> Result<Vec<Vec<Vec<NativeField>>>, RomLookupError> {
+) -> Result<Vec<Vec<SumcheckFactor<'a>>>, RomLookupError> {
     if table_point.len() != ROM_ADDRESS_BIT_COUNT {
         return Err(RomLookupError::Shape);
     }
@@ -481,15 +491,15 @@ fn address_binding_terms(
         .map(|((selector_index, address_bits), coefficient)| {
             let selector = column(columns, selector_index, cycle_weights.len())?;
             let mut factors = Vec::with_capacity(ROM_LOOKUP_FACTOR_COUNT);
-            factors.push(cycle_weights.to_vec());
-            factors.push(selector.iter().map(|value| *coefficient * *value).collect());
+            factors.push(SumcheckFactor::borrowed(cycle_weights));
+            factors.push(SumcheckFactor::scaled(selector, *coefficient));
             for (index, point) in address_bits.iter().zip(table_point) {
                 let bits = column(columns, *index, cycle_weights.len())?;
-                factors.push(
-                    bits.iter()
-                        .map(|bit| *bit * *point + (one - *bit) * (one - *point))
-                        .collect(),
-                );
+                factors.push(SumcheckFactor::affine(
+                    bits,
+                    NativeField::from_u64(2) * *point - one,
+                    one - *point,
+                ));
             }
             Ok(factors)
         })
@@ -667,23 +677,7 @@ fn evaluate_mle(
     evaluations: &[NativeField],
     point: &[NativeField],
 ) -> Result<NativeField, RomLookupError> {
-    let shift = u32::try_from(point.len()).map_err(|_| RomLookupError::Shape)?;
-    let expected = 1_usize.checked_shl(shift).ok_or(RomLookupError::Shape)?;
-    if evaluations.len() != expected {
-        return Err(RomLookupError::Shape);
-    }
-    let mut folded = evaluations.to_vec();
-    for challenge in point {
-        fold(&mut folded, *challenge)?;
-    }
-    folded.first().copied().ok_or(RomLookupError::Shape)
-}
-
-fn fold(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), RomLookupError> {
-    if values.len() <= 1 || !values.len().is_power_of_two() {
-        return Err(RomLookupError::Shape);
-    }
-    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| RomLookupError::Shape)
+    crate::field_fold::evaluate_mle(evaluations, point).map_err(|_| RomLookupError::Shape)
 }
 
 fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {

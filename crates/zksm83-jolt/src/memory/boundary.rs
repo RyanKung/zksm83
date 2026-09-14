@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
 
 use crate::{
     NativeField,
+    field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
-    sumcheck::SumOfProductsSumcheckProof,
+    sumcheck::{SumOfProductsSumcheckProof, SumcheckFactor},
 };
 
 use super::{
@@ -14,12 +17,12 @@ use super::{
 };
 
 const BOUNDARY_DOMAIN: &[u8] = b"zksm83-native-memory-boundary-inverses/v1";
-const TERM_COUNT: usize = 9;
+const TERM_COUNT: usize = 4;
 const FACTOR_COUNT: usize = 3;
 
 type LimbColumns = Vec<Vec<u64>>;
 type InverseColumns = (LimbColumns, LimbColumns);
-type SumcheckTerms = Vec<Vec<Vec<NativeField>>>;
+type SumcheckTerms<'a> = Vec<Vec<SumcheckFactor<'a>>>;
 
 struct RelationColumns<'a> {
     initial: &'a [NativeField],
@@ -77,7 +80,7 @@ pub(super) fn prove(
         mix,
     )?;
     let (sumcheck, claim, opening_point) =
-        SumOfProductsSumcheckProof::prove(&terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(terms, &mut transcript)?;
     if claim != NativeField::from_u64(0) {
         return Err(MutableMemoryError::Unsatisfied);
     }
@@ -191,37 +194,60 @@ pub(super) fn inverse_columns(
     let final_values = one_column(&final_memory.inner)?;
     let final_timestamps = one_column(&timestamps.inner)?;
     let alpha_squared = challenges.alpha * challenges.alpha;
-    let mut initial_limbs = (0..2)
-        .map(|_| Vec::with_capacity(MEMORY_IMAGE_BYTES))
-        .collect::<Vec<_>>();
-    let mut final_limbs = (0..2)
-        .map(|_| Vec::with_capacity(MEMORY_IMAGE_BYTES))
-        .collect::<Vec<_>>();
-    for address in 0..MEMORY_IMAGE_BYTES {
-        let address_field =
-            NativeField::from_u64(u64::try_from(address).map_err(|_| MutableMemoryError::Shape)?);
-        let initial_token = address_field + challenges.alpha * at(initial_values, address)?;
-        let final_token = address_field
-            + challenges.alpha * at(final_values, address)?
-            + alpha_squared * at(final_timestamps, address)?;
-        push_limbs(
-            &mut initial_limbs,
-            split_field(super::inverse(challenges.beta - initial_token)?)?,
-        )?;
-        push_limbs(
-            &mut final_limbs,
-            split_field(super::inverse(challenges.beta - final_token)?)?,
-        )?;
+    let one = NativeField::from_u64(1);
+    let columns = selected_inverse_columns(
+        MEMORY_IMAGE_BYTES,
+        |address| {
+            let address_field = NativeField::from_u64(
+                u64::try_from(address).map_err(|_| MutableMemoryError::Shape)?,
+            );
+            let initial_token = address_field + challenges.alpha * at(initial_values, address)?;
+            let final_token = address_field
+                + challenges.alpha * at(final_values, address)?
+                + alpha_squared * at(final_timestamps, address)?;
+            Ok::<_, MutableMemoryError>((
+                [
+                    SelectedDenominator::new(one, challenges.beta - initial_token),
+                    SelectedDenominator::new(one, challenges.beta - final_token),
+                ],
+                (),
+            ))
+        },
+        |[initial_inverse, final_inverse], ()| {
+            let [initial_low, initial_high] = split_field(initial_inverse.value())?;
+            let [final_low, final_high] = split_field(final_inverse.value())?;
+            Ok::<_, MutableMemoryError>([initial_low, initial_high, final_low, final_high])
+        },
+        map_batch_error,
+    )?;
+    let mut columns = columns.into_iter();
+    let initial = vec![
+        columns.next().ok_or(MutableMemoryError::Shape)?,
+        columns.next().ok_or(MutableMemoryError::Shape)?,
+    ];
+    let final_memory = vec![
+        columns.next().ok_or(MutableMemoryError::Shape)?,
+        columns.next().ok_or(MutableMemoryError::Shape)?,
+    ];
+    if columns.next().is_some() {
+        return Err(MutableMemoryError::Shape);
     }
-    Ok((initial_limbs, final_limbs))
+    Ok((initial, final_memory))
 }
 
-fn relation_terms(
-    columns: RelationColumns<'_>,
+fn map_batch_error(error: FieldBatchError) -> MutableMemoryError {
+    match error {
+        FieldBatchError::Shape => MutableMemoryError::Shape,
+        FieldBatchError::ZeroDenominator => MutableMemoryError::ZeroDenominator,
+    }
+}
+
+fn relation_terms<'a>(
+    columns: RelationColumns<'a>,
     challenges: MemoryChallenges,
     row_point: &[NativeField],
     mix: NativeField,
-) -> Result<SumcheckTerms, MutableMemoryError> {
+) -> Result<SumcheckTerms<'a>, MutableMemoryError> {
     for column in [
         columns.initial,
         columns.final_memory,
@@ -233,63 +259,52 @@ fn relation_terms(
             return Err(MutableMemoryError::Shape);
         }
     }
-    let weight = equality_evaluations(row_point);
-    let address = (0..MEMORY_IMAGE_BYTES)
-        .map(|value| {
-            u64::try_from(value)
-                .map(NativeField::from_u64)
-                .map_err(|_| MutableMemoryError::Shape)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let one = vec![NativeField::from_u64(1); MEMORY_IMAGE_BYTES];
+    let weight = Arc::from(equality_evaluations(row_point));
+    let one = NativeField::from_u64(1);
     let alpha_squared = challenges.alpha * challenges.alpha;
     Ok(vec![
-        term(&weight, constant(challenges.beta), columns.initial_inverse),
         term(
             &weight,
-            scaled(&address, -NativeField::from_u64(1)),
-            columns.initial_inverse,
+            SumcheckFactor::linear_combination(
+                vec![(columns.initial, -challenges.alpha)],
+                -one,
+                challenges.beta,
+                MEMORY_IMAGE_BYTES,
+            ),
+            SumcheckFactor::borrowed(columns.initial_inverse),
         ),
         term(
             &weight,
-            scaled(columns.initial, -challenges.alpha),
-            columns.initial_inverse,
-        ),
-        term(&weight, constant(-NativeField::from_u64(1)), &one),
-        term(
-            &weight,
-            constant(mix * challenges.beta),
-            columns.final_inverse,
-        ),
-        term(&weight, scaled(&address, -mix), columns.final_inverse),
-        term(
-            &weight,
-            scaled(columns.final_memory, -(mix * challenges.alpha)),
-            columns.final_inverse,
+            SumcheckFactor::constant(-one, MEMORY_IMAGE_BYTES),
+            SumcheckFactor::constant(one, MEMORY_IMAGE_BYTES),
         ),
         term(
             &weight,
-            scaled(columns.timestamps, -(mix * alpha_squared)),
-            columns.final_inverse,
+            SumcheckFactor::linear_combination(
+                vec![
+                    (columns.final_memory, -(mix * challenges.alpha)),
+                    (columns.timestamps, -(mix * alpha_squared)),
+                ],
+                -mix,
+                mix * challenges.beta,
+                MEMORY_IMAGE_BYTES,
+            ),
+            SumcheckFactor::borrowed(columns.final_inverse),
         ),
-        term(&weight, constant(-mix), &one),
+        term(
+            &weight,
+            SumcheckFactor::constant(-mix, MEMORY_IMAGE_BYTES),
+            SumcheckFactor::constant(one, MEMORY_IMAGE_BYTES),
+        ),
     ])
 }
 
-fn term(
-    weight: &[NativeField],
-    middle: Vec<NativeField>,
-    right: &[NativeField],
-) -> Vec<Vec<NativeField>> {
-    vec![weight.to_vec(), middle, right.to_vec()]
-}
-
-fn constant(value: NativeField) -> Vec<NativeField> {
-    vec![value; MEMORY_IMAGE_BYTES]
-}
-
-fn scaled(values: &[NativeField], scale: NativeField) -> Vec<NativeField> {
-    values.iter().map(|value| scale * *value).collect()
+fn term<'a>(
+    weight: &Arc<[NativeField]>,
+    middle: SumcheckFactor<'a>,
+    right: SumcheckFactor<'a>,
+) -> Vec<SumcheckFactor<'a>> {
+    vec![SumcheckFactor::shared(Arc::clone(weight)), middle, right]
 }
 
 fn check_terminal(
@@ -312,18 +327,20 @@ fn check_terminal(
     let one = NativeField::from_u64(1);
     let alpha_squared = challenges.alpha * challenges.alpha;
     let expected = vec![
-        vec![weight, challenges.beta, initial_inverse],
-        vec![weight, -address, initial_inverse],
-        vec![weight, -challenges.alpha * initial, initial_inverse],
-        vec![weight, -one, one],
-        vec![weight, mix * challenges.beta, final_inverse],
-        vec![weight, -mix * address, final_inverse],
         vec![
             weight,
-            -mix * challenges.alpha * final_memory,
+            challenges.beta - address - challenges.alpha * initial,
+            initial_inverse,
+        ],
+        vec![weight, -one, one],
+        vec![
+            weight,
+            mix * (challenges.beta
+                - address
+                - challenges.alpha * final_memory
+                - alpha_squared * timestamp),
             final_inverse,
         ],
-        vec![weight, -mix * alpha_squared * timestamp, final_inverse],
         vec![weight, -mix, one],
     ];
     if proof.final_terms() != expected {
@@ -431,16 +448,6 @@ fn joined_opening(opening: &ColumnOpening) -> Result<NativeField, MutableMemoryE
             .copied()
             .ok_or(MutableMemoryError::Shape)?,
     ))
-}
-
-fn push_limbs(columns: &mut [Vec<u64>], limbs: [u64; 2]) -> Result<(), MutableMemoryError> {
-    for (column, limb) in columns.iter_mut().zip(limbs) {
-        column.push(limb);
-    }
-    if columns.len() != 2 {
-        return Err(MutableMemoryError::Shape);
-    }
-    Ok(())
 }
 
 fn at(values: &[NativeField], index: usize) -> Result<NativeField, MutableMemoryError> {

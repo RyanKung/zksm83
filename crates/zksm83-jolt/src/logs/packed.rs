@@ -9,7 +9,7 @@ use crate::{
     uniform::{CommittedWitness, CompositeUniformRelationProof},
 };
 
-use super::{CommittedProtocolLogs, sum::ProtocolLogSumProof};
+use super::{CommittedLogColumns, CommittedProtocolLogs, sum::ProtocolLogSumProof};
 use super::{
     LOG_KIND_COUNT, LOG_LAYOUT, LogChallenges, ProtocolLogCommitments, ProtocolLogError,
     STATE_BUS_INDEX, STATE_INPUT_INDEX, STATE_ISA_INDEX, STATE_OUTPUT_INDEX, TraceLogLayout,
@@ -38,6 +38,13 @@ pub struct PackedProtocolLogProof {
     pub(crate) trace_relation: CompositeUniformRelationProof,
     pub(crate) table_relation: table_relation::TableRelationProof,
     pub(crate) sum: ProtocolLogSumProof,
+}
+
+pub(crate) struct PreparedPackedProtocolLogs {
+    trace_inverses: CommittedWitness,
+    table_inverses: CommittedLogColumns,
+    phase_one: Vec<u8>,
+    challenges: LogChallenges,
 }
 
 impl PackedProtocolLogClaim {
@@ -182,6 +189,17 @@ pub fn prove_packed_protocol_logs(
     execution: &NativeExecutionClaim,
     claim: PackedProtocolLogClaim,
 ) -> Result<PackedProtocolLogProof, ProtocolLogError> {
+    let prepared = prepare_packed_protocol_logs(trace, trace_witness, logs, execution, claim)?;
+    prove_prepared_packed_protocol_logs(prepared, trace_witness, logs, execution, claim)
+}
+
+pub(crate) fn prepare_packed_protocol_logs(
+    trace: &BlockCpuWitness,
+    trace_witness: &CommittedWitness,
+    logs: &CommittedProtocolLogs,
+    execution: &NativeExecutionClaim,
+    claim: PackedProtocolLogClaim,
+) -> Result<PreparedPackedProtocolLogs, ProtocolLogError> {
     if PackedProtocolLogClaim::from_trace(trace, execution)? != claim {
         return Err(ProtocolLogError::Shape);
     }
@@ -199,6 +217,28 @@ pub fn prove_packed_protocol_logs(
     let trace_inverses = crate::commit_witness(&trace_inverse_values)?;
     let table_inverse_values = table_relation::inverse_columns(&logs.inner, challenges)?;
     let table_inverses = commit_log_columns(&table_inverse_values)?;
+    Ok(PreparedPackedProtocolLogs {
+        trace_inverses,
+        table_inverses,
+        phase_one,
+        challenges,
+    })
+}
+
+pub(crate) fn prove_prepared_packed_protocol_logs(
+    prepared: PreparedPackedProtocolLogs,
+    trace_witness: &CommittedWitness,
+    logs: &CommittedProtocolLogs,
+    execution: &NativeExecutionClaim,
+    claim: PackedProtocolLogClaim,
+) -> Result<PackedProtocolLogProof, ProtocolLogError> {
+    let protocol = NativeProtocolVersion::current();
+    let PreparedPackedProtocolLogs {
+        trace_inverses,
+        table_inverses,
+        phase_one,
+        challenges,
+    } = prepared;
     let trace_relation = packed_trace_relation::prove(trace_witness, &trace_inverses, challenges)?;
     let full = full_descriptor(
         protocol,

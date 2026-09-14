@@ -15,6 +15,7 @@ use crate::{
     block_isa::lane_output_value,
     block_memory::{BLOCK_MEMORY_ROW_BITS_START, memory_row_index_value},
     block_metadata::{lane_column, lane_value},
+    field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
         verify_uniform_composite_for_protocol,
@@ -25,7 +26,7 @@ use super::{
     BUS_START, BUS_WIDTH, INPUT_START, ISA_START, ISA_WIDTH, LOG_COLUMN_COUNT, LogChallenges,
     LogEntries, LogKind, OUTPUT_START, PACKED_TRACE_INVERSE_COLUMN_COUNT,
     PACKED_TRACE_INVERSE_ENTRY_COUNT, PROTOCOL_LOG_ROW_COUNT, ProtocolLogError, append_table,
-    compress, packed_trace, push_inverse, selected_inverse, trace_value,
+    compress, packed_trace, split_field, trace_value,
 };
 
 const PACKED_ISA_LANES: usize = 4;
@@ -239,7 +240,7 @@ impl UniformRelation for PackedTraceLogRelation {
             TRACE_BUS_SLOTS as u64,
             PACKED_ISA_LANES as u64,
             PACKED_TRACE_INVERSE_ENTRY_COUNT as u64,
-            5,
+            6,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -373,34 +374,34 @@ pub(super) fn inverse_columns(
     if trace.columns().len() != BLOCK_CPU_COLUMN_COUNT {
         return Err(ProtocolLogError::Shape);
     }
-    let mut columns = (0..PACKED_TRACE_INVERSE_COLUMN_COUNT)
-        .map(|_| Vec::with_capacity(UNIFORM_ROW_COUNT))
-        .collect::<Vec<_>>();
-    for row in 0..UNIFORM_ROW_COUNT {
-        append_row_inverses(trace, row, challenges, &mut columns)?;
-    }
-    Ok(columns)
+    selected_inverse_columns(
+        UNIFORM_ROW_COUNT,
+        |row| Ok((inverse_row(trace, row, challenges)?, ())),
+        |inverses, ()| inverse_limb_row(inverses),
+        map_batch_error,
+    )
 }
 
-fn append_row_inverses(
+fn inverse_row(
     trace: &BlockCpuWitness,
     row: usize,
     challenges: LogChallenges,
-    columns: &mut [Vec<u64>],
-) -> Result<(), ProtocolLogError> {
+) -> Result<[SelectedDenominator; PACKED_TRACE_INVERSE_ENTRY_COUNT], ProtocolLogError> {
     let row_index = packed_trace(
         trace.columns(),
         BLOCK_MEMORY_ROW_BITS_START,
         crate::UNIFORM_NUM_VARIABLES,
         row,
     )?;
+    let zero = NativeField::from_u64(0);
+    let mut entries = [SelectedDenominator::new(zero, zero); PACKED_TRACE_INVERSE_ENTRY_COUNT];
     for slot in 0..TRACE_BUS_SLOTS {
-        append_bus_inverses(trace, row, row_index, slot, challenges, columns)?;
+        append_bus_inverses(trace, row, row_index, slot, challenges, &mut entries)?;
     }
     for lane in 0..PACKED_ISA_LANES {
-        append_isa_inverse(trace, row, row_index, lane, challenges, columns)?;
+        append_isa_inverse(trace, row, row_index, lane, challenges, &mut entries)?;
     }
-    Ok(())
+    Ok(entries)
 }
 
 fn append_bus_inverses(
@@ -409,7 +410,7 @@ fn append_bus_inverses(
     row_index: u64,
     slot: usize,
     challenges: LogChallenges,
-    columns: &mut [Vec<u64>],
+    entries: &mut [SelectedDenominator],
 ) -> Result<(), ProtocolLogError> {
     let active = packed_bus_value(trace, slot_active_column(slot)?, row)?;
     let kind = packed_bus_kind(trace, slot, row)?;
@@ -418,7 +419,7 @@ fn append_bus_inverses(
         .and_then(|value| value.checked_add(u64::try_from(slot).ok()?))
         .ok_or(ProtocolLogError::Shape)?;
     let bus_token = compress_trace_bus(trace, slot, row, position, kind, challenges)?;
-    push_selected(columns, slot, active, bus_token, LogKind::Bus, challenges)?;
+    push_selected(entries, slot, active, bus_token, LogKind::Bus, challenges)?;
     let input = u64::from(kind == 6 || kind == 13);
     let input_offset = if kind == 13 {
         slot_auxiliary_column(slot)?
@@ -428,7 +429,7 @@ fn append_bus_inverses(
     let input_token =
         compress_trace_byte(trace, slot, row, input_offset, LogKind::Input, challenges)?;
     push_selected(
-        columns,
+        entries,
         TRACE_BUS_SLOTS + slot,
         input,
         input_token,
@@ -444,7 +445,7 @@ fn append_bus_inverses(
         challenges,
     )?;
     push_selected(
-        columns,
+        entries,
         TRACE_BUS_SLOTS * 2 + slot,
         u64::from(kind == 7),
         output_token,
@@ -459,7 +460,7 @@ fn append_isa_inverse(
     row_index: u64,
     lane: usize,
     challenges: LogChallenges,
-    columns: &mut [Vec<u64>],
+    entries: &mut [SelectedDenominator],
 ) -> Result<(), ProtocolLogError> {
     let position = row_index
         .checked_mul(PACKED_ISA_LANES as u64)
@@ -489,7 +490,7 @@ fn append_isa_inverse(
     );
     let active_column = lane_column(lane).ok_or(ProtocolLogError::Shape)?;
     push_selected(
-        columns,
+        entries,
         TRACE_BUS_SLOTS * 3 + lane,
         trace_value(trace.columns(), active_column, row)?,
         token,
@@ -561,15 +562,38 @@ fn packed_bus_value(
 }
 
 fn push_selected(
-    columns: &mut [Vec<u64>],
+    entries: &mut [SelectedDenominator],
     entry: usize,
     selector: u64,
     token: NativeField,
     kind: LogKind,
     challenges: LogChallenges,
 ) -> Result<(), ProtocolLogError> {
-    let inverse = selected_inverse(selector, token, challenges.point(kind))?;
-    push_inverse(columns, entry * 2, inverse)
+    *entries.get_mut(entry).ok_or(ProtocolLogError::Shape)? = SelectedDenominator::new(
+        NativeField::from_u64(selector),
+        challenges.point(kind) - token,
+    );
+    Ok(())
+}
+
+fn inverse_limb_row(
+    inverses: [SelectedDenominator; PACKED_TRACE_INVERSE_ENTRY_COUNT],
+) -> Result<[u64; PACKED_TRACE_INVERSE_COLUMN_COUNT], ProtocolLogError> {
+    let mut limbs = [0_u64; PACKED_TRACE_INVERSE_COLUMN_COUNT];
+    for (entry, inverse) in inverses.into_iter().enumerate() {
+        let [low, high] = split_field(inverse.value())?;
+        let offset = entry.checked_mul(2).ok_or(ProtocolLogError::Shape)?;
+        *limbs.get_mut(offset).ok_or(ProtocolLogError::Shape)? = low;
+        *limbs.get_mut(offset + 1).ok_or(ProtocolLogError::Shape)? = high;
+    }
+    Ok(limbs)
+}
+
+fn map_batch_error(error: FieldBatchError) -> ProtocolLogError {
+    match error {
+        FieldBatchError::Shape => ProtocolLogError::Shape,
+        FieldBatchError::ZeroDenominator => ProtocolLogError::ZeroDenominator,
+    }
 }
 
 fn bus_values(

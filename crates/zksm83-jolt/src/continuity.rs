@@ -15,6 +15,7 @@ use crate::{
     WitnessCommitments,
     block_boundary::{BLOCK_LOCAL_STATE_SCALAR_COUNT, device_state_column, local_state_column},
     block_memory::BLOCK_MEMORY_ROW_BITS_START,
+    field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::OpeningProof,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
@@ -44,6 +45,12 @@ pub struct PackedContinuityProof {
     pub(crate) inverse_commitments: WitnessCommitments,
     pub(crate) relation: CompositeUniformRelationProof,
     pub(crate) sum: ContinuitySumProof,
+}
+
+pub(crate) struct PreparedPackedContinuity {
+    inverses: CommittedWitness,
+    phase_one: Vec<u8>,
+    challenges: ContinuityChallenges,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +185,15 @@ pub fn prove_packed_continuity(
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
 ) -> Result<PackedContinuityProof, ContinuityError> {
+    let prepared = prepare_packed_continuity(trace, trace_witness, claim)?;
+    prove_prepared_packed_continuity(prepared, trace_witness, claim)
+}
+
+pub(crate) fn prepare_packed_continuity(
+    trace: &BlockCpuWitness,
+    trace_witness: &CommittedWitness,
+    claim: &NativeExecutionClaim,
+) -> Result<PreparedPackedContinuity, ContinuityError> {
     let protocol = NativeProtocolVersion::current();
     let layout = ContinuityLayout::Packed;
     claim.validate()?;
@@ -185,6 +201,25 @@ pub fn prove_packed_continuity(
     let challenges = challenges(protocol, layout, &phase_one)?;
     let inverse_columns = inverse_columns(trace.columns(), layout, challenges)?;
     let inverses = crate::commit_witness(&inverse_columns)?;
+    Ok(PreparedPackedContinuity {
+        inverses,
+        phase_one,
+        challenges,
+    })
+}
+
+pub(crate) fn prove_prepared_packed_continuity(
+    prepared: PreparedPackedContinuity,
+    trace_witness: &CommittedWitness,
+    claim: &NativeExecutionClaim,
+) -> Result<PackedContinuityProof, ContinuityError> {
+    let protocol = NativeProtocolVersion::current();
+    let layout = ContinuityLayout::Packed;
+    let PreparedPackedContinuity {
+        inverses,
+        phase_one,
+        challenges,
+    } = prepared;
     let relation = ContinuityRelation::new(layout, challenges);
     let relation_proof = prove_uniform_composite(&relation, trace_witness, &inverses)?;
     let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
@@ -331,7 +366,7 @@ impl UniformRelation for ContinuityRelation {
         bytes.extend_from_slice(&(STATE_SCALAR_COUNT as u64).to_le_bytes());
         bytes.extend_from_slice(&(TRACE_ROW_BIT_COUNT as u64).to_le_bytes());
         bytes.extend_from_slice(&(PACKED_INVERSE_COLUMN_COUNT as u64).to_le_bytes());
-        bytes.extend_from_slice(&6_u64.to_le_bytes());
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
         bytes
     }
 
@@ -402,79 +437,72 @@ fn inverse_columns(
     if trace.len() != layout.trace_column_count() {
         return Err(ContinuityError::Shape);
     }
-    let mut columns = (0..layout.inverse_column_count())
-        .map(|_| Vec::with_capacity(UNIFORM_ROW_COUNT))
-        .collect::<Vec<_>>();
     let powers = state_mix_powers(challenges.state_mix);
-    for row in 0..UNIFORM_ROW_COUNT {
-        let active = trace_value(trace, layout.active_column(), row)?;
-        let row_tag =
-            NativeField::from_u64(u64::try_from(row).map_err(|_| ContinuityError::Shape)?);
-        let after = state_token_from_layout_trace(
-            trace,
-            layout,
-            true,
-            row,
-            row_tag + NativeField::from_u64(1),
-            &powers,
-        )?;
-        let before = state_token_from_layout_trace(trace, layout, false, row, row_tag, &powers)?;
-        push_inverse(
-            &mut columns,
-            0,
-            selected_inverse(active, after, challenges)?,
-        )?;
-        push_inverse(
-            &mut columns,
-            2,
-            selected_inverse(active, before, challenges)?,
-        )?;
-        let instruction = trace_value(trace, crate::block_metadata::INSTRUCTION_BLOCK, row)?;
-        let lane_count = (0..BASIC_BLOCK_INSTRUCTION_BOUND).try_fold(0_u64, |count, lane| {
-            let column = crate::block_metadata::lane_column(lane).ok_or(ContinuityError::Shape)?;
-            count
-                .checked_add(trace_value(trace, column, row)?)
-                .ok_or(ContinuityError::Shape)
-        })?;
-        let transition = active
-            .checked_sub(instruction)
-            .and_then(|count| count.checked_add(lane_count))
-            .ok_or(ContinuityError::Shape)?;
-        columns
-            .get_mut(4)
-            .ok_or(ContinuityError::Shape)?
-            .push(transition);
+    if layout.inverse_column_count() != PACKED_INVERSE_COLUMN_COUNT {
+        return Err(ContinuityError::Shape);
     }
-    Ok(columns)
+    selected_inverse_columns(
+        UNIFORM_ROW_COUNT,
+        |row| continuity_inverse_row(trace, layout, challenges, &powers, row),
+        continuity_limb_row,
+        map_batch_error,
+    )
 }
 
-fn selected_inverse(
-    selector: u64,
-    token: NativeField,
+fn continuity_inverse_row(
+    trace: &[Vec<u64>],
+    layout: ContinuityLayout,
     challenges: ContinuityChallenges,
-) -> Result<NativeField, ContinuityError> {
-    if selector == 0 {
-        return Ok(NativeField::from_u64(0));
-    }
-    let selector = NativeField::from_u64(selector);
-    Ok(selector * inverse(challenges.inverse_point - token)?)
+    powers: &[NativeField; STATE_SCALAR_COUNT],
+    row: usize,
+) -> Result<([SelectedDenominator; 2], u64), ContinuityError> {
+    let active = trace_value(trace, layout.active_column(), row)?;
+    let row_tag = NativeField::from_u64(u64::try_from(row).map_err(|_| ContinuityError::Shape)?);
+    let after = state_token_from_layout_trace(
+        trace,
+        layout,
+        true,
+        row,
+        row_tag + NativeField::from_u64(1),
+        powers,
+    )?;
+    let before = state_token_from_layout_trace(trace, layout, false, row, row_tag, powers)?;
+    let instruction = trace_value(trace, crate::block_metadata::INSTRUCTION_BLOCK, row)?;
+    let lane_count = (0..BASIC_BLOCK_INSTRUCTION_BOUND).try_fold(0_u64, |count, lane| {
+        let column = crate::block_metadata::lane_column(lane).ok_or(ContinuityError::Shape)?;
+        count
+            .checked_add(trace_value(trace, column, row)?)
+            .ok_or(ContinuityError::Shape)
+    })?;
+    let transition = active
+        .checked_sub(instruction)
+        .and_then(|count| count.checked_add(lane_count))
+        .ok_or(ContinuityError::Shape)?;
+    let scale = NativeField::from_u64(active);
+    Ok((
+        [
+            SelectedDenominator::new(scale, challenges.inverse_point - after),
+            SelectedDenominator::new(scale, challenges.inverse_point - before),
+        ],
+        transition,
+    ))
 }
 
-fn push_inverse(
-    columns: &mut [Vec<u64>],
-    offset: usize,
-    inverse: NativeField,
-) -> Result<(), ContinuityError> {
-    let [low, high] = split_field(inverse)?;
-    columns
-        .get_mut(offset)
-        .ok_or(ContinuityError::Shape)?
-        .push(low);
-    columns
-        .get_mut(offset + 1)
-        .ok_or(ContinuityError::Shape)?
-        .push(high);
-    Ok(())
+fn continuity_limb_row(
+    inverses: [SelectedDenominator; 2],
+    transition: u64,
+) -> Result<[u64; PACKED_INVERSE_COLUMN_COUNT], ContinuityError> {
+    let [after, before] = inverses;
+    let [after_low, after_high] = split_field(after.value())?;
+    let [before_low, before_high] = split_field(before.value())?;
+    Ok([after_low, after_high, before_low, before_high, transition])
+}
+
+fn map_batch_error(error: FieldBatchError) -> ContinuityError {
+    match error {
+        FieldBatchError::Shape => ContinuityError::Shape,
+        FieldBatchError::ZeroDenominator => ContinuityError::ZeroDenominator,
+    }
 }
 
 fn prove_sum(
@@ -683,15 +711,7 @@ fn evaluate_field_column(
     values: &[NativeField],
     point: &[NativeField],
 ) -> Result<NativeField, ContinuityError> {
-    if values.len() != 1_usize << point.len() {
-        return Err(ContinuityError::Shape);
-    }
-    let mut folded = values.to_vec();
-    for coordinate in point {
-        crate::field_fold::fold_binary_layer(&mut folded, *coordinate)
-            .map_err(|_| ContinuityError::Shape)?;
-    }
-    folded.first().copied().ok_or(ContinuityError::Shape)
+    crate::field_fold::evaluate_mle(values, point).map_err(|_| ContinuityError::Shape)
 }
 
 fn trace_value(trace: &[Vec<u64>], column: usize, row: usize) -> Result<u64, ContinuityError> {

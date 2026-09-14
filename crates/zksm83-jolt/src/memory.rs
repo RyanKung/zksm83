@@ -8,7 +8,7 @@ pub(crate) mod sum;
 mod tests;
 
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
-use jolt_field::{CanonicalBytes, Field};
+use jolt_field::CanonicalBytes;
 use thiserror::Error;
 
 use crate::{
@@ -71,6 +71,15 @@ pub struct PackedMutableMemoryProof {
     pub(crate) clock: clock::ClockProof,
     pub(crate) boundary: boundary::BoundaryProof,
     pub(crate) multiset_sum: sum::MultisetSumProof,
+}
+
+pub(crate) struct PreparedPackedMutableMemory {
+    final_timestamps: CommittedMemoryColumns,
+    trace_inverses: CommittedWitness,
+    initial_inverses: CommittedMemoryColumns,
+    final_inverses: CommittedMemoryColumns,
+    phase_one: Vec<u8>,
+    challenges: MemoryChallenges,
 }
 
 /// Invalid mutable-memory image, ordered trace, proof, or backend operation.
@@ -182,6 +191,16 @@ pub fn prove_packed_mutable_memory(
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
 ) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
+    let prepared = prepare_packed_mutable_memory(trace, trace_witness, initial, final_memory)?;
+    prove_prepared_packed_mutable_memory(prepared, trace_witness, initial, final_memory)
+}
+
+pub(crate) fn prepare_packed_mutable_memory(
+    trace: &BlockCpuWitness,
+    trace_witness: &CommittedWitness,
+    initial: &CommittedMemory,
+    final_memory: &CommittedMemory,
+) -> Result<PreparedPackedMutableMemory, MutableMemoryError> {
     let protocol = NativeProtocolVersion::current();
     if trace.columns().len() != BLOCK_CPU_COLUMN_COUNT {
         return Err(MutableMemoryError::Shape);
@@ -203,6 +222,31 @@ pub fn prove_packed_mutable_memory(
         boundary::inverse_columns(initial, final_memory, &final_timestamps, challenges)?;
     let initial_inverses = commit_u64_columns(&initial_inverse_values)?;
     let final_inverses = commit_u64_columns(&final_inverse_values)?;
+    Ok(PreparedPackedMutableMemory {
+        final_timestamps,
+        trace_inverses,
+        initial_inverses,
+        final_inverses,
+        phase_one,
+        challenges,
+    })
+}
+
+pub(crate) fn prove_prepared_packed_mutable_memory(
+    prepared: PreparedPackedMutableMemory,
+    trace_witness: &CommittedWitness,
+    initial: &CommittedMemory,
+    final_memory: &CommittedMemory,
+) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
+    let protocol = NativeProtocolVersion::current();
+    let PreparedPackedMutableMemory {
+        final_timestamps,
+        trace_inverses,
+        initial_inverses,
+        final_inverses,
+        phase_one,
+        challenges,
+    } = prepared;
     let relation = block_event::BlockMemoryEventRelation::new(challenges);
     let event_relation = prove_uniform_composite(&relation, trace_witness, &trace_inverses)?;
     let clock = clock::prove_at(trace_witness, &phase_one, BLOCK_MEMORY_ROW_BITS_START)?;
@@ -402,10 +446,6 @@ fn challenges(descriptor: &[u8]) -> Result<MemoryChallenges, MutableMemoryError>
     Ok(MemoryChallenges { alpha, beta })
 }
 
-fn inverse(value: NativeField) -> Result<NativeField, MutableMemoryError> {
-    value.inverse().ok_or(MutableMemoryError::ZeroDenominator)
-}
-
 fn split_field(value: NativeField) -> Result<[u64; 2], MutableMemoryError> {
     let bytes = value.to_bytes_le_vec();
     let low = <[u8; 8]>::try_from(bytes.get(..8).ok_or(MutableMemoryError::Shape)?)
@@ -466,15 +506,7 @@ fn evaluate_field_column(
     values: &[NativeField],
     point: &[NativeField],
 ) -> Result<NativeField, MutableMemoryError> {
-    if values.len() != 1_usize << point.len() {
-        return Err(MutableMemoryError::Shape);
-    }
-    let mut values = values.to_vec();
-    for coordinate in point {
-        crate::field_fold::fold_binary_layer(&mut values, *coordinate)
-            .map_err(|_| MutableMemoryError::Shape)?;
-    }
-    values.first().copied().ok_or(MutableMemoryError::Shape)
+    crate::field_fold::evaluate_mle(values, point).map_err(|_| MutableMemoryError::Shape)
 }
 
 fn push_bytes(target: &mut Vec<u8>, value: &[u8]) -> Result<(), MutableMemoryError> {

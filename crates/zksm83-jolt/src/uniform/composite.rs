@@ -45,8 +45,14 @@ fn prove_on_worker(
     validate_shapes(protocol, relation, left.commitments(), right.commitments())?;
     let left_columns = left.field_columns()?;
     let right_columns = right.field_columns()?;
-    let mut columns = left_columns.into_owned_columns();
-    columns.extend(right_columns.into_owned_columns());
+    let column_count = left_columns
+        .as_slice()
+        .len()
+        .checked_add(right_columns.as_slice().len())
+        .ok_or(UniformError::Shape)?;
+    let mut columns = Vec::with_capacity(column_count);
+    columns.extend_from_slice(left_columns.as_slice());
+    columns.extend_from_slice(right_columns.as_slice());
     ensure_relation_holds(relation, &columns, UNIFORM_ROW_COUNT)?;
     let descriptor = descriptor(protocol, relation, left.commitments(), right.commitments())?;
     let mut transcript = outer_transcript(protocol, &descriptor, super::TranscriptSide::Prover);
@@ -57,7 +63,7 @@ fn prove_on_worker(
     }
     let weights = super::equality_evaluations(&row_point);
     let (rounds, opening_point, opened_values) =
-        prove_sumcheck(relation, columns, weights, constraint_mix, &mut transcript)?;
+        prove_sumcheck(relation, &columns, weights, constraint_mix, &mut transcript)?;
     let split = left.commitments().column_count();
     let left_values = opened_values
         .get(..split)

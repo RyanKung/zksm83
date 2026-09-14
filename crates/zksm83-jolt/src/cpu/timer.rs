@@ -5,11 +5,11 @@ use akita_pcs::Ring;
 use super::{
     BUS_VALUE_OFFSET, ConstraintSink, HALT_IDLE_MODE, HALT_UNTIL_SERIAL_MODE,
     HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, INSTRUCTION_MODE, INTERRUPT_MODE, RowView,
-    bit_selector, boolean, bus_field, bus_kind_bits, packed_bits, zero_from_bits,
+    boolean, bus_field, packed_bits, zero_from_bits,
 };
 use crate::{
-    NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START,
-    TRACE_CYCLE_INCREMENT, TRACE_INTERRUPT_START, UniformError,
+    NativeField, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START, TRACE_CYCLE_INCREMENT,
+    TRACE_INTERRUPT_START, UniformError,
     trace::device::{
         TRACE_AFTER_DMG_LOW_BITS_START, TRACE_AFTER_INTERRUPT_REQUEST_BITS_START,
         TRACE_BEFORE_DMG_LOW_BITS_START, TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START,
@@ -441,12 +441,7 @@ fn low_selector(
     slot: usize,
     expected: u8,
 ) -> Result<NativeField, UniformError> {
-    fixed_selector(
-        view,
-        TRACE_BUS_ADDRESS_BITS_START + slot * 16,
-        8,
-        expected.into(),
-    )
+    view.low_address_selector(slot, expected)
 }
 
 fn fixed_selector(
@@ -467,5 +462,5 @@ fn fixed_selector(
 }
 
 fn bus_kind(view: &RowView<'_>, slot: usize, code: u8) -> Result<NativeField, UniformError> {
-    bit_selector(bus_kind_bits(view, slot)?, code)
+    view.bus_kind_selector(slot, code)
 }

@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use akita_pcs::{Ring, Transcript};
 
 use crate::{
     NativeField,
+    field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
-    sumcheck::SumOfProductsSumcheckProof,
+    sumcheck::{SumOfProductsSumcheckProof, SumcheckFactor},
 };
 
 use super::{
@@ -11,11 +14,11 @@ use super::{
     LOG_COLUMN_COUNT, LOG_KIND_COUNT, LOG_LAYOUT, LogChallenges, LogKind, OUTPUT_START,
     PROTOCOL_LOG_NUM_VARIABLES, PROTOCOL_LOG_ROW_COUNT, ProtocolLogError,
     TABLE_INVERSE_COLUMN_COUNT, equality_evaluation, equality_evaluations, field_column,
-    join_limbs, push_bytes, push_inverse, transcript,
+    join_limbs, push_bytes, split_field, transcript,
 };
 
 const RELATION_DOMAIN: &[u8] = b"zksm83-native-protocol-log-table-relation/v1";
-const TERM_COUNT: usize = 61;
+const TERM_COUNT: usize = 27;
 const FACTOR_COUNT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,7 +49,7 @@ pub(super) fn prove(
     }
     let terms = relation_terms(logs, &inverses.inner, challenges, &row_point, mix)?;
     let (sumcheck, claim, opening_point) =
-        SumOfProductsSumcheckProof::prove(&terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(terms, &mut transcript)?;
     if claim != NativeField::from_u64(0) {
         return Err(ProtocolLogError::Unsatisfied);
     }
@@ -109,58 +112,82 @@ pub(super) fn inverse_columns(
     if logs.commitments().column_count() != LOG_COLUMN_COUNT {
         return Err(ProtocolLogError::Shape);
     }
-    let mut columns = (0..TABLE_INVERSE_COLUMN_COUNT)
-        .map(|_| Vec::with_capacity(PROTOCOL_LOG_ROW_COUNT))
-        .collect::<Vec<_>>();
-    for row in 0..PROTOCOL_LOG_ROW_COUNT {
-        for (kind, start, width) in layouts() {
-            let selector = field_value(logs, start, row)?;
-            let token = compress_table(logs, start, width, row, challenges.mix(kind))?;
-            let selected = if selector == NativeField::from_u64(0) {
-                NativeField::from_u64(0)
-            } else {
-                selector * super::inverse(challenges.point(kind) - token)?
-            };
-            push_inverse(&mut columns, kind.index() * 2, selected)?;
-        }
-    }
-    Ok(columns)
+    selected_inverse_columns(
+        PROTOCOL_LOG_ROW_COUNT,
+        |row| Ok((table_inverse_row(logs, challenges, row)?, ())),
+        |inverses, ()| table_inverse_limb_row(inverses),
+        map_batch_error,
+    )
 }
 
-fn relation_terms(
+fn table_inverse_row(
     logs: &CommittedColumns,
-    inverses: &CommittedColumns,
+    challenges: LogChallenges,
+    row: usize,
+) -> Result<[SelectedDenominator; LOG_KIND_COUNT], ProtocolLogError> {
+    let zero = NativeField::from_u64(0);
+    let mut entries = [SelectedDenominator::new(zero, zero); LOG_KIND_COUNT];
+    for (entry, (kind, start, width)) in layouts().into_iter().enumerate() {
+        let selector = field_value(logs, start, row)?;
+        let token = compress_table(logs, start, width, row, challenges.mix(kind))?;
+        *entries.get_mut(entry).ok_or(ProtocolLogError::Shape)? =
+            SelectedDenominator::new(selector, challenges.point(kind) - token);
+    }
+    Ok(entries)
+}
+
+fn table_inverse_limb_row(
+    inverses: [SelectedDenominator; LOG_KIND_COUNT],
+) -> Result<[u64; TABLE_INVERSE_COLUMN_COUNT], ProtocolLogError> {
+    let mut limbs = [0_u64; TABLE_INVERSE_COLUMN_COUNT];
+    for (kind, inverse) in inverses.into_iter().enumerate() {
+        let [low, high] = split_field(inverse.value())?;
+        let offset = kind.checked_mul(2).ok_or(ProtocolLogError::Shape)?;
+        *limbs.get_mut(offset).ok_or(ProtocolLogError::Shape)? = low;
+        *limbs.get_mut(offset + 1).ok_or(ProtocolLogError::Shape)? = high;
+    }
+    Ok(limbs)
+}
+
+fn map_batch_error(error: FieldBatchError) -> ProtocolLogError {
+    match error {
+        FieldBatchError::Shape => ProtocolLogError::Shape,
+        FieldBatchError::ZeroDenominator => ProtocolLogError::ZeroDenominator,
+    }
+}
+
+fn relation_terms<'a>(
+    logs: &'a CommittedColumns,
+    inverses: &'a CommittedColumns,
     challenges: LogChallenges,
     row_point: &[NativeField],
     mix: NativeField,
-) -> Result<Vec<Vec<Vec<NativeField>>>, ProtocolLogError> {
+) -> Result<Vec<Vec<SumcheckFactor<'a>>>, ProtocolLogError> {
     if logs.commitments().column_count() != LOG_COLUMN_COUNT
         || inverses.commitments().column_count() != TABLE_INVERSE_COLUMN_COUNT
     {
         return Err(ProtocolLogError::Shape);
     }
-    let weight = equality_evaluations(row_point);
-    let one = vec![NativeField::from_u64(1); PROTOCOL_LOG_ROW_COUNT];
+    let weight = Arc::from(equality_evaluations(row_point));
     let mut terms = Vec::with_capacity(TERM_COUNT);
     let mut scale = NativeField::from_u64(1);
     for (kind, start, width) in layouts() {
         let selector = field_column(logs, start)?;
-        let inverse = joined_inverse_columns(inverses, kind)?;
-        push_boolean_terms(&mut terms, &weight, selector, &one, scale);
+        let inverse = Arc::from(joined_inverse_columns(inverses, kind)?);
+        push_boolean_terms(&mut terms, &weight, selector, scale);
         scale *= mix;
         for column in start + 1..start + width {
             let data = field_column(logs, column)?;
-            push_inactive_terms(&mut terms, &weight, selector, data, &one, scale);
+            push_inactive_terms(&mut terms, &weight, selector, data, scale);
             scale *= mix;
         }
         push_inverse_terms(
             &mut terms,
             RelationVectors {
-                weight: &weight,
+                weight: Arc::clone(&weight),
                 selector,
                 data: table_data(logs, start, width)?,
-                inverse: &inverse,
-                one: &one,
+                inverse,
             },
             challenges,
             kind,
@@ -175,61 +202,74 @@ fn relation_terms(
 }
 
 struct RelationVectors<'a> {
-    weight: &'a [NativeField],
+    weight: Arc<[NativeField]>,
     selector: &'a [NativeField],
     data: Vec<&'a [NativeField]>,
-    inverse: &'a [NativeField],
-    one: &'a [NativeField],
+    inverse: Arc<[NativeField]>,
 }
 
-fn push_boolean_terms(
-    terms: &mut Vec<Vec<Vec<NativeField>>>,
-    weight: &[NativeField],
-    selector: &[NativeField],
-    one: &[NativeField],
+fn push_boolean_terms<'a>(
+    terms: &mut Vec<Vec<SumcheckFactor<'a>>>,
+    weight: &Arc<[NativeField]>,
+    selector: &'a [NativeField],
     scale: NativeField,
 ) {
-    terms.push(term(weight, scaled(selector, scale), selector));
-    terms.push(term(weight, scaled(selector, -scale), one));
+    terms.push(term(
+        weight,
+        SumcheckFactor::scaled(selector, scale),
+        SumcheckFactor::affine(
+            selector,
+            NativeField::from_u64(1),
+            -NativeField::from_u64(1),
+        ),
+    ));
 }
 
-fn push_inactive_terms(
-    terms: &mut Vec<Vec<Vec<NativeField>>>,
-    weight: &[NativeField],
-    selector: &[NativeField],
-    data: &[NativeField],
-    one: &[NativeField],
+fn push_inactive_terms<'a>(
+    terms: &mut Vec<Vec<SumcheckFactor<'a>>>,
+    weight: &Arc<[NativeField]>,
+    selector: &'a [NativeField],
+    data: &'a [NativeField],
     scale: NativeField,
 ) {
-    terms.push(term(weight, scaled(data, scale), one));
-    terms.push(term(weight, scaled(selector, -scale), data));
+    terms.push(term(
+        weight,
+        SumcheckFactor::scaled(data, scale),
+        SumcheckFactor::affine(
+            selector,
+            -NativeField::from_u64(1),
+            NativeField::from_u64(1),
+        ),
+    ));
 }
 
-fn push_inverse_terms(
-    terms: &mut Vec<Vec<Vec<NativeField>>>,
-    vectors: RelationVectors<'_>,
+fn push_inverse_terms<'a>(
+    terms: &mut Vec<Vec<SumcheckFactor<'a>>>,
+    vectors: RelationVectors<'a>,
     challenges: LogChallenges,
     kind: LogKind,
     scale: NativeField,
 ) {
-    terms.push(term(
-        vectors.weight,
-        constant(scale * challenges.point(kind)),
-        vectors.inverse,
-    ));
+    let mut sources = Vec::with_capacity(vectors.data.len());
     let mut power = NativeField::from_u64(1);
     for data in vectors.data {
-        terms.push(term(
-            vectors.weight,
-            scaled(data, -(scale * power)),
-            vectors.inverse,
-        ));
+        sources.push((data, -(scale * power)));
         power *= challenges.mix(kind);
     }
     terms.push(term(
-        vectors.weight,
-        scaled(vectors.selector, -scale),
-        vectors.one,
+        &vectors.weight,
+        SumcheckFactor::linear_combination(
+            sources,
+            NativeField::from_u64(0),
+            scale * challenges.point(kind),
+            PROTOCOL_LOG_ROW_COUNT,
+        ),
+        SumcheckFactor::shared(Arc::clone(&vectors.inverse)),
+    ));
+    terms.push(term(
+        &vectors.weight,
+        SumcheckFactor::scaled(vectors.selector, -scale),
+        SumcheckFactor::constant(NativeField::from_u64(1), PROTOCOL_LOG_ROW_COUNT),
     ));
 }
 
@@ -253,25 +293,24 @@ fn check_terminal(
     for (kind, start, width) in layouts() {
         let selector = scalar(logs, start)?;
         let inverse = joined_inverse_values(inverses, kind)?;
-        terms.push(vec![weight, scale * selector, selector]);
-        terms.push(vec![weight, -scale * selector, one]);
+        terms.push(vec![weight, scale * selector, selector - one]);
         for column in start + 1..start + width {
             let data = scalar(logs, column)?;
             scale *= mix;
-            terms.push(vec![weight, scale * data, one]);
-            terms.push(vec![weight, -scale * selector, data]);
+            terms.push(vec![weight, scale * data, one - selector]);
         }
         scale *= mix;
-        terms.push(vec![weight, scale * challenges.point(kind), inverse]);
+        let mut token = NativeField::from_u64(0);
         let mut power = one;
         for column in start + 1..start + width {
-            terms.push(vec![
-                weight,
-                -(scale * power) * scalar(logs, column)?,
-                inverse,
-            ]);
+            token += power * scalar(logs, column)?;
             power *= challenges.mix(kind);
         }
+        terms.push(vec![
+            weight,
+            scale * (challenges.point(kind) - token),
+            inverse,
+        ]);
         terms.push(vec![weight, -scale * selector, one]);
         scale *= mix;
     }
@@ -392,20 +431,12 @@ fn descriptor(full: &[u8]) -> Result<Vec<u8>, ProtocolLogError> {
     Ok(descriptor)
 }
 
-fn term(
-    weight: &[NativeField],
-    middle: Vec<NativeField>,
-    right: &[NativeField],
-) -> Vec<Vec<NativeField>> {
-    vec![weight.to_vec(), middle, right.to_vec()]
-}
-
-fn constant(value: NativeField) -> Vec<NativeField> {
-    vec![value; PROTOCOL_LOG_ROW_COUNT]
-}
-
-fn scaled(values: &[NativeField], scale: NativeField) -> Vec<NativeField> {
-    values.iter().map(|value| scale * *value).collect()
+fn term<'a>(
+    weight: &Arc<[NativeField]>,
+    middle: SumcheckFactor<'a>,
+    right: SumcheckFactor<'a>,
+) -> Vec<SumcheckFactor<'a>> {
+    vec![SumcheckFactor::shared(Arc::clone(weight)), middle, right]
 }
 
 fn scalar(values: &[NativeField], index: usize) -> Result<NativeField, ProtocolLogError> {

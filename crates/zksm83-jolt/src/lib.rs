@@ -35,6 +35,7 @@ mod block_routing;
 mod block_test_support;
 mod continuity;
 mod cpu;
+mod field_batch;
 mod field_fold;
 mod isa;
 mod isa_lookup;
@@ -349,7 +350,7 @@ pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
 
 /// Explicit proof/receipt composition revision bound by current backend identities.
 pub const PROOF_COMPOSITION_REVISION_V2: &str =
-    "packed-block-transition-count-derived-cpu-scalars-v2";
+    "packed-block-committed-bus-matches-compact-sumchecks-shared-isa-table-wire-v2";
 
 /// The sole native receipt protocol revision supported by this build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -528,7 +529,7 @@ mod tests {
         assert_eq!(BLOCK_CPU_COMMITMENT_GROUP_COUNT, 36);
         assert_eq!(BLOCK_CPU_OPENING_COUNT, 18);
         assert_eq!(BLOCK_CPU_PADDED_COLUMN_COUNT, 4_608);
-        assert_eq!(BLOCK_CPU_PADDING_COLUMN_COUNT, 103);
+        assert_eq!(BLOCK_CPU_PADDING_COLUMN_COUNT, 43);
         assert_eq!(NativeProtocolVersion::V2.code(), NATIVE_RECEIPT_VERSION);
         assert_eq!(NativeProtocolVersion::current(), NativeProtocolVersion::V2);
     }

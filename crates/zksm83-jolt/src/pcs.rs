@@ -23,6 +23,7 @@ use akita_types::{
     PolynomialGroupLayout, PrecommittedGroupProfiles,
 };
 use jolt_field::{CanonicalBytes, Ring};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -232,10 +233,6 @@ impl<'a> FieldColumnView<'a> {
     pub(crate) fn as_slice(&self) -> &[&'a [NativeField]] {
         &self.columns
     }
-
-    pub(crate) fn into_owned_columns(self) -> Vec<Vec<NativeField>> {
-        self.columns.into_iter().map(<[_]>::to_vec).collect()
-    }
 }
 
 impl PcsProverContext {
@@ -367,7 +364,7 @@ pub(crate) fn commit_columns<C>(
     columns: &[C],
 ) -> Result<CommittedColumns, PcsError>
 where
-    C: AsRef<[u64]>,
+    C: AsRef<[u64]> + Sync,
 {
     let row_count = validate_column_shape(layout, columns)?;
     let context = PcsContextLease::acquire(layout)?;
@@ -822,10 +819,10 @@ fn padded_polynomials<C>(
     row_count: usize,
 ) -> Result<Vec<DensePoly<NativeField>>, PcsError>
 where
-    C: AsRef<[u64]>,
+    C: AsRef<[u64]> + Sync,
 {
     let mut polynomials = column_group
-        .iter()
+        .par_iter()
         .map(|column| {
             let field_column = column
                 .as_ref()

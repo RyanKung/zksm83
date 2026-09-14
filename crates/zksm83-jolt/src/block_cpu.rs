@@ -3,7 +3,9 @@
 use akita_pcs::Ring;
 use thiserror::Error;
 use zksm83_core::{StepKind, VmState};
-use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlock, BasicBlockLaneIndex};
+use zksm83_trace::{
+    BASIC_BLOCK_BUS_EVENT_BOUND, BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlock, BasicBlockLaneIndex,
+};
 
 use crate::{
     BLOCK_MEMORY_COLUMN_COUNT, BLOCK_MEMORY_CONSTRAINT_COUNT, BlockFrontendError, BlockMemoryError,
@@ -11,18 +13,22 @@ use crate::{
     NativeTraceError, RomLookupColumns, UNIFORM_ROW_COUNT, UniformError, UniformRelation,
     block_metadata,
     cpu::packed::{
-        PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT, PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT,
-        PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT, constrain_instruction_lane,
+        PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT, PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT,
+        PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT, PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT,
+        constrain_bus_matches, constrain_instruction_lane,
     },
     trace::{
         CPU_BOUNDARY_AUX_COLUMN_COUNT, CPU_LANE_AUX_COLUMN_COUNT, CPU_SEMANTIC_AUX_COLUMN_COUNT,
-        CpuSemanticAuxEncoder, PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_DERIVED_SCALAR_COUNT,
-        cpu_semantic_legacy_column, packed_cpu_aux_offset, packed_cpu_derived_scalar,
+        CpuSemanticAuxEncoder, PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_BUS_MATCH_COLUMN_COUNT,
+        PACKED_CPU_DERIVED_SCALAR_COUNT, PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT,
+        cpu_semantic_legacy_column, packed_cpu_aux_offset, packed_cpu_bus_match_offset,
+        packed_cpu_derived_scalar,
     },
 };
 
 const PACKED_CPU_LANE_CONSTRAINT_COUNT: usize = 1_024 - PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT;
-const PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT: usize = PACKED_CPU_AUX_COLUMN_COUNT
+const PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT: usize = PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT
+    + PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT
     + PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT
     + BASIC_BLOCK_INSTRUCTION_BOUND * PACKED_CPU_LANE_CONSTRAINT_COUNT;
 
@@ -31,13 +37,13 @@ pub const BLOCK_CPU_COLUMN_COUNT: usize = BLOCK_MEMORY_COLUMN_COUNT + PACKED_CPU
 /// Identities in the packed memory and lane-local CPU semantic relation.
 pub const BLOCK_CPU_CONSTRAINT_COUNT: usize =
     BLOCK_MEMORY_CONSTRAINT_COUNT + PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT;
-/// Conservative degree bound after projecting shared bus slots into lane-local order.
-pub const BLOCK_CPU_MAX_DEGREE: usize = 41;
+/// Conservative degree bound after projecting shared bus slots through committed matches.
+pub const BLOCK_CPU_MAX_DEGREE: usize = 23;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(PACKED_CPU_LANE_CONSTRAINT_COUNT == 770);
-const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_505);
-const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 13_004);
+const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_565);
+const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 13_064);
 
 /// Fixed-row packed witness with compact helpers for every instruction lane.
 #[derive(Debug)]
@@ -185,14 +191,17 @@ impl UniformRelation for BlockCpuRelation {
             CPU_BOUNDARY_AUX_COLUMN_COUNT as u64,
             CPU_LANE_AUX_COLUMN_COUNT as u64,
             PACKED_CPU_DERIVED_SCALAR_COUNT as u64,
+            PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT as u64,
+            PACKED_CPU_BUS_MATCH_COLUMN_COUNT as u64,
             BASIC_BLOCK_INSTRUCTION_BOUND as u64,
             PACKED_CPU_AUX_COLUMN_COUNT as u64,
+            PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT as u64,
             PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT as u64,
             PACKED_CPU_LANE_CONSTRAINT_COUNT as u64,
             BLOCK_CPU_COLUMN_COUNT as u64,
             BLOCK_CPU_CONSTRAINT_COUNT as u64,
             BLOCK_CPU_MAX_DEGREE as u64,
-            5,
+            6,
         ] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
@@ -273,11 +282,41 @@ fn append_block(
     if rows.next().is_some() {
         return Err(BlockCpuError::Layout);
     }
+    write_bus_matches(&mut packed, &mut written, block)?;
     if written.iter().any(|value| !value) {
         return Err(BlockCpuError::Layout);
     }
     for (column, value) in columns.iter_mut().zip(packed) {
         column.push(value);
+    }
+    Ok(())
+}
+
+fn write_bus_matches(
+    packed: &mut [u64; PACKED_CPU_AUX_COLUMN_COUNT],
+    written: &mut [bool; PACKED_CPU_AUX_COLUMN_COUNT],
+    block: &BasicBlock,
+) -> Result<(), BlockCpuError> {
+    for (lane, lane_value) in block.lanes().iter().copied().enumerate() {
+        let descriptor = lane_value.descriptor();
+        for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+            let expected_shared = match descriptor {
+                Some(value) if local_slot < value.bus_event_count() => Some(
+                    value
+                        .bus_event_start()
+                        .checked_add(local_slot)
+                        .ok_or(BlockCpuError::Layout)?,
+                ),
+                Some(_) | None => None,
+            };
+            for shared_slot in local_slot..BASIC_BLOCK_BUS_EVENT_BOUND {
+                let target = packed_cpu_bus_match_offset(lane, local_slot, shared_slot)
+                    .ok_or(BlockCpuError::Layout)?;
+                *packed.get_mut(target).ok_or(BlockCpuError::Layout)? =
+                    u64::from(expected_shared == Some(shared_slot));
+                *written.get_mut(target).ok_or(BlockCpuError::Layout)? = true;
+            }
+        }
     }
     Ok(())
 }
@@ -319,7 +358,7 @@ fn constrain_cpu(row: &[NativeField], constraints: &mut [NativeField]) -> Result
     let instruction_block = block_metadata::instruction_value(row)?;
     let canonical_auxiliary = NativeField::from_u64(1) - instruction_block;
     let (padding_constraints, remaining_constraints) =
-        constraints.split_at_mut(PACKED_CPU_AUX_COLUMN_COUNT);
+        constraints.split_at_mut(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT);
     for (offset, constraint) in padding_constraints.iter_mut().enumerate() {
         let value = row
             .get(
@@ -331,6 +370,9 @@ fn constrain_cpu(row: &[NativeField], constraints: &mut [NativeField]) -> Result
             .ok_or(UniformError::Shape)?;
         *constraint = canonical_auxiliary * value;
     }
+    let (bus_match_constraints, remaining_constraints) =
+        remaining_constraints.split_at_mut(PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT);
+    constrain_bus_matches(row, bus_match_constraints)?;
     let (boundary_constraints, lane_constraints) =
         remaining_constraints.split_at_mut(PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT);
     let mut boundary_start = 0_usize;
@@ -379,8 +421,10 @@ mod tests {
     use crate::{
         BLOCK_ROUTING_COLUMN_COUNT, TRACE_AFTER_CPU_BYTE_BITS_START,
         TRACE_BEFORE_CPU_BYTE_BITS_START, TRACE_RESULT_BITS_START, TRACE_RESULT_VALUE,
-        block_boundary::local_state_column, block_test_support::lookup_blocks,
-        trace::packed_cpu_aux_offset, validate_uniform_witness,
+        block_boundary::local_state_column,
+        block_test_support::lookup_blocks,
+        trace::{packed_cpu_aux_offset, packed_cpu_bus_match_offset},
+        validate_uniform_witness,
     };
 
     #[test]
@@ -453,6 +497,20 @@ mod tests {
             .and_then(|column| column.first_mut())
             .ok_or(UniformError::Shape)? ^= 1;
         assert!(validate_uniform_witness(&BlockCpuRelation, &helper_mutation).is_err());
+
+        let mut bus_match_mutation = witness.columns().to_vec();
+        let first_bus_match = BLOCK_MEMORY_COLUMN_COUNT
+            .checked_add(packed_cpu_bus_match_offset(0, 0, 0).ok_or(UniformError::Shape)?)
+            .ok_or(UniformError::Shape)?;
+        *bus_match_mutation
+            .get_mut(first_bus_match)
+            .and_then(|column| column.first_mut())
+            .ok_or(UniformError::Shape)? ^= 1;
+        let memory_prefix = bus_match_mutation
+            .get(..BLOCK_MEMORY_COLUMN_COUNT)
+            .ok_or(UniformError::Shape)?;
+        validate_uniform_witness(&BlockMemoryRelation, memory_prefix)?;
+        assert!(validate_uniform_witness(&BlockCpuRelation, &bus_match_mutation).is_err());
         Ok(())
     }
 }

@@ -30,7 +30,8 @@ use crate::{
     block_metadata,
     block_routing::bus_owner_value,
     trace::{
-        PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_DERIVED_SCALAR_COUNT, packed_cpu_aux_offset,
+        PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_BUS_MATCH_COLUMN_COUNT,
+        PACKED_CPU_DERIVED_SCALAR_COUNT, packed_cpu_aux_offset, packed_cpu_bus_match_offset,
         packed_cpu_derived_scalar, packed_cpu_derived_scalar_at,
     },
 };
@@ -43,9 +44,11 @@ pub(crate) const PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT: usize =
     PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT * 2;
 pub(crate) const PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT: usize =
     (BASIC_BLOCK_INSTRUCTION_BOUND + 1) * PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT;
+pub(crate) const PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT: usize = PACKED_CPU_BUS_MATCH_COLUMN_COUNT;
 
 const _: () = assert!(PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT == 254);
 const _: () = assert!(PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT == 635);
+const _: () = assert!(PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT == 60);
 
 pub(super) struct PackedProjection<'a> {
     row: &'a [NativeField],
@@ -530,13 +533,27 @@ fn project_local_bus(
         .ok_or(UniformError::Shape)?;
     let mut projected = NativeField::from_u64(0);
     for shared_slot in local_slot..BASIC_BLOCK_BUS_EVENT_BOUND {
-        projected +=
-            local_bus_match(row, lane, local_slot, shared_slot)? * shared_value(bus, shared_slot)?;
+        projected += committed_local_bus_match(row, lane, local_slot, shared_slot)?
+            * shared_value(bus, shared_slot)?;
     }
     Ok(projected)
 }
 
-fn local_bus_match(
+fn committed_local_bus_match(
+    row: &[NativeField],
+    lane: usize,
+    local_slot: usize,
+    shared_slot: usize,
+) -> Result<NativeField, UniformError> {
+    let offset =
+        packed_cpu_bus_match_offset(lane, local_slot, shared_slot).ok_or(UniformError::Shape)?;
+    let index = BLOCK_MEMORY_COLUMN_COUNT
+        .checked_add(offset)
+        .ok_or(UniformError::Shape)?;
+    row.get(index).copied().ok_or(UniformError::Shape)
+}
+
+fn expected_local_bus_match(
     routing: &[NativeField],
     lane: usize,
     local_slot: usize,
@@ -556,6 +573,30 @@ fn local_bus_match(
     } else {
         Ok(first * bus_owner_value(routing, shared_slot, lane)?)
     }
+}
+
+pub(crate) fn constrain_bus_matches(
+    row: &[NativeField],
+    constraints: &mut [NativeField],
+) -> Result<(), UniformError> {
+    if constraints.len() != PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT {
+        return Err(UniformError::Shape);
+    }
+    let mut cursor = 0_usize;
+    for lane in 0..BASIC_BLOCK_INSTRUCTION_BOUND {
+        for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+            for shared_slot in local_slot..BASIC_BLOCK_BUS_EVENT_BOUND {
+                let output = constraints.get_mut(cursor).ok_or(UniformError::Shape)?;
+                *output = committed_local_bus_match(row, lane, local_slot, shared_slot)?
+                    - expected_local_bus_match(row, lane, local_slot, shared_slot)?;
+                cursor = cursor.checked_add(1).ok_or(UniformError::Shape)?;
+            }
+        }
+    }
+    if cursor != PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT {
+        return Err(UniformError::Shape);
+    }
+    Ok(())
 }
 
 const _: () = assert!(ISA_ADDRESS_BIT_COUNT == 9);

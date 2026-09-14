@@ -4,8 +4,7 @@ use akita_pcs::Ring;
 
 use super::{
     BUS_ADDRESS_OFFSET, BUS_AUXILIARY_OFFSET, BUS_BEFORE_OFFSET, BUS_INDEX_OFFSET,
-    BUS_PHYSICAL_ADDRESS_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, RowView, bit_selector,
-    bus_field, bus_kind_bits, packed_bits,
+    BUS_PHYSICAL_ADDRESS_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, RowView, bus_field, packed_bits,
 };
 use crate::{
     NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START,
@@ -124,18 +123,9 @@ fn constrain_interrupt_registers(
 }
 
 fn low_selector(view: &RowView<'_>, slot: usize, value: u8) -> Result<NativeField, UniformError> {
-    let start = TRACE_BUS_ADDRESS_BITS_START + slot * 16;
-    let one = NativeField::from_u64(1);
-    (0..8).try_fold(one, |selector, bit| {
-        let actual = view.value(start + bit)?;
-        Ok(if (value >> bit) & 1 == 1 {
-            selector * actual
-        } else {
-            selector * (one - actual)
-        })
-    })
+    view.low_address_selector(slot, value)
 }
 
 fn bus_kind(view: &RowView<'_>, slot: usize, code: u8) -> Result<NativeField, UniformError> {
-    bit_selector(bus_kind_bits(view, slot)?, code)
+    view.bus_kind_selector(slot, code)
 }

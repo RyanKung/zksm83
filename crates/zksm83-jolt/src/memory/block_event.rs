@@ -13,11 +13,13 @@ use crate::{
         memory_row_index_value, memory_selector_column, memory_selector_value,
         memory_write_selector_column, memory_write_selector_value,
     },
+    field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
 };
 
-use super::{MemoryChallenges, MutableMemoryError, field_bytes, inverse, join_limbs, split_field};
+use super::{MemoryChallenges, MutableMemoryError, field_bytes, join_limbs, split_field};
 
 const BUS_SLOTS: usize = 5;
+const INVERSE_ENTRY_COUNT: usize = BUS_SLOTS * 2;
 const INVERSE_COLUMN_COUNT: usize = BUS_SLOTS * 4;
 const CONSTRAINT_COUNT: usize = BUS_SLOTS * 2;
 
@@ -47,7 +49,7 @@ impl UniformRelation for BlockMemoryEventRelation {
             BLOCK_CPU_COLUMN_COUNT as u64,
             BUS_SLOTS as u64,
             TRACE_MEMORY_TIMESTAMP_BITS as u64,
-            6,
+            7,
         ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -120,56 +122,97 @@ pub(super) fn inverse_columns(
     if trace.columns().len() != BLOCK_CPU_COLUMN_COUNT {
         return Err(MutableMemoryError::Shape);
     }
-    let mut columns = (0..INVERSE_COLUMN_COUNT)
-        .map(|_| Vec::with_capacity(UNIFORM_ROW_COUNT))
-        .collect::<Vec<_>>();
     let alpha_squared = challenges.alpha * challenges.alpha;
-    for row in 0..UNIFORM_ROW_COUNT {
-        let row_index = packed_trace_bits(
+    selected_inverse_columns(
+        UNIFORM_ROW_COUNT,
+        |row| Ok((inverse_row(trace, row, challenges, alpha_squared)?, ())),
+        |inverses, ()| inverse_limb_row(inverses),
+        map_batch_error,
+    )
+}
+
+fn inverse_row(
+    trace: &BlockCpuWitness,
+    row: usize,
+    challenges: MemoryChallenges,
+    alpha_squared: NativeField,
+) -> Result<[SelectedDenominator; INVERSE_ENTRY_COUNT], MutableMemoryError> {
+    let row_index = packed_trace_bits(
+        trace,
+        BLOCK_MEMORY_ROW_BITS_START,
+        UNIFORM_NUM_VARIABLES,
+        row,
+    )?;
+    let zero = NativeField::from_u64(0);
+    let mut entries = [SelectedDenominator::new(zero, zero); INVERSE_ENTRY_COUNT];
+    for slot in 0..BUS_SLOTS {
+        let selected = trace_value(trace, memory_selector_column(slot)?, row)?;
+        let write = trace_value(trace, memory_write_selector_column(slot)?, row)?;
+        let address = trace_value(
             trace,
-            BLOCK_MEMORY_ROW_BITS_START,
-            UNIFORM_NUM_VARIABLES,
+            packed_bus_column(slot_physical_address_column(slot)?)?,
             row,
         )?;
-        for slot in 0..BUS_SLOTS {
-            let selected = trace_value(trace, memory_selector_column(slot)?, row)?;
-            let write = trace_value(trace, memory_write_selector_column(slot)?, row)?;
-            let address = trace_value(
-                trace,
-                packed_bus_column(slot_physical_address_column(slot)?)?,
-                row,
-            )?;
-            let before = trace_value(trace, packed_bus_column(slot_before_column(slot)?)?, row)?;
-            let after = trace_value(trace, packed_bus_column(slot_value_column(slot)?)?, row)?;
-            let predecessor = packed_predecessor(trace, slot, row)?;
-            let slot_number = u64::try_from(slot).map_err(|_| MutableMemoryError::Shape)?;
-            let current = row_index
-                .checked_mul(BUS_SLOTS as u64)
-                .and_then(|value| value.checked_add(slot_number + 1))
-                .ok_or(MutableMemoryError::Shape)?;
-            let input_value = write
-                .checked_mul(before)
-                .and_then(|value| {
-                    selected
-                        .checked_sub(write)
-                        .and_then(|read| read.checked_mul(after))
-                        .and_then(|read_value| value.checked_add(read_value))
-                })
-                .ok_or(MutableMemoryError::Shape)?;
-            let input = NativeField::from_u64(address)
-                + challenges.alpha * NativeField::from_u64(input_value)
-                + alpha_squared * NativeField::from_u64(predecessor);
-            let output = NativeField::from_u64(address)
-                + challenges.alpha * NativeField::from_u64(after)
-                + alpha_squared * NativeField::from_u64(current);
-            let selected = NativeField::from_u64(selected);
-            let input_inverse = selected_inverse(selected, challenges.beta - input)?;
-            let output_inverse = selected_inverse(selected, challenges.beta - output)?;
-            push_inverse(&mut columns, slot, input_inverse)?;
-            push_inverse(&mut columns, BUS_SLOTS * 2 + slot, output_inverse)?;
-        }
+        let before = trace_value(trace, packed_bus_column(slot_before_column(slot)?)?, row)?;
+        let after = trace_value(trace, packed_bus_column(slot_value_column(slot)?)?, row)?;
+        let predecessor = packed_predecessor(trace, slot, row)?;
+        let slot_number = u64::try_from(slot).map_err(|_| MutableMemoryError::Shape)?;
+        let current = row_index
+            .checked_mul(BUS_SLOTS as u64)
+            .and_then(|value| value.checked_add(slot_number + 1))
+            .ok_or(MutableMemoryError::Shape)?;
+        let input_value = write
+            .checked_mul(before)
+            .and_then(|value| {
+                selected
+                    .checked_sub(write)
+                    .and_then(|read| read.checked_mul(after))
+                    .and_then(|read_value| value.checked_add(read_value))
+            })
+            .ok_or(MutableMemoryError::Shape)?;
+        let input = NativeField::from_u64(address)
+            + challenges.alpha * NativeField::from_u64(input_value)
+            + alpha_squared * NativeField::from_u64(predecessor);
+        let output = NativeField::from_u64(address)
+            + challenges.alpha * NativeField::from_u64(after)
+            + alpha_squared * NativeField::from_u64(current);
+        let scale = NativeField::from_u64(selected);
+        *entries.get_mut(slot).ok_or(MutableMemoryError::Shape)? =
+            SelectedDenominator::new(scale, challenges.beta - input);
+        *entries
+            .get_mut(BUS_SLOTS + slot)
+            .ok_or(MutableMemoryError::Shape)? =
+            SelectedDenominator::new(scale, challenges.beta - output);
     }
-    Ok(columns)
+    Ok(entries)
+}
+
+fn inverse_limb_row(
+    inverses: [SelectedDenominator; INVERSE_ENTRY_COUNT],
+) -> Result<[u64; INVERSE_COLUMN_COUNT], MutableMemoryError> {
+    let mut limbs = [0_u64; INVERSE_COLUMN_COUNT];
+    for (entry, inverse) in inverses.into_iter().enumerate() {
+        let [low, high] = split_field(inverse.value())?;
+        let low_column = if entry < BUS_SLOTS {
+            entry
+        } else {
+            entry
+                .checked_add(BUS_SLOTS)
+                .ok_or(MutableMemoryError::Shape)?
+        };
+        *limbs.get_mut(low_column).ok_or(MutableMemoryError::Shape)? = low;
+        *limbs
+            .get_mut(low_column + BUS_SLOTS)
+            .ok_or(MutableMemoryError::Shape)? = high;
+    }
+    Ok(limbs)
+}
+
+fn map_batch_error(error: FieldBatchError) -> MutableMemoryError {
+    match error {
+        FieldBatchError::Shape => MutableMemoryError::Shape,
+        FieldBatchError::ZeroDenominator => MutableMemoryError::ZeroDenominator,
+    }
 }
 
 fn packed_bus_column(relative: usize) -> Result<usize, MutableMemoryError> {
@@ -218,34 +261,6 @@ fn trace_value(
         .and_then(|values| values.get(row))
         .copied()
         .ok_or(MutableMemoryError::Shape)
-}
-
-fn selected_inverse(
-    selected: NativeField,
-    denominator: NativeField,
-) -> Result<NativeField, MutableMemoryError> {
-    if selected == NativeField::from_u64(0) {
-        Ok(NativeField::from_u64(0))
-    } else {
-        Ok(selected * inverse(denominator)?)
-    }
-}
-
-fn push_inverse(
-    columns: &mut [Vec<u64>],
-    low_column: usize,
-    value: NativeField,
-) -> Result<(), MutableMemoryError> {
-    let [low, high] = split_field(value)?;
-    columns
-        .get_mut(low_column)
-        .ok_or(MutableMemoryError::Shape)?
-        .push(low);
-    columns
-        .get_mut(low_column + BUS_SLOTS)
-        .ok_or(MutableMemoryError::Shape)?
-        .push(high);
-    Ok(())
 }
 
 fn inverse_value(row: &[NativeField], low_column: usize) -> Result<NativeField, UniformError> {

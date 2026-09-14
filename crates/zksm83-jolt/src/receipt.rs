@@ -57,9 +57,8 @@ pub fn native_backend_digest() -> [u8; 32] {
 }
 
 /// Prover-side inputs for one contiguous native trace segment.
-#[derive(Clone, Copy)]
 pub struct NativeSegmentWitness<'a> {
-    trace: &'a BlockCpuWitness,
+    trace: BlockCpuWitness,
     initial_memory: &'a CommittedMemory,
     final_memory: &'a CommittedMemory,
 }
@@ -160,7 +159,7 @@ impl<'a> NativeSegmentWitness<'a> {
     /// Creates one segment input from a canonical trace and exact memory checkpoints.
     #[must_use]
     pub const fn new(
-        trace: &'a BlockCpuWitness,
+        trace: BlockCpuWitness,
         initial_memory: &'a CommittedMemory,
         final_memory: &'a CommittedMemory,
     ) -> Self {
@@ -443,20 +442,25 @@ fn prove_segment(
     witness: NativeSegmentWitness<'_>,
     rom: &CommittedRom,
 ) -> Result<(NativeSegmentReceipt, NativeBoundary), NativeReceiptError> {
-    let claim = NativeExecutionClaim::from_packed_trace(witness.trace)
+    let NativeSegmentWitness {
+        trace,
+        initial_memory,
+        final_memory,
+    } = witness;
+    let claim = NativeExecutionClaim::from_packed_trace(&trace)
         .map_err(PackedBlockProofError::Continuity)?;
-    let expected_initial = NativeStateBoundary::from_vm_state(witness.trace.initial_state());
-    let memory_identity = direct_memory_identity(witness.initial_memory.commitment())?;
+    let expected_initial = NativeStateBoundary::from_vm_state(trace.initial_state());
+    let memory_identity = direct_memory_identity(initial_memory.commitment())?;
     if initial.state() != expected_initial || initial.memory() != &memory_identity {
         return Err(NativeReceiptError::SegmentChain(
             "prover witness does not start at the expected boundary",
         ));
     }
-    let logs = commit_packed_protocol_logs(witness.trace)?;
-    let log_claim = PackedProtocolLogClaim::from_trace(witness.trace, &claim)?;
+    let logs = commit_packed_protocol_logs(&trace)?;
+    let log_claim = PackedProtocolLogClaim::from_trace(&trace, &claim)?;
     let segment_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
-    let final_state = NativeStateBoundary::from_vm_state(witness.trace.final_state());
-    let final_memory_identity = direct_memory_identity(witness.final_memory.commitment())?;
+    let final_state = NativeStateBoundary::from_vm_state(trace.final_state());
+    let final_memory_identity = direct_memory_identity(final_memory.commitment())?;
     let log_counts = ProtocolLogCounts::packed(
         initial.state(),
         final_state,
@@ -471,13 +475,13 @@ fn prove_segment(
         log_counts,
     )?;
     let proof = prove_packed_block_components(
-        witness.trace,
+        trace,
         &claim,
         log_claim,
         &logs,
         rom,
-        witness.initial_memory,
-        witness.final_memory,
+        initial_memory,
+        final_memory,
     )?;
     let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| NativeReceiptError::Counter)?;
     let padded_row_count = capacity
@@ -497,8 +501,8 @@ fn prove_segment(
         padded_row_count,
         initial,
         final_boundary: final_boundary.clone(),
-        initial_memory: witness.initial_memory.commitment().clone(),
-        final_memory: witness.final_memory.commitment().clone(),
+        initial_memory: initial_memory.commitment().clone(),
+        final_memory: final_memory.commitment().clone(),
         logs: logs.commitment().clone(),
         m_cycle_count,
         log_counts: committed_log_counts,

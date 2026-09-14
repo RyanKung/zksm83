@@ -2,12 +2,25 @@
 
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use jolt_field::Field;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
     NativeField,
     metrics::{self, Phase},
 };
+
+mod factor;
+mod rounds;
+mod sparse;
+
+pub(crate) use factor::SumcheckFactor;
+use factor::{FoldedFactor, SumcheckTable};
+use rounds::{
+    inner_product, multi_product_round, product_round, shared_sum_of_term_products,
+    shared_sum_product_round, sum_of_products,
+};
+use sparse::SparseTable;
 
 /// Proof that a Boolean-hypercube sum equals an inner product of two MLEs.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,11 +84,23 @@ impl ProductSumcheckProof {
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
         validate_tables(left, right)?;
-        let mut left = left.to_vec();
-        let mut right = right.to_vec();
-        let claim = inner_product(&left, &right)?;
+        let claim = inner_product(left, right)?;
         let mut rounds = Vec::with_capacity(variable_count(left.len())?);
         let mut point = Vec::with_capacity(rounds.capacity());
+        if left.len() == 1 {
+            return finish_product_sumcheck(left, right, rounds, claim, point, transcript);
+        }
+        let message = product_round(left, right)?;
+        absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
+        let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
+        let (left, right) = rayon::join(
+            || fold_borrowed(left, challenge),
+            || fold_borrowed(right, challenge),
+        );
+        let mut left = left?;
+        let mut right = right?;
+        rounds.push(message);
+        point.push(challenge);
         while left.len() > 1 {
             let message = product_round(&left, &right)?;
             absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
@@ -85,22 +110,49 @@ impl ProductSumcheckProof {
             rounds.push(message);
             point.push(challenge);
         }
-        let final_left = first_value(&left)?;
-        let final_right = first_value(&right)?;
-        absorb_finals(
-            transcript,
-            b"product-sumcheck-final",
-            &[final_left, final_right],
-        )?;
-        Ok((
-            Self {
-                rounds,
-                final_left,
-                final_right,
-            },
-            claim,
-            point,
-        ))
+        finish_product_sumcheck(&left, &right, rounds, claim, point, transcript)
+    }
+
+    pub(crate) fn prove_sparse_left(
+        left_entries: Vec<(usize, NativeField)>,
+        logical_length: usize,
+        right: &[NativeField],
+        transcript: &mut AkitaTranscript<NativeField>,
+    ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
+        let _phase = metrics::start(Phase::Sumcheck);
+        let mut left = SparseTable::new(left_entries, logical_length)?;
+        if right.len() != logical_length {
+            return Err(ProductSumcheckError::LengthMismatch);
+        }
+        let claim = left.inner_product(right)?;
+        let mut rounds = Vec::with_capacity(variable_count(logical_length)?);
+        let mut point = Vec::with_capacity(rounds.capacity());
+        if logical_length == 1 {
+            let left = [left.final_value()?];
+            return finish_product_sumcheck(&left, right, rounds, claim, point, transcript);
+        }
+        let message = left.round(right)?;
+        absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
+        let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
+        let (left_result, folded_right) =
+            rayon::join(|| left.fold(challenge), || fold_borrowed(right, challenge));
+        left_result?;
+        let mut right = folded_right?;
+        rounds.push(message);
+        point.push(challenge);
+        while left.length() > 1 {
+            let message = left.round(&right)?;
+            absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
+            let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
+            let (left_result, right_result) =
+                rayon::join(|| left.fold(challenge), || fold(&mut right, challenge));
+            left_result?;
+            right_result?;
+            rounds.push(message);
+            point.push(challenge);
+        }
+        let left = [left.final_value()?];
+        finish_product_sumcheck(&left, &right, rounds, claim, point, transcript)
     }
 
     pub(crate) fn verify(
@@ -145,19 +197,33 @@ impl ProductSumcheckProof {
 
 impl MultiProductSumcheckProof {
     pub(crate) fn prove(
-        factors: &[Vec<NativeField>],
+        factors: Vec<SumcheckFactor<'_>>,
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
-        validate_factors(factors)?;
-        let mut factors = factors.to_vec();
+        validate_factors(&factors)?;
         let claim = sum_of_products(&factors)?;
         let mut current_len = factors
             .first()
-            .map(Vec::len)
+            .map(SumcheckTable::table_len)
             .ok_or(ProductSumcheckError::EmptyFactors)?;
         let mut rounds = Vec::with_capacity(variable_count(current_len)?);
         let mut point = Vec::with_capacity(rounds.capacity());
+        if current_len == 1 {
+            return finish_multi_product_sumcheck(&factors, rounds, claim, point, transcript);
+        }
+        let message = multi_product_round(&factors)?;
+        absorb_round(
+            transcript,
+            b"multi-product-sumcheck",
+            rounds.len(),
+            &message,
+        )?;
+        let challenge = transcript.challenge_scalar(b"multi-product-sumcheck-challenge");
+        let mut factors = fold_initial_factors(factors, challenge)?;
+        current_len /= 2;
+        rounds.push(message);
+        point.push(challenge);
         while current_len > 1 {
             let message = multi_product_round(&factors)?;
             absorb_round(
@@ -167,26 +233,14 @@ impl MultiProductSumcheckProof {
                 &message,
             )?;
             let challenge = transcript.challenge_scalar(b"multi-product-sumcheck-challenge");
-            for factor in &mut factors {
-                fold(factor, challenge)?;
-            }
+            factors
+                .par_iter_mut()
+                .try_for_each(|factor| factor.fold(challenge))?;
             current_len /= 2;
             rounds.push(message);
             point.push(challenge);
         }
-        let final_factors = factors
-            .iter()
-            .map(|factor| first_value(factor))
-            .collect::<Result<Vec<_>, _>>()?;
-        absorb_finals(transcript, b"multi-product-sumcheck-final", &final_factors)?;
-        Ok((
-            Self {
-                rounds,
-                final_factors,
-            },
-            claim,
-            point,
-        ))
+        finish_multi_product_sumcheck(&factors, rounds, claim, point, transcript)
     }
 
     pub(crate) fn verify(
@@ -249,18 +303,43 @@ impl MultiProductSumcheckProof {
 }
 
 impl SumOfProductsSumcheckProof {
-    pub(crate) fn prove(
-        terms: &[Vec<Vec<NativeField>>],
+    pub(crate) fn prove_shared_first(
+        terms: Vec<Vec<SumcheckFactor<'_>>>,
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
-        let (_, _, mut current_len) = validate_terms(terms)?;
-        let claim = sum_of_term_products(terms)?;
-        let mut terms = terms.to_vec();
+        let (shared, terms) = split_shared_first(terms)?;
+        let (_, _, mut current_len) = validate_terms(&terms)?;
+        if shared.table_len() != current_len {
+            return Err(ProductSumcheckError::LengthMismatch);
+        }
+        let claim = shared_sum_of_term_products(&shared, &terms)?;
         let mut rounds = Vec::with_capacity(variable_count(current_len)?);
         let mut point = Vec::with_capacity(rounds.capacity());
+        if current_len == 1 {
+            return finish_shared_sum_of_products(
+                &shared, &terms, rounds, claim, point, transcript,
+            );
+        }
+        let message = shared_sum_product_round(&shared, &terms)?;
+        absorb_round(
+            transcript,
+            b"sum-of-products-sumcheck",
+            rounds.len(),
+            &message,
+        )?;
+        let challenge = transcript.challenge_scalar(b"sum-of-products-sumcheck-challenge");
+        let (shared, terms) = rayon::join(
+            || shared.fold(challenge),
+            || fold_initial_terms(terms, challenge),
+        );
+        let mut shared = shared?;
+        let mut terms = terms?;
+        current_len /= 2;
+        rounds.push(message);
+        point.push(challenge);
         while current_len > 1 {
-            let message = sum_product_round(&terms)?;
+            let message = shared_sum_product_round(&shared, &terms)?;
             absorb_round(
                 transcript,
                 b"sum-of-products-sumcheck",
@@ -268,28 +347,22 @@ impl SumOfProductsSumcheckProof {
                 &message,
             )?;
             let challenge = transcript.challenge_scalar(b"sum-of-products-sumcheck-challenge");
-            for term in &mut terms {
-                for factor in term {
-                    fold(factor, challenge)?;
-                }
-            }
+            let (shared_result, terms_result) = rayon::join(
+                || shared.fold(challenge),
+                || {
+                    terms.par_iter_mut().try_for_each(|term| {
+                        term.par_iter_mut()
+                            .try_for_each(|factor| factor.fold(challenge))
+                    })
+                },
+            );
+            shared_result?;
+            terms_result?;
             current_len /= 2;
             rounds.push(message);
             point.push(challenge);
         }
-        let final_terms = terms
-            .iter()
-            .map(|term| term.iter().map(|factor| first_value(factor)).collect())
-            .collect::<Result<Vec<Vec<_>>, _>>()?;
-        absorb_term_finals(transcript, &final_terms)?;
-        Ok((
-            Self {
-                rounds,
-                final_terms,
-            },
-            claim,
-            point,
-        ))
+        finish_shared_sum_of_products(&shared, &terms, rounds, claim, point, transcript)
     }
 
     pub(crate) fn verify(
@@ -354,6 +427,136 @@ impl SumOfProductsSumcheckProof {
     }
 }
 
+fn split_shared_first(
+    terms: Vec<Vec<SumcheckFactor<'_>>>,
+) -> Result<(SumcheckFactor<'_>, Vec<Vec<SumcheckFactor<'_>>>), ProductSumcheckError> {
+    let mut terms = terms.into_iter();
+    let mut first = terms
+        .next()
+        .ok_or(ProductSumcheckError::EmptyFactors)?
+        .into_iter();
+    let shared = first.next().ok_or(ProductSumcheckError::EmptyFactors)?;
+    let mut stripped = vec![first.collect::<Vec<_>>()];
+    for term in terms {
+        let mut factors = term.into_iter();
+        let candidate = factors.next().ok_or(ProductSumcheckError::EmptyFactors)?;
+        if !shared.same_table(&candidate) {
+            return Err(ProductSumcheckError::LengthMismatch);
+        }
+        stripped.push(factors.collect());
+    }
+    Ok((shared, stripped))
+}
+
+fn finish_product_sumcheck(
+    left: &[NativeField],
+    right: &[NativeField],
+    rounds: Vec<[NativeField; 3]>,
+    claim: NativeField,
+    point: Vec<NativeField>,
+    transcript: &mut AkitaTranscript<NativeField>,
+) -> Result<(ProductSumcheckProof, NativeField, Vec<NativeField>), ProductSumcheckError> {
+    let final_left = first_value(left)?;
+    let final_right = first_value(right)?;
+    absorb_finals(
+        transcript,
+        b"product-sumcheck-final",
+        &[final_left, final_right],
+    )?;
+    Ok((
+        ProductSumcheckProof {
+            rounds,
+            final_left,
+            final_right,
+        },
+        claim,
+        point,
+    ))
+}
+
+fn finish_multi_product_sumcheck(
+    factors: &[impl SumcheckTable],
+    rounds: Vec<Vec<NativeField>>,
+    claim: NativeField,
+    point: Vec<NativeField>,
+    transcript: &mut AkitaTranscript<NativeField>,
+) -> Result<(MultiProductSumcheckProof, NativeField, Vec<NativeField>), ProductSumcheckError> {
+    let final_factors = factors
+        .iter()
+        .map(|factor| factor.table_value(0))
+        .collect::<Result<Vec<_>, _>>()?;
+    absorb_finals(transcript, b"multi-product-sumcheck-final", &final_factors)?;
+    Ok((
+        MultiProductSumcheckProof {
+            rounds,
+            final_factors,
+        },
+        claim,
+        point,
+    ))
+}
+
+fn finish_shared_sum_of_products<T: SumcheckTable>(
+    shared: &T,
+    terms: &[Vec<T>],
+    rounds: Vec<Vec<NativeField>>,
+    claim: NativeField,
+    point: Vec<NativeField>,
+    transcript: &mut AkitaTranscript<NativeField>,
+) -> Result<(SumOfProductsSumcheckProof, NativeField, Vec<NativeField>), ProductSumcheckError> {
+    let shared_value = shared.table_value(0)?;
+    let final_terms = terms
+        .iter()
+        .map(|term| {
+            let mut factors = Vec::with_capacity(term.len() + 1);
+            factors.push(shared_value);
+            factors.extend(
+                term.iter()
+                    .map(|factor| factor.table_value(0))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(factors)
+        })
+        .collect::<Result<Vec<_>, ProductSumcheckError>>()?;
+    absorb_term_finals(transcript, &final_terms)?;
+    Ok((
+        SumOfProductsSumcheckProof {
+            rounds,
+            final_terms,
+        },
+        claim,
+        point,
+    ))
+}
+
+fn fold_borrowed(
+    values: &[NativeField],
+    challenge: NativeField,
+) -> Result<Vec<NativeField>, ProductSumcheckError> {
+    crate::field_fold::fold_binary_layer_from_slice(values, challenge)
+        .map_err(|_| ProductSumcheckError::FoldingShape)
+}
+
+fn fold_initial_factors(
+    factors: Vec<SumcheckFactor<'_>>,
+    challenge: NativeField,
+) -> Result<Vec<FoldedFactor>, ProductSumcheckError> {
+    factors
+        .into_par_iter()
+        .map(|factor| factor.fold(challenge))
+        .collect()
+}
+
+fn fold_initial_terms(
+    terms: Vec<Vec<SumcheckFactor<'_>>>,
+    challenge: NativeField,
+) -> Result<Vec<Vec<FoldedFactor>>, ProductSumcheckError> {
+    terms
+        .into_par_iter()
+        .map(|term| fold_initial_factors(term, challenge))
+        .collect()
+}
+
 fn validate_tables(
     left: &[NativeField],
     right: &[NativeField],
@@ -370,34 +573,37 @@ fn validate_tables(
     Ok(())
 }
 
-fn validate_factors(factors: &[Vec<NativeField>]) -> Result<(), ProductSumcheckError> {
+fn validate_factors(factors: &[impl SumcheckTable]) -> Result<(), ProductSumcheckError> {
     let first = factors.first().ok_or(ProductSumcheckError::EmptyFactors)?;
-    if first.is_empty() {
+    if first.table_len() == 0 {
         return Err(ProductSumcheckError::EmptyTable);
     }
-    if !first.len().is_power_of_two() {
+    if !first.table_len().is_power_of_two() {
         return Err(ProductSumcheckError::NonPowerOfTwo);
     }
-    if factors.iter().any(|factor| factor.len() != first.len()) {
+    if factors
+        .iter()
+        .any(|factor| factor.table_len() != first.table_len())
+    {
         return Err(ProductSumcheckError::LengthMismatch);
     }
     Ok(())
 }
 
-fn validate_terms(
-    terms: &[Vec<Vec<NativeField>>],
+fn validate_terms<T: SumcheckTable>(
+    terms: &[Vec<T>],
 ) -> Result<(usize, usize, usize), ProductSumcheckError> {
     let first_term = terms.first().ok_or(ProductSumcheckError::EmptyFactors)?;
     let first_factor = first_term
         .first()
         .ok_or(ProductSumcheckError::EmptyFactors)?;
-    if first_factor.is_empty() || !first_factor.len().is_power_of_two() {
+    if first_factor.table_len() == 0 || !first_factor.table_len().is_power_of_two() {
         return Err(ProductSumcheckError::NonPowerOfTwo);
     }
     let factor_count = first_term.len();
-    let table_len = first_factor.len();
+    let table_len = first_factor.table_len();
     if terms.iter().any(|term| {
-        term.len() != factor_count || term.iter().any(|factor| factor.len() != table_len)
+        term.len() != factor_count || term.iter().any(|factor| factor.table_len() != table_len)
     }) {
         return Err(ProductSumcheckError::LengthMismatch);
     }
@@ -409,162 +615,6 @@ fn variable_count(length: usize) -> Result<usize, ProductSumcheckError> {
         return Err(ProductSumcheckError::NonPowerOfTwo);
     }
     usize::try_from(length.ilog2()).map_err(|_| ProductSumcheckError::ProofShape)
-}
-
-fn inner_product(
-    left: &[NativeField],
-    right: &[NativeField],
-) -> Result<NativeField, ProductSumcheckError> {
-    validate_tables(left, right)?;
-    Ok(left
-        .iter()
-        .copied()
-        .zip(right.iter().copied())
-        .fold(NativeField::from_u64(0), |sum, (left, right)| {
-            sum + left * right
-        }))
-}
-
-fn sum_of_products(factors: &[Vec<NativeField>]) -> Result<NativeField, ProductSumcheckError> {
-    validate_factors(factors)?;
-    let length = factors
-        .first()
-        .map(Vec::len)
-        .ok_or(ProductSumcheckError::EmptyFactors)?;
-    (0..length).try_fold(NativeField::from_u64(0), |sum, index| {
-        let product = factors
-            .iter()
-            .try_fold(NativeField::from_u64(1), |product, factor| {
-                factor
-                    .get(index)
-                    .copied()
-                    .map(|value| product * value)
-                    .ok_or(ProductSumcheckError::FoldingShape)
-            })?;
-        Ok(sum + product)
-    })
-}
-
-fn sum_of_term_products(
-    terms: &[Vec<Vec<NativeField>>],
-) -> Result<NativeField, ProductSumcheckError> {
-    let (_, _, length) = validate_terms(terms)?;
-    (0..length).try_fold(NativeField::from_u64(0), |sum, index| {
-        let row_sum = terms
-            .iter()
-            .try_fold(NativeField::from_u64(0), |term_sum, factors| {
-                let product =
-                    factors
-                        .iter()
-                        .try_fold(NativeField::from_u64(1), |product, factor| {
-                            factor
-                                .get(index)
-                                .copied()
-                                .map(|value| product * value)
-                                .ok_or(ProductSumcheckError::FoldingShape)
-                        })?;
-                Ok::<_, ProductSumcheckError>(term_sum + product)
-            })?;
-        Ok(sum + row_sum)
-    })
-}
-
-fn product_round(
-    left: &[NativeField],
-    right: &[NativeField],
-) -> Result<[NativeField; 3], ProductSumcheckError> {
-    validate_tables(left, right)?;
-    if left.len() == 1 {
-        return Err(ProductSumcheckError::FoldingShape);
-    }
-    let mut evaluations = [NativeField::from_u64(0); 3];
-    for (left_pair, right_pair) in left.chunks_exact(2).zip(right.chunks_exact(2)) {
-        let (left_zero, left_one) = pair_values(left_pair)?;
-        let (right_zero, right_one) = pair_values(right_pair)?;
-        for (point_index, evaluation) in evaluations.iter_mut().enumerate() {
-            let point = usize_to_field(point_index)?;
-            let left_at = left_zero + point * (left_one - left_zero);
-            let right_at = right_zero + point * (right_one - right_zero);
-            *evaluation += left_at * right_at;
-        }
-    }
-    Ok(evaluations)
-}
-
-fn multi_product_round(
-    factors: &[Vec<NativeField>],
-) -> Result<Vec<NativeField>, ProductSumcheckError> {
-    validate_factors(factors)?;
-    let length = factors
-        .first()
-        .map(Vec::len)
-        .ok_or(ProductSumcheckError::EmptyFactors)?;
-    if length == 1 {
-        return Err(ProductSumcheckError::FoldingShape);
-    }
-    let evaluation_count = factors
-        .len()
-        .checked_add(1)
-        .ok_or(ProductSumcheckError::ProofShape)?;
-    let mut evaluations = vec![NativeField::from_u64(0); evaluation_count];
-    for pair_start in (0..length).step_by(2) {
-        for (point_index, evaluation) in evaluations.iter_mut().enumerate() {
-            let point = usize_to_field(point_index)?;
-            let product =
-                factors
-                    .iter()
-                    .try_fold(NativeField::from_u64(1), |product, factor| {
-                        let zero = factor
-                            .get(pair_start)
-                            .copied()
-                            .ok_or(ProductSumcheckError::FoldingShape)?;
-                        let one = factor
-                            .get(
-                                pair_start
-                                    .checked_add(1)
-                                    .ok_or(ProductSumcheckError::FoldingShape)?,
-                            )
-                            .copied()
-                            .ok_or(ProductSumcheckError::FoldingShape)?;
-                        Ok::<_, ProductSumcheckError>(product * (zero + point * (one - zero)))
-                    })?;
-            *evaluation += product;
-        }
-    }
-    Ok(evaluations)
-}
-
-fn sum_product_round(
-    terms: &[Vec<Vec<NativeField>>],
-) -> Result<Vec<NativeField>, ProductSumcheckError> {
-    let (_, factor_count, length) = validate_terms(terms)?;
-    if length == 1 {
-        return Err(ProductSumcheckError::FoldingShape);
-    }
-    let mut evaluations = vec![NativeField::from_u64(0); factor_count + 1];
-    for pair_start in (0..length).step_by(2) {
-        for (point_index, evaluation) in evaluations.iter_mut().enumerate() {
-            let point = usize_to_field(point_index)?;
-            for factors in terms {
-                let product =
-                    factors
-                        .iter()
-                        .try_fold(NativeField::from_u64(1), |product, factor| {
-                            let zero = factor
-                                .get(pair_start)
-                                .copied()
-                                .ok_or(ProductSumcheckError::FoldingShape)?;
-                            let one = factor
-                                .get(pair_start + 1)
-                                .copied()
-                                .ok_or(ProductSumcheckError::FoldingShape)?;
-                            Ok::<_, ProductSumcheckError>(product * (zero + point * (one - zero)))
-                        })?;
-                *evaluation += product;
-            }
-        }
-    }
-    Ok(evaluations)
 }
 
 fn terminal_term_sum(terms: &[Vec<NativeField>]) -> NativeField {
@@ -694,6 +744,7 @@ mod tests {
 
     use super::{
         MultiProductSumcheckProof, NativeField, ProductSumcheckProof, SumOfProductsSumcheckProof,
+        SumcheckFactor,
     };
 
     fn transcript(side: bool) -> AkitaTranscript<NativeField> {
@@ -731,8 +782,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let factors = [[1_u64, 2, 3, 4], [5_u64, 6, 7, 8], [2_u64, 0, 1, 3]]
             .map(|factor| factor.map(NativeField::from_u64).to_vec());
+        let compact = factors
+            .iter()
+            .map(|factor| SumcheckFactor::borrowed(factor))
+            .collect();
         let (proof, claim, prover_point) =
-            MultiProductSumcheckProof::prove(&factors, &mut transcript(true))?;
+            MultiProductSumcheckProof::prove(compact, &mut transcript(true))?;
         let verifier_point = proof.verify(claim, 2, 3, &mut transcript(false))?;
         assert_eq!(prover_point, verifier_point);
 
@@ -753,19 +808,28 @@ mod tests {
 
     #[test]
     fn sum_of_products_round_trip_and_tamper_rejection() -> Result<(), Box<dyn std::error::Error>> {
-        let terms = vec![
-            vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
-            vec![vec![2, 0, 1, 3], vec![9, 2, 4, 1]],
-        ]
-        .into_iter()
-        .map(|term| {
-            term.into_iter()
-                .map(|factor| factor.into_iter().map(NativeField::from_u64).collect())
-                .collect()
-        })
-        .collect::<Vec<Vec<Vec<_>>>>();
+        let shared = vec![1, 2, 3, 4]
+            .into_iter()
+            .map(NativeField::from_u64)
+            .collect::<Vec<_>>();
+        let terms = vec![vec![vec![5, 6, 7, 8]], vec![vec![9, 2, 4, 1]]]
+            .into_iter()
+            .map(|term| {
+                term.into_iter()
+                    .map(|factor| factor.into_iter().map(NativeField::from_u64).collect())
+                    .collect()
+            })
+            .collect::<Vec<Vec<Vec<_>>>>();
+        let compact = terms
+            .iter()
+            .map(|term| {
+                std::iter::once(SumcheckFactor::borrowed(&shared))
+                    .chain(term.iter().map(|factor| SumcheckFactor::borrowed(factor)))
+                    .collect()
+            })
+            .collect();
         let (proof, claim, prover_point) =
-            SumOfProductsSumcheckProof::prove(&terms, &mut transcript(true))?;
+            SumOfProductsSumcheckProof::prove_shared_first(compact, &mut transcript(true))?;
         let verifier_point = proof.verify(claim, 2, 2, 2, &mut transcript(false))?;
         assert_eq!(prover_point, verifier_point);
 

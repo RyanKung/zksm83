@@ -185,7 +185,7 @@ fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
     let initial_memory = crate::commit_memory(&initial_bytes)?;
     let final_memory = crate::commit_memory(&final_bytes)?;
     eprintln!("receipt gate commitments: {:.2?}", started.elapsed());
-    let witness = NativeSegmentWitness::new(&trace, &initial_memory, &final_memory);
+    let witness = NativeSegmentWitness::new(trace, &initial_memory, &final_memory);
     let mut prover = NativeReceiptStreamProver::new(&rom, Cursor::new(Vec::new()))?;
     prover.append(witness)?;
     let mut bytes = Vec::new();
@@ -283,8 +283,9 @@ fn two_segment_receipt_authenticates_exact_shared_boundary()
         .iter()
         .map(|memory| crate::commit_memory(memory))
         .collect::<Result<Vec<_>, _>>()?;
-    let first_trace = traces.first().ok_or("missing first trace")?;
-    let second_trace = traces.get(1).ok_or("missing second trace")?;
+    let mut traces = traces.into_iter();
+    let first_trace = traces.next().ok_or("missing first trace")?;
+    let second_trace = traces.next().ok_or("missing second trace")?;
     let initial_memory = committed_memories.first().ok_or("missing initial memory")?;
     let middle_memory = committed_memories.get(1).ok_or("missing middle memory")?;
     let final_memory = committed_memories.get(2).ok_or("missing final memory")?;

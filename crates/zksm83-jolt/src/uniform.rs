@@ -7,11 +7,12 @@ mod geometry;
 mod relation;
 #[cfg(test)]
 mod scratch_tests;
+mod sumcheck;
 
 use akita_config::proof_optimized::fp128;
 use akita_pcs::{AkitaError, AkitaTranscript, Ring, Transcript};
 use akita_serialization::SerializationError;
-use jolt_field::Field;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{AkitaWorkerError, NativeProtocolVersion};
@@ -21,7 +22,10 @@ pub(crate) use composite::{
     CompositeUniformRelationProof, prove_uniform_composite, verify_uniform_composite_for_protocol,
 };
 pub use relation::ConstraintOutput;
-use relation::{initialize_constraint_output, trim_zero_suffix};
+use relation::initialize_constraint_output;
+#[cfg(test)]
+use sumcheck::{combined_relation_with_scratch, parallel_sumcheck_round, sumcheck_round};
+use sumcheck::{prove_sumcheck, replay_sumcheck};
 
 /// Scalar field used by the native transparent relation and Akita PCS.
 pub type NativeField = fp128::Field;
@@ -298,7 +302,7 @@ fn prove_satisfied_uniform_on_worker(
     let weights = equality_evaluations(&row_point);
     let (sumcheck_rounds, opening_point, opened_values) = prove_sumcheck(
         relation,
-        field_columns.into_owned_columns(),
+        field_columns.as_slice(),
         weights,
         constraint_mix,
         &mut transcript,
@@ -394,15 +398,51 @@ fn validate_committed_relation(
     Ok(())
 }
 
-fn ensure_relation_holds(
+fn ensure_relation_holds<C>(
     relation: &impl UniformRelation,
-    columns: &[impl AsRef<[NativeField]>],
+    columns: &[C],
+    row_count: usize,
+) -> Result<(), UniformError>
+where
+    C: AsRef<[NativeField]> + Sync,
+{
+    let chunks = validation_chunk_count(row_count)?;
+    let rows_per_chunk = row_count.div_ceil(chunks);
+    let results = (0..chunks)
+        .into_par_iter()
+        .map(|chunk| validate_field_chunk(relation, columns, row_count, rows_per_chunk, chunk))
+        .collect::<Vec<_>>();
+    finish_parallel_validation(results)
+}
+
+fn ensure_u64_relation_holds(
+    relation: &impl UniformRelation,
+    columns: &[Vec<u64>],
     row_count: usize,
 ) -> Result<(), UniformError> {
+    let chunks = validation_chunk_count(row_count)?;
+    let rows_per_chunk = row_count.div_ceil(chunks);
+    let results = (0..chunks)
+        .into_par_iter()
+        .map(|chunk| validate_u64_chunk(relation, columns, row_count, rows_per_chunk, chunk))
+        .collect::<Vec<_>>();
+    finish_parallel_validation(results)
+}
+
+fn validate_field_chunk<C>(
+    relation: &impl UniformRelation,
+    columns: &[C],
+    row_count: usize,
+    rows_per_chunk: usize,
+    chunk: usize,
+) -> Result<Option<(usize, usize)>, UniformError>
+where
+    C: AsRef<[NativeField]>,
+{
     let zero = NativeField::from_u64(0);
     let mut row = Vec::with_capacity(columns.len());
     let mut constraints = vec![zero; relation.constraint_count()];
-    for row_index in 0..row_count {
+    for row_index in validation_range(row_count, rows_per_chunk, chunk)? {
         row.clear();
         for column in columns {
             row.push(
@@ -416,24 +456,23 @@ fn ensure_relation_holds(
         initialize_constraint_output(relation, &mut constraints);
         relation.evaluate(&row, &mut constraints)?;
         if let Some(constraint) = constraints.iter().position(|value| *value != zero) {
-            return Err(UniformError::WitnessUnsatisfied {
-                row: row_index,
-                constraint,
-            });
+            return Ok(Some((row_index, constraint)));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
-fn ensure_u64_relation_holds(
+fn validate_u64_chunk(
     relation: &impl UniformRelation,
     columns: &[Vec<u64>],
     row_count: usize,
-) -> Result<(), UniformError> {
+    rows_per_chunk: usize,
+    chunk: usize,
+) -> Result<Option<(usize, usize)>, UniformError> {
     let zero = NativeField::from_u64(0);
     let mut row = Vec::with_capacity(columns.len());
     let mut constraints = vec![zero; relation.constraint_count()];
-    for row_index in 0..row_count {
+    for row_index in validation_range(row_count, rows_per_chunk, chunk)? {
         row.clear();
         for column in columns {
             row.push(NativeField::from_u64(
@@ -443,10 +482,37 @@ fn ensure_u64_relation_holds(
         initialize_constraint_output(relation, &mut constraints);
         relation.evaluate(&row, &mut constraints)?;
         if let Some(constraint) = constraints.iter().position(|value| *value != zero) {
-            return Err(UniformError::WitnessUnsatisfied {
-                row: row_index,
-                constraint,
-            });
+            return Ok(Some((row_index, constraint)));
+        }
+    }
+    Ok(None)
+}
+
+fn validation_chunk_count(row_count: usize) -> Result<usize, UniformError> {
+    if row_count == 0 {
+        return Err(UniformError::Shape);
+    }
+    Ok(rayon::current_num_threads().clamp(1, row_count))
+}
+
+fn validation_range(
+    row_count: usize,
+    rows_per_chunk: usize,
+    chunk: usize,
+) -> Result<std::ops::Range<usize>, UniformError> {
+    let start = chunk
+        .checked_mul(rows_per_chunk)
+        .ok_or(UniformError::Shape)?;
+    let end = start.saturating_add(rows_per_chunk).min(row_count);
+    Ok(start..end)
+}
+
+fn finish_parallel_validation(
+    results: Vec<Result<Option<(usize, usize)>, UniformError>>,
+) -> Result<(), UniformError> {
+    for result in results {
+        if let Some((row, constraint)) = result? {
+            return Err(UniformError::WitnessUnsatisfied { row, constraint });
         }
     }
     Ok(())
@@ -511,282 +577,6 @@ fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {
         evaluations = next;
     }
     evaluations
-}
-
-type SumcheckOutput = (Vec<Vec<NativeField>>, Vec<NativeField>, Vec<NativeField>);
-
-fn prove_sumcheck(
-    relation: &impl UniformRelation,
-    mut columns: Vec<Vec<NativeField>>,
-    mut weights: Vec<NativeField>,
-    constraint_mix: NativeField,
-    transcript: &mut AkitaTranscript<NativeField>,
-) -> Result<SumcheckOutput, UniformError> {
-    let _phase = crate::metrics::start(crate::metrics::Phase::Sumcheck);
-    if columns.iter().any(|column| column.len() != weights.len()) {
-        return Err(UniformError::Shape);
-    }
-    let round_evaluations = relation
-        .max_constraint_degree()
-        .checked_add(2)
-        .ok_or(UniformError::Shape)?;
-    let mut rounds = Vec::with_capacity(weights.len().ilog2() as usize);
-    let mut opening_point = Vec::with_capacity(rounds.capacity());
-    let mut claim = NativeField::from_u64(0);
-    let zero = NativeField::from_u64(0);
-    let mut row_scratch = vec![zero; relation.column_count()];
-    let mut constraint_scratch = vec![zero; relation.constraint_count()];
-    while weights.len() > 1 {
-        let message = sumcheck_round(
-            relation,
-            &columns,
-            &weights,
-            constraint_mix,
-            round_evaluations,
-            &mut row_scratch,
-            &mut constraint_scratch,
-        )?;
-        let at_zero = message.first().copied().ok_or(UniformError::Sumcheck)?;
-        let at_one = message.get(1).copied().ok_or(UniformError::Sumcheck)?;
-        if at_zero + at_one != claim {
-            return Err(UniformError::Unsatisfied);
-        }
-        absorb_round(transcript, rounds.len(), &message)?;
-        let challenge = transcript.challenge_scalar(b"sumcheck-round");
-        claim = evaluate_lagrange(&message, challenge)?;
-        fold_columns(&mut columns, challenge)?;
-        fold_column(&mut weights, challenge)?;
-        rounds.push(message);
-        opening_point.push(challenge);
-    }
-    let opened_values = columns
-        .iter()
-        .map(|column| column.first().copied().ok_or(UniformError::Shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    let terminal_weight = weights.first().copied().ok_or(UniformError::Shape)?;
-    let terminal_relation = combined_relation_with_scratch(
-        relation,
-        &opened_values,
-        constraint_mix,
-        &mut constraint_scratch,
-    )?;
-    if claim != terminal_weight * terminal_relation {
-        return Err(UniformError::TerminalMismatch);
-    }
-    Ok((rounds, opening_point, opened_values))
-}
-
-fn replay_sumcheck(
-    relation: &impl UniformRelation,
-    rounds: &[Vec<NativeField>],
-    opened_values: &[NativeField],
-    row_point: &[NativeField],
-    constraint_mix: NativeField,
-    transcript: &mut AkitaTranscript<NativeField>,
-) -> Result<Vec<NativeField>, UniformError> {
-    let expected_message_len = relation
-        .max_constraint_degree()
-        .checked_add(2)
-        .ok_or(UniformError::Shape)?;
-    if rounds.len() != row_point.len() || opened_values.len() != relation.column_count() {
-        return Err(UniformError::Shape);
-    }
-    let mut claim = NativeField::from_u64(0);
-    let mut opening_point = Vec::with_capacity(rounds.len());
-    for (round_index, message) in rounds.iter().enumerate() {
-        if message.len() != expected_message_len {
-            return Err(UniformError::Sumcheck);
-        }
-        let at_zero = message.first().copied().ok_or(UniformError::Sumcheck)?;
-        let at_one = message.get(1).copied().ok_or(UniformError::Sumcheck)?;
-        if at_zero + at_one != claim {
-            return Err(UniformError::Sumcheck);
-        }
-        absorb_round(transcript, round_index, message)?;
-        let challenge = transcript.challenge_scalar(b"sumcheck-round");
-        claim = evaluate_lagrange(message, challenge)?;
-        opening_point.push(challenge);
-    }
-    let terminal_weight = equality_evaluation(row_point, &opening_point)?;
-    let terminal_relation = combined_relation(relation, opened_values, constraint_mix)?;
-    if claim != terminal_weight * terminal_relation {
-        return Err(UniformError::TerminalMismatch);
-    }
-    Ok(opening_point)
-}
-
-fn sumcheck_round(
-    relation: &impl UniformRelation,
-    columns: &[Vec<NativeField>],
-    weights: &[NativeField],
-    constraint_mix: NativeField,
-    evaluation_count: usize,
-    row_scratch: &mut [NativeField],
-    constraint_scratch: &mut [NativeField],
-) -> Result<Vec<NativeField>, UniformError> {
-    if columns.iter().any(|column| column.len() != weights.len())
-        || weights.len() < 2
-        || !weights.len().is_multiple_of(2)
-        || row_scratch.len() != columns.len()
-        || constraint_scratch.len() != relation.constraint_count()
-    {
-        return Err(UniformError::Shape);
-    }
-    let zero = NativeField::from_u64(0);
-    let mut message = vec![zero; evaluation_count];
-    for (point_index, evaluation) in message.iter_mut().enumerate() {
-        let point =
-            NativeField::from_u64(u64::try_from(point_index).map_err(|_| UniformError::Shape)?);
-        for pair_index in 0..(weights.len() / 2) {
-            interpolate_row_into(columns, pair_index, point, row_scratch)?;
-            let weight = interpolate_pair(weights, pair_index, point)?;
-            *evaluation += weight
-                * combined_relation_with_scratch(
-                    relation,
-                    row_scratch,
-                    constraint_mix,
-                    constraint_scratch,
-                )?;
-        }
-    }
-    Ok(message)
-}
-
-fn interpolate_row_into(
-    columns: &[Vec<NativeField>],
-    pair_index: usize,
-    point: NativeField,
-    output: &mut [NativeField],
-) -> Result<(), UniformError> {
-    if columns.len() != output.len() {
-        return Err(UniformError::Shape);
-    }
-    for (value, column) in output.iter_mut().zip(columns) {
-        *value = interpolate_pair(column, pair_index, point)?;
-    }
-    Ok(())
-}
-
-fn interpolate_pair(
-    values: &[NativeField],
-    pair_index: usize,
-    point: NativeField,
-) -> Result<NativeField, UniformError> {
-    let start = pair_index.checked_mul(2).ok_or(UniformError::Shape)?;
-    let low = values.get(start).copied().ok_or(UniformError::Shape)?;
-    let high = values
-        .get(start.checked_add(1).ok_or(UniformError::Shape)?)
-        .copied()
-        .ok_or(UniformError::Shape)?;
-    Ok(low + point * (high - low))
-}
-
-fn combined_relation(
-    relation: &impl UniformRelation,
-    row: &[NativeField],
-    constraint_mix: NativeField,
-) -> Result<NativeField, UniformError> {
-    let mut constraints = vec![NativeField::from_u64(0); relation.constraint_count()];
-    combined_relation_with_scratch(relation, row, constraint_mix, &mut constraints)
-}
-
-fn combined_relation_with_scratch(
-    relation: &impl UniformRelation,
-    row: &[NativeField],
-    constraint_mix: NativeField,
-    constraints: &mut [NativeField],
-) -> Result<NativeField, UniformError> {
-    if row.len() != relation.column_count() {
-        return Err(UniformError::Shape);
-    }
-    let zero = NativeField::from_u64(0);
-    if constraints.len() != relation.constraint_count() {
-        return Err(UniformError::Shape);
-    }
-    initialize_constraint_output(relation, constraints);
-    relation.evaluate(row, constraints)?;
-    let mut power = NativeField::from_u64(1);
-    let mut combined = zero;
-    let mixed_constraints = trim_zero_suffix(constraints);
-    for constraint in mixed_constraints.iter().copied() {
-        combined += power * constraint;
-        power *= constraint_mix;
-    }
-    Ok(combined)
-}
-
-fn fold_columns(
-    columns: &mut [Vec<NativeField>],
-    challenge: NativeField,
-) -> Result<(), UniformError> {
-    for column in columns {
-        fold_column(column, challenge)?;
-    }
-    Ok(())
-}
-
-fn fold_column(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), UniformError> {
-    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| UniformError::Shape)
-}
-
-fn evaluate_lagrange(
-    evaluations: &[NativeField],
-    point: NativeField,
-) -> Result<NativeField, UniformError> {
-    if evaluations.is_empty() {
-        return Err(UniformError::Sumcheck);
-    }
-    let mut result = NativeField::from_u64(0);
-    for (index, evaluation) in evaluations.iter().enumerate() {
-        let index_field =
-            NativeField::from_u64(u64::try_from(index).map_err(|_| UniformError::Shape)?);
-        let mut numerator = NativeField::from_u64(1);
-        let mut denominator = NativeField::from_u64(1);
-        for other in 0..evaluations.len() {
-            if other == index {
-                continue;
-            }
-            let other_field =
-                NativeField::from_u64(u64::try_from(other).map_err(|_| UniformError::Shape)?);
-            numerator *= point - other_field;
-            denominator *= index_field - other_field;
-        }
-        let inverse = denominator
-            .inverse()
-            .ok_or(UniformError::NonInvertibleInterpolation)?;
-        result += *evaluation * numerator * inverse;
-    }
-    Ok(result)
-}
-
-fn equality_evaluation(
-    left: &[NativeField],
-    right: &[NativeField],
-) -> Result<NativeField, UniformError> {
-    if left.len() != right.len() {
-        return Err(UniformError::Shape);
-    }
-    let one = NativeField::from_u64(1);
-    Ok(left
-        .iter()
-        .copied()
-        .zip(right.iter().copied())
-        .fold(one, |product, (left, right)| {
-            product * (left * right + (one - left) * (one - right))
-        }))
-}
-
-fn absorb_round(
-    transcript: &mut AkitaTranscript<NativeField>,
-    round_index: usize,
-    message: &[NativeField],
-) -> Result<(), UniformError> {
-    let index = u64::try_from(round_index).map_err(|_| UniformError::Shape)?;
-    transcript.append_bytes(b"sumcheck-round-index", &index.to_le_bytes());
-    for value in message {
-        transcript.append_field(b"sumcheck-round-evaluation", value);
-    }
-    Ok(())
 }
 
 fn on_worker<T: Send>(

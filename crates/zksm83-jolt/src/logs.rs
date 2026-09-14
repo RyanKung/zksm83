@@ -8,7 +8,7 @@ pub(crate) mod table_relation;
 mod tests;
 
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
-use jolt_field::{CanonicalBytes, Field};
+use jolt_field::CanonicalBytes;
 use thiserror::Error;
 
 use crate::{
@@ -76,6 +76,7 @@ pub use packed::{
     PackedProtocolLogClaim, PackedProtocolLogProof, commit_packed_protocol_logs,
     prove_packed_protocol_logs, verify_packed_protocol_logs,
 };
+pub(crate) use packed::{prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs};
 
 /// Invalid log table, cursor claim, proof shape, or backend operation.
 #[derive(Debug, Error)]
@@ -321,21 +322,6 @@ fn compress(values: &[NativeField], mix: NativeField) -> NativeField {
         .0
 }
 
-fn selected_inverse(
-    selector: u64,
-    token: NativeField,
-    inverse_point: NativeField,
-) -> Result<NativeField, ProtocolLogError> {
-    if selector == 0 {
-        return Ok(NativeField::from_u64(0));
-    }
-    Ok(NativeField::from_u64(selector) * inverse(inverse_point - token)?)
-}
-
-fn inverse(value: NativeField) -> Result<NativeField, ProtocolLogError> {
-    value.inverse().ok_or(ProtocolLogError::ZeroDenominator)
-}
-
 fn split_field(value: NativeField) -> Result<[u64; 2], ProtocolLogError> {
     let bytes = value.to_bytes_le_vec();
     let low = <[u8; 8]>::try_from(bytes.get(..8).ok_or(ProtocolLogError::Shape)?)
@@ -386,16 +372,6 @@ fn push_column(
     Ok(())
 }
 
-fn push_inverse(
-    columns: &mut [Vec<u64>],
-    offset: usize,
-    value: NativeField,
-) -> Result<(), ProtocolLogError> {
-    let [low, high] = split_field(value)?;
-    push_column(columns, offset, low)?;
-    push_column(columns, offset + 1, high)
-}
-
 fn field_column(
     columns: &CommittedColumns,
     index: usize,
@@ -407,15 +383,7 @@ fn evaluate_field_column(
     values: &[NativeField],
     point: &[NativeField],
 ) -> Result<NativeField, ProtocolLogError> {
-    if values.len() != 1_usize << point.len() {
-        return Err(ProtocolLogError::Shape);
-    }
-    let mut folded = values.to_vec();
-    for coordinate in point {
-        crate::field_fold::fold_binary_layer(&mut folded, *coordinate)
-            .map_err(|_| ProtocolLogError::Shape)?;
-    }
-    folded.first().copied().ok_or(ProtocolLogError::Shape)
+    crate::field_fold::evaluate_mle(values, point).map_err(|_| ProtocolLogError::Shape)
 }
 
 fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {

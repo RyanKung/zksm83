@@ -5,8 +5,8 @@ use akita_pcs::Ring;
 use super::{
     BUS_ADDRESS_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, DMA_BYTE_MODE, HALT_IDLE_MODE,
     HALT_UNTIL_SERIAL_MODE, HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, HALT_WAKE_MODE,
-    INSTRUCTION_MODE, INTERRUPT_MODE, RowView, STATE_IME, STATE_RUN_STATE, bit_selector, bus_field,
-    bus_kind_bits, operation_selector, packed_bits, zero_from_bits,
+    INSTRUCTION_MODE, INTERRUPT_MODE, RowView, STATE_IME, STATE_RUN_STATE, bus_field,
+    operation_selector, packed_bits, zero_from_bits,
 };
 use crate::{
     NativeField, TRACE_ACTIVE, TRACE_AFTER_DMA_BITS_START, TRACE_AFTER_INTERRUPT_ENABLE_BITS_START,
@@ -306,7 +306,7 @@ fn fixed_byte_selector(
 }
 
 fn bus_kind(view: &RowView<'_>, slot: usize, code: u8) -> Result<NativeField, UniformError> {
-    bit_selector(bus_kind_bits(view, slot)?, code)
+    view.bus_kind_selector(slot, code)
 }
 
 fn constrain_interrupt_masks(
