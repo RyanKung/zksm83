@@ -3,7 +3,7 @@
 use thiserror::Error;
 use zksm83_core::{
     BusEvent, BusWitness, MachineProfile, RunState, StepError, StepInput, StepRelation, VmState,
-    WitnessRequest,
+    VmStateError, WitnessRequest,
 };
 use zksm83_memory::{
     LogAccumulator, LogError, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -50,6 +50,23 @@ impl TraceBuilder {
             private_input,
             state,
         }
+    }
+
+    /// Starts execution at a DMG post-boot MBC3 state with an explicit cartridge profile.
+    pub fn new_dmg_post_boot_mbc3_profile(
+        rom: RomImage,
+        memory: MemoryImage,
+        private_input: Vec<u8>,
+        profile: MachineProfile,
+    ) -> Result<Self, TraceBuilderError> {
+        let state =
+            VmState::dmg_post_boot_mbc3_profile_initial(profile, rom.root(), memory.root())?;
+        Ok(Self {
+            rom,
+            memory,
+            private_input,
+            state,
+        })
     }
 
     /// Restores a validated trace boundary from committed ROM and memory images.
@@ -293,8 +310,7 @@ impl TraceBuilder {
         requested: u64,
     ) -> Result<(), TraceBuilderError> {
         if run_state.can_execute_instruction()
-            || (self.state.profile() == MachineProfile::DmgPostBootMbc3V1
-                && run_state == RunState::Halted)
+            || (self.state.profile().is_dmg_post_boot_mbc3() && run_state == RunState::Halted)
         {
             return Ok(());
         }
@@ -452,6 +468,9 @@ pub enum TraceBuilderError {
     /// The pure transition rejected a fully materialized step.
     #[error(transparent)]
     Step(#[from] StepError),
+    /// VM state construction rejected the selected profile.
+    #[error(transparent)]
+    State(#[from] VmStateError),
     /// ROM image could not produce a requested authentication witness.
     #[error(transparent)]
     Rom(#[from] RomImageError),

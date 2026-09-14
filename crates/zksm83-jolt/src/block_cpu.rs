@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-const PACKED_CPU_LANE_CONSTRAINT_COUNT: usize = 312;
+const PACKED_CPU_LANE_CONSTRAINT_COUNT: usize = 317;
 const PACKED_CPU_SEMANTIC_CONSTRAINT_COUNT: usize = PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT
     + PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT
     + PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT
@@ -50,7 +50,7 @@ pub const BLOCK_CPU_MAX_DEGREE: usize = 23;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_604);
-const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 11_458);
+const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 11_483);
 
 /// Fixed-row packed witness with compact helpers for every instruction lane.
 #[derive(Debug)]

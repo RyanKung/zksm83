@@ -255,8 +255,9 @@ pub use receipt::{
     verify_native_receipt_bytes, verify_native_receipt_reader, verify_native_spool_reader,
 };
 pub use rom_lookup::{
-    CommittedRom, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment, RomLookupColumns,
-    RomLookupError, RomLookupProof, commit_rom, prove_rom_lookup, verify_rom_lookup,
+    CommittedRom, ROM_256KIB_IMAGE_BYTES, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment,
+    RomLookupColumns, RomLookupError, RomLookupProof, commit_rom, prove_rom_lookup,
+    verify_rom_lookup,
 };
 use serde::Serialize;
 pub use state::{
@@ -358,7 +359,7 @@ pub const PROTOCOL_ID_V2: &str = "zksm83-native-jolt-akita-v2";
 pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
 
 /// Explicit proof/receipt composition revision bound by current backend identities.
-pub const PROOF_COMPOSITION_REVISION_V2: &str = "packed-block-jolt-execution-shout-compact19-compact-aux54-isa38-mmio-address-bits-projected-composites-batched-isa-selective-openings-native-only-wire-v2";
+pub const PROOF_COMPOSITION_REVISION_V2: &str = "packed-block-jolt-execution-shout-compact20-compact-aux55-isa38-mbc3-profiled-rom-size-rtc-wire-v2";
 
 /// The sole native receipt protocol revision supported by this build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]

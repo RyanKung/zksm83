@@ -21,7 +21,9 @@ pub use execution_lookup::{
     ExecutionLookupError, ExecutionLookupOutput, ExecutionLookupQuery,
     evaluate_execution_table_entry,
 };
-pub use mbc3::{Mbc3State, Mbc3StateError};
+pub use mbc3::{
+    Mbc3CartridgeProfile, Mbc3ExternalWindow, Mbc3RomSize, Mbc3RtcMode, Mbc3State, Mbc3StateError,
+};
 pub use state::{
     CpuState, Flags, ImeState, MachineContext, MachineProfile, Registers, RunState, VmState,
     VmStateError,

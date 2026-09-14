@@ -6,7 +6,9 @@ use zksm83_memory::{
     BusTranscriptAccumulator, CommitmentRoot, IsaTranscriptAccumulator, LogAccumulator, LogKind,
 };
 
-use crate::{DmgDeviceState, Mbc3State, Mbc3StateError};
+use crate::{
+    DmgDeviceState, Mbc3CartridgeProfile, Mbc3RomSize, Mbc3RtcMode, Mbc3State, Mbc3StateError,
+};
 
 /// Stable machine semantics selected for a VM state.
 ///
@@ -16,8 +18,14 @@ use crate::{DmgDeviceState, Mbc3State, Mbc3StateError};
 pub enum MachineProfile {
     /// Synthetic clean-core profile with declared byte input/output ports.
     CleanCoreV1,
-    /// Original monochrome Game Boy state immediately after the boot ROM.
+    /// Original monochrome Game Boy state immediately after the boot ROM, one-MiB no-RTC MBC3.
     DmgPostBootMbc3V1,
+    /// DMG post-boot MBC3 with a 256-KiB no-RTC cartridge.
+    DmgPostBootMbc3Rom256KiBNoRtcV1,
+    /// DMG post-boot MBC3 with a 256-KiB RTC-capable cartridge.
+    DmgPostBootMbc3Rom256KiBRtcV1,
+    /// DMG post-boot MBC3 with a one-MiB RTC-capable cartridge.
+    DmgPostBootMbc3Rom1MiBRtcV1,
 }
 
 impl MachineProfile {
@@ -27,6 +35,51 @@ impl MachineProfile {
         match self {
             Self::CleanCoreV1 => 0,
             Self::DmgPostBootMbc3V1 => 1,
+            Self::DmgPostBootMbc3Rom256KiBNoRtcV1 => 2,
+            Self::DmgPostBootMbc3Rom256KiBRtcV1 => 3,
+            Self::DmgPostBootMbc3Rom1MiBRtcV1 => 4,
+        }
+    }
+
+    /// Returns whether this profile uses DMG post-boot device semantics.
+    #[must_use]
+    pub const fn is_dmg_post_boot_mbc3(self) -> bool {
+        match self {
+            Self::CleanCoreV1 => false,
+            Self::DmgPostBootMbc3V1
+            | Self::DmgPostBootMbc3Rom256KiBNoRtcV1
+            | Self::DmgPostBootMbc3Rom256KiBRtcV1
+            | Self::DmgPostBootMbc3Rom1MiBRtcV1 => true,
+        }
+    }
+
+    /// Returns the MBC3 cartridge profile used by address mapping.
+    #[must_use]
+    pub const fn mbc3_cartridge_profile(self) -> Mbc3CartridgeProfile {
+        match self {
+            Self::CleanCoreV1 | Self::DmgPostBootMbc3V1 => Mbc3CartridgeProfile::one_mib_no_rtc(),
+            Self::DmgPostBootMbc3Rom256KiBNoRtcV1 => {
+                Mbc3CartridgeProfile::new(Mbc3RomSize::Rom256KiB, Mbc3RtcMode::NoRtc)
+            }
+            Self::DmgPostBootMbc3Rom256KiBRtcV1 => {
+                Mbc3CartridgeProfile::new(Mbc3RomSize::Rom256KiB, Mbc3RtcMode::RtcCapable)
+            }
+            Self::DmgPostBootMbc3Rom1MiBRtcV1 => {
+                Mbc3CartridgeProfile::new(Mbc3RomSize::Rom1MiB, Mbc3RtcMode::RtcCapable)
+            }
+        }
+    }
+
+    /// Selects the stable DMG post-boot machine profile for an MBC3 cartridge profile.
+    #[must_use]
+    pub const fn dmg_post_boot_for_cartridge(profile: Mbc3CartridgeProfile) -> Self {
+        match (profile.rom_size(), profile.rtc()) {
+            (Mbc3RomSize::Rom256KiB, Mbc3RtcMode::NoRtc) => Self::DmgPostBootMbc3Rom256KiBNoRtcV1,
+            (Mbc3RomSize::Rom256KiB, Mbc3RtcMode::RtcCapable) => {
+                Self::DmgPostBootMbc3Rom256KiBRtcV1
+            }
+            (Mbc3RomSize::Rom1MiB, Mbc3RtcMode::NoRtc) => Self::DmgPostBootMbc3V1,
+            (Mbc3RomSize::Rom1MiB, Mbc3RtcMode::RtcCapable) => Self::DmgPostBootMbc3Rom1MiBRtcV1,
         }
     }
 }
@@ -396,8 +449,32 @@ impl VmState {
         rom_root: CommitmentRoot,
         memory_root: CommitmentRoot,
     ) -> Self {
+        Self::dmg_post_boot_mbc3_unchecked(MachineProfile::DmgPostBootMbc3V1, rom_root, memory_root)
+    }
+
+    /// Constructs a DMG post-boot MBC3 boundary state with an explicit cartridge profile.
+    pub fn dmg_post_boot_mbc3_profile_initial(
+        profile: MachineProfile,
+        rom_root: CommitmentRoot,
+        memory_root: CommitmentRoot,
+    ) -> Result<Self, VmStateError> {
+        if !profile.is_dmg_post_boot_mbc3() {
+            return Err(VmStateError::UnsupportedMachineProfile { profile });
+        }
+        Ok(Self::dmg_post_boot_mbc3_unchecked(
+            profile,
+            rom_root,
+            memory_root,
+        ))
+    }
+
+    fn dmg_post_boot_mbc3_unchecked(
+        profile: MachineProfile,
+        rom_root: CommitmentRoot,
+        memory_root: CommitmentRoot,
+    ) -> Self {
         Self {
-            profile: MachineProfile::DmgPostBootMbc3V1,
+            profile,
             cpu: CpuState::dmg_post_boot_initial(),
             mbc3: Mbc3State::profile_initial(),
             dmg_devices: DmgDeviceState::dmg_post_boot(),
@@ -594,6 +671,12 @@ pub enum VmStateError {
     /// An explicit MBC3 mapper snapshot violated the cartridge profile.
     #[error(transparent)]
     InvalidMbc3(#[from] Mbc3StateError),
+    /// The requested constructor cannot create the supplied machine profile.
+    #[error("machine profile {profile:?} is unsupported by this constructor")]
+    UnsupportedMachineProfile {
+        /// Rejected profile.
+        profile: MachineProfile,
+    },
 }
 
 const fn bool_mask(value: bool, mask: u8) -> u8 {

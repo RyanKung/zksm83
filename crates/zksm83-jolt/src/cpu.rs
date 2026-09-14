@@ -51,6 +51,7 @@ mod word;
 use std::cell::Cell;
 
 use akita_pcs::Ring;
+use jolt_field::Field;
 
 use crate::{
     ConstraintOutput, ISA_BASE_M_CYCLES, ISA_DATA_READS, ISA_DATA_WRITES, ISA_IMMEDIATE_READS,
@@ -73,12 +74,12 @@ use selectors::{argument_selector, operation_selector};
 
 /// Number of relation slots; unused tail slots are canonical zero identities.
 pub const CPU_STRUCTURAL_CONSTRAINT_COUNT: usize = 6144;
-// Keep the 892-slot zero tail explicit while guarding every real constraint push.
-const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5252;
+// Keep the 885-slot zero tail explicit while guarding every real constraint push.
+const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5259;
 /// Maximum algebraic degree of one CPU/device constraint before equality weighting.
 pub const CPU_STRUCTURAL_MAX_DEGREE: usize = 18;
 
-const CPU_STRUCTURAL_DOMAIN: &[u8] = b"zksm83/native-cpu-structural/v21";
+const CPU_STRUCTURAL_DOMAIN: &[u8] = b"zksm83/native-cpu-structural/v22";
 const PADDING_MODE: usize = TraceMode::Padding.index();
 const INTERRUPT_MODE: usize = TraceMode::Interrupt.index();
 pub(super) const INSTRUCTION_MODE: usize = TraceMode::Instruction.index();
@@ -97,7 +98,11 @@ const STATE_CYCLES: usize = 12;
 pub(super) const STATE_MBC3_RAM_ENABLED: usize = 13;
 pub(super) const STATE_MBC3_ROM_BANK: usize = 14;
 pub(super) const STATE_MBC3_RAM_RTC_SELECT: usize = 15;
-const STATE_PROFILE: usize = 20;
+pub(super) const STATE_PROFILE: usize = 20;
+pub(super) const PROFILE_DMG_MBC3_ROM_256KIB_NO_RTC: u64 = 2;
+pub(super) const PROFILE_DMG_MBC3_ROM_256KIB_RTC: u64 = 3;
+pub(super) const PROFILE_DMG_MBC3_ROM_1MIB_RTC: u64 = 4;
+const PROFILE_CODE_COUNT: u64 = 5;
 pub(super) const BUS_ADDRESS_OFFSET: usize = 1 + TRACE_BUS_KIND_BITS;
 pub(super) const BUS_PHYSICAL_ADDRESS_OFFSET: usize = BUS_ADDRESS_OFFSET + 1;
 pub(super) const BUS_BEFORE_OFFSET: usize = BUS_ADDRESS_OFFSET + 2;
@@ -431,8 +436,8 @@ fn constrain_cpu_ranges(
     sink.push(enum_range(view.after(STATE_IME)?, 3))?;
     sink.push(enum_range(view.before(STATE_RUN_STATE)?, 4))?;
     sink.push(enum_range(view.after(STATE_RUN_STATE)?, 4))?;
-    sink.push(boolean(view.before(STATE_PROFILE)?))?;
-    sink.push(boolean(view.after(STATE_PROFILE)?))
+    sink.push(enum_range(view.before(STATE_PROFILE)?, PROFILE_CODE_COUNT))?;
+    sink.push(enum_range(view.after(STATE_PROFILE)?, PROFILE_CODE_COUNT))
 }
 
 fn constrain_mapper_ranges(
@@ -451,8 +456,14 @@ fn constrain_mapper_ranges(
         } else {
             view.after(state)?
         };
+        let profile = if bits == TRACE_BEFORE_ROM_BANK_BITS_START {
+            view.before(STATE_PROFILE)?
+        } else {
+            view.after(STATE_PROFILE)?
+        };
         sink.push(value - packed_bits(view, bits, 6)?)?;
         sink.push(zero_from_bits(view, bits, 6)?)?;
+        sink.push(profile_256kib_selector(profile)? * (value - packed_bits(view, bits, 4)?))?;
     }
     for (state, bits) in [
         (STATE_MBC3_RAM_RTC_SELECT, TRACE_BEFORE_RAM_RTC_BITS_START),
@@ -666,10 +677,45 @@ pub(super) fn boolean(value: NativeField) -> NativeField {
     value * (value - NativeField::from_u64(1))
 }
 
-fn enum_range(value: NativeField, count: u64) -> NativeField {
+pub(super) fn enum_range(value: NativeField, count: u64) -> NativeField {
     (0..count).fold(NativeField::from_u64(1), |product, admitted| {
         product * (value - NativeField::from_u64(admitted))
     })
+}
+
+pub(super) fn profile_code_selector(
+    profile: NativeField,
+    code: u64,
+) -> Result<NativeField, UniformError> {
+    let code_field = NativeField::from_u64(code);
+    let mut numerator = NativeField::from_u64(1);
+    let mut denominator = NativeField::from_u64(1);
+    for admitted in 0..PROFILE_CODE_COUNT {
+        if admitted == code {
+            continue;
+        }
+        let admitted_field = NativeField::from_u64(admitted);
+        numerator *= profile - admitted_field;
+        denominator *= code_field - admitted_field;
+    }
+    let inverse = denominator
+        .inverse()
+        .ok_or(UniformError::NonInvertibleInterpolation)?;
+    Ok(numerator * inverse)
+}
+
+pub(super) fn profile_256kib_selector(profile: NativeField) -> Result<NativeField, UniformError> {
+    Ok(
+        profile_code_selector(profile, PROFILE_DMG_MBC3_ROM_256KIB_NO_RTC)?
+            + profile_code_selector(profile, PROFILE_DMG_MBC3_ROM_256KIB_RTC)?,
+    )
+}
+
+pub(super) fn profile_rtc_selector(profile: NativeField) -> Result<NativeField, UniformError> {
+    Ok(
+        profile_code_selector(profile, PROFILE_DMG_MBC3_ROM_256KIB_RTC)?
+            + profile_code_selector(profile, PROFILE_DMG_MBC3_ROM_1MIB_RTC)?,
+    )
 }
 
 fn bus_slot_start(slot: usize) -> Result<usize, UniformError> {

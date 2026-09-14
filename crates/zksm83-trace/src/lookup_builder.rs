@@ -3,7 +3,7 @@
 use thiserror::Error;
 use zksm83_core::{
     BusEvent, BusWitness, LookupStepRelation, MachineProfile, RunState, StepError, StepInput,
-    VmState, WitnessRequest,
+    VmState, VmStateError, WitnessRequest,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogError, LogKind, MemoryRead, MemoryWrite, MerklePath, RomRead,
@@ -36,11 +36,30 @@ pub struct LookupTraceBuilder {
 impl LookupTraceBuilder {
     /// Starts the DMG/MBC3 relation from explicit externally authenticated roots.
     pub fn new_dmg_post_boot_mbc3(
+        rom: Vec<u8>,
+        memory: Vec<u8>,
+        private_input: Vec<u8>,
+        rom_root: CommitmentRoot,
+        memory_root_anchor: CommitmentRoot,
+    ) -> Result<Self, LookupTraceBuilderError> {
+        Self::new_dmg_post_boot_mbc3_profile(
+            rom,
+            memory,
+            private_input,
+            rom_root,
+            memory_root_anchor,
+            MachineProfile::DmgPostBootMbc3V1,
+        )
+    }
+
+    /// Starts the lookup-backed relation with an explicit DMG/MBC3 cartridge profile.
+    pub fn new_dmg_post_boot_mbc3_profile(
         mut rom: Vec<u8>,
         memory: Vec<u8>,
         private_input: Vec<u8>,
         rom_root: CommitmentRoot,
         memory_root_anchor: CommitmentRoot,
+        profile: MachineProfile,
     ) -> Result<Self, LookupTraceBuilderError> {
         if rom.is_empty() {
             return Err(LookupTraceBuilderError::EmptyRom);
@@ -62,7 +81,11 @@ impl LookupTraceBuilder {
             rom,
             memory,
             private_input,
-            state: VmState::dmg_post_boot_mbc3_initial(rom_root, memory_root_anchor),
+            state: VmState::dmg_post_boot_mbc3_profile_initial(
+                profile,
+                rom_root,
+                memory_root_anchor,
+            )?,
         })
     }
 
@@ -92,7 +115,7 @@ impl LookupTraceBuilder {
                 expected: MEMORY_BYTES,
             });
         }
-        if state.profile() != MachineProfile::DmgPostBootMbc3V1 {
+        if !state.profile().is_dmg_post_boot_mbc3() {
             return Err(LookupTraceBuilderError::CheckpointProfileMismatch);
         }
         if state.bus_transcript().next_index() != 0 || state.isa_transcript().next_index() != 0 {
@@ -522,6 +545,9 @@ pub enum LookupTraceBuilderError {
     /// The pure transition relation rejected the byte-array witness.
     #[error(transparent)]
     Step(#[from] StepError),
+    /// VM state construction rejected the selected profile.
+    #[error(transparent)]
+    State(#[from] VmStateError),
     /// An accepted write disagreed with the backing byte array.
     #[error("lookup memory effect diverged from its backing table")]
     MemoryEffectDivergence,

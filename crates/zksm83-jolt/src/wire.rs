@@ -226,6 +226,17 @@ impl Wire for AkitaBatchedProof<NativeField, NativeField> {
     }
 }
 
+impl Wire for u64 {
+    fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
+        writer.u64(*self);
+        Ok(())
+    }
+
+    fn decode(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        reader.u64()
+    }
+}
+
 fn encode_akita<T: AkitaSerialize>(value: &T, writer: &mut WireWriter) -> Result<(), WireError> {
     let mut bytes = Vec::new();
     value.serialize_compressed(&mut bytes)?;
@@ -317,7 +328,10 @@ wire_struct!(ExecutionLookupProof {
     trace_cycle_opening,
     trace_address_opening,
 });
-wire_struct!(RomCommitment { inner });
+wire_struct!(RomCommitment {
+    logical_byte_length,
+    inner,
+});
 wire_struct!(RomLookupProof {
     claimed_output,
     table_sumcheck,

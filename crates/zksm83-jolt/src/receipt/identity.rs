@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     AKITA_LOG_SCHEDULE_SHA256, AKITA_MEMORY_SCHEDULE_SHA256, AKITA_ROM_SCHEDULE_SHA256,
     MEMORY_IMAGE_BYTES, MemoryCommitment, NativeProtocolVersion, NativeStateBoundary,
-    PackedBlockProofError, ProtocolLogCommitments, ROM_IMAGE_BYTES, RomCommitment,
-    STATE_SCALAR_COUNT, backend_identity_for,
+    PackedBlockProofError, ProtocolLogCommitments, ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES,
+    RomCommitment, STATE_SCALAR_COUNT, backend_identity_for,
 };
 
 use super::{NativeReceiptError, NativeStatement};
@@ -18,6 +18,9 @@ const OUTPUT_CURSOR_SCALAR: usize = 17;
 const BUS_CURSOR_SCALAR: usize = 18;
 const ISA_CURSOR_SCALAR: usize = 19;
 const DMG_POST_BOOT_MBC3_V1: u64 = 1;
+const DMG_POST_BOOT_MBC3_ROM_256KIB_NO_RTC_V1: u64 = 2;
+const DMG_POST_BOOT_MBC3_ROM_256KIB_RTC_V1: u64 = 3;
+const DMG_POST_BOOT_MBC3_ROM_1MIB_RTC_V1: u64 = 4;
 
 const IDENTITY_DOMAIN_V2: &[u8] = b"zksm83/native-commitment-identity/v2";
 const LAYOUT_DOMAIN_V2: &[u8] = b"zksm83/native-layout-identity/v2";
@@ -445,7 +448,7 @@ impl NativeBoundary {
 
     pub(crate) fn machine_profile(&self) -> Result<u64, NativeReceiptError> {
         let profile = self.scalar(PROFILE_SCALAR)?;
-        if profile != DMG_POST_BOOT_MBC3_V1 {
+        if !is_supported_native_machine_profile(profile) {
             return Err(NativeReceiptError::UnsupportedProfile);
         }
         Ok(profile)
@@ -528,10 +531,11 @@ pub(super) fn direct_rom_identity_for(
     protocol: NativeProtocolVersion,
     commitment: &RomCommitment,
 ) -> Result<CommitmentIdentity, NativeReceiptError> {
+    commitment.validate().map_err(NativeCpuErrorMap::rom)?;
     direct_identity(
         protocol,
         CommitmentKind::Rom,
-        u64::try_from(ROM_IMAGE_BYTES).map_err(|_| NativeReceiptError::Counter)?,
+        commitment.logical_byte_length(),
         &commitment
             .canonical_bytes()
             .map_err(NativeCpuErrorMap::rom)?,
@@ -635,6 +639,28 @@ pub(super) fn checked_delta(initial: u64, final_value: u64) -> Result<u64, Nativ
     final_value
         .checked_sub(initial)
         .ok_or(NativeReceiptError::Counter)
+}
+
+pub(super) const fn is_supported_native_machine_profile(profile: u64) -> bool {
+    matches!(
+        profile,
+        DMG_POST_BOOT_MBC3_V1
+            | DMG_POST_BOOT_MBC3_ROM_256KIB_NO_RTC_V1
+            | DMG_POST_BOOT_MBC3_ROM_256KIB_RTC_V1
+            | DMG_POST_BOOT_MBC3_ROM_1MIB_RTC_V1
+    )
+}
+
+pub(super) fn rom_byte_length_for_machine_profile(profile: u64) -> Result<u64, NativeReceiptError> {
+    match profile {
+        DMG_POST_BOOT_MBC3_V1 | DMG_POST_BOOT_MBC3_ROM_1MIB_RTC_V1 => {
+            u64::try_from(ROM_IMAGE_BYTES).map_err(|_| NativeReceiptError::Counter)
+        }
+        DMG_POST_BOOT_MBC3_ROM_256KIB_NO_RTC_V1 | DMG_POST_BOOT_MBC3_ROM_256KIB_RTC_V1 => {
+            u64::try_from(ROM_256KIB_IMAGE_BYTES).map_err(|_| NativeReceiptError::Counter)
+        }
+        _ => Err(NativeReceiptError::UnsupportedProfile),
+    }
 }
 
 pub(super) fn backend_digest(protocol: NativeProtocolVersion) -> [u8; 32] {

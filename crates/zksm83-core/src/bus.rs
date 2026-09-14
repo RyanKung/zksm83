@@ -7,7 +7,7 @@ use zksm83_memory::{
     dmg_owner, owner,
 };
 
-use crate::{DmgInterrupt, MachineProfile, StepError, VmState};
+use crate::{DmgInterrupt, Mbc3ExternalWindow, StepError, VmState};
 
 /// Semantic role of an authenticated ROM read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -553,7 +553,10 @@ impl Executor {
     }
 
     pub(crate) fn fetch(&mut self, address: u16, role: BusRole) -> Result<u8, StepError> {
-        let physical_address = self.state.mbc3().map_rom(address);
+        let physical_address = self
+            .state
+            .mbc3()
+            .map_rom_for(self.state.profile().mbc3_cartridge_profile(), address);
         let read = self.take_rom_read(address, physical_address, role)?;
         let value = read.value;
         self.events.push(match role {
@@ -608,13 +611,22 @@ impl Executor {
     pub(crate) fn read_data(&mut self, address: u16) -> Result<u8, StepError> {
         self.require_cpu_dma_access(address)?;
         self.require_cpu_ppu_access(address)?;
-        if self.state.profile() == MachineProfile::DmgPostBootMbc3V1 && address == 0xff00 {
+        if self.state.profile().is_dmg_post_boot_mbc3() && address == 0xff00 {
             return self.read_dmg_joypad();
         }
         if (0xa000..=0xbfff).contains(&address) {
-            return match self.state.mbc3().map_ram(address) {
-                Some(physical_address) => self.read_memory(address, physical_address),
-                None => {
+            return match self
+                .state
+                .mbc3()
+                .external_window_for(self.state.profile().mbc3_cartridge_profile(), address)
+            {
+                Mbc3ExternalWindow::Ram(physical_address) => {
+                    self.read_memory(address, physical_address)
+                }
+                Mbc3ExternalWindow::RtcRegister(select) => {
+                    Err(StepError::Mbc3RtcRegisterUnavailable { select })
+                }
+                Mbc3ExternalWindow::Unavailable => {
                     let value = 0xff;
                     self.events
                         .push(BusEvent::Mbc3OpenBusRead { address, value });
@@ -637,15 +649,27 @@ impl Executor {
         self.require_cpu_dma_access(address)?;
         self.require_cpu_ppu_access(address)?;
         if address <= 0x7fff {
-            self.state.mbc3_mut().apply_control_write(address, value);
+            let profile = self.state.profile().mbc3_cartridge_profile();
+            self.state
+                .mbc3_mut()
+                .apply_control_write_for(profile, address, value);
             self.events
                 .push(BusEvent::Mbc3ControlWrite { address, value });
             return Ok(());
         }
         if (0xa000..=0xbfff).contains(&address) {
-            return match self.state.mbc3().map_ram(address) {
-                Some(physical_address) => self.write_memory(address, physical_address, value),
-                None => {
+            return match self
+                .state
+                .mbc3()
+                .external_window_for(self.state.profile().mbc3_cartridge_profile(), address)
+            {
+                Mbc3ExternalWindow::Ram(physical_address) => {
+                    self.write_memory(address, physical_address, value)
+                }
+                Mbc3ExternalWindow::RtcRegister(select) => {
+                    Err(StepError::Mbc3RtcRegisterUnavailable { select })
+                }
+                Mbc3ExternalWindow::Unavailable => {
                     self.events
                         .push(BusEvent::Mbc3IgnoredWrite { address, value });
                     Ok(())
@@ -713,7 +737,10 @@ impl Executor {
         }
         let value = match state_owner(self.state, source) {
             AddressOwner::Rom => {
-                let physical = self.state.mbc3().map_rom(source);
+                let physical = self
+                    .state
+                    .mbc3()
+                    .map_rom_for(self.state.profile().mbc3_cartridge_profile(), source);
                 let read = self.take_rom_read(source, physical, BusRole::DataRead)?;
                 let value = read.value;
                 self.events.push(BusEvent::DmgDmaRomRead(read));
@@ -721,10 +748,19 @@ impl Executor {
             }
             AddressOwner::Memory => {
                 let physical = if (0xa000..=0xbfff).contains(&source) {
-                    self.state
+                    match self
+                        .state
                         .mbc3()
-                        .map_ram(source)
-                        .ok_or(StepError::DmgDmaSourceUnavailable { address: source })?
+                        .external_window_for(self.state.profile().mbc3_cartridge_profile(), source)
+                    {
+                        Mbc3ExternalWindow::Ram(physical) => physical,
+                        Mbc3ExternalWindow::RtcRegister(select) => {
+                            return Err(StepError::Mbc3RtcRegisterUnavailable { select });
+                        }
+                        Mbc3ExternalWindow::Unavailable => {
+                            return Err(StepError::DmgDmaSourceUnavailable { address: source });
+                        }
+                    }
                 } else {
                     u32::from(source)
                 };
@@ -908,7 +944,7 @@ impl Executor {
     }
 
     fn require_cpu_dma_access(&self, address: u16) -> Result<(), StepError> {
-        if self.state.profile() == MachineProfile::DmgPostBootMbc3V1
+        if self.state.profile().is_dmg_post_boot_mbc3()
             && self.state.dmg_devices().dma_active()
             && !(0xff80..=0xfffe).contains(&address)
         {
@@ -918,7 +954,7 @@ impl Executor {
     }
 
     fn require_cpu_ppu_access(&self, address: u16) -> Result<(), StepError> {
-        if self.state.profile() != MachineProfile::DmgPostBootMbc3V1 {
+        if !self.state.profile().is_dmg_post_boot_mbc3() {
             return Ok(());
         }
         let devices = self.state.dmg_devices();
@@ -932,9 +968,10 @@ impl Executor {
 }
 
 const fn state_owner(state: VmState, address: u16) -> AddressOwner {
-    match state.profile() {
-        MachineProfile::CleanCoreV1 => owner(address),
-        MachineProfile::DmgPostBootMbc3V1 => dmg_owner(address),
+    if state.profile().is_dmg_post_boot_mbc3() {
+        dmg_owner(address)
+    } else {
+        owner(address)
     }
 }
 

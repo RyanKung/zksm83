@@ -12,17 +12,21 @@ use std::{
     time::Instant,
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
+use zksm83_core::{
+    CpuState, DmgDeviceState, MachineProfile, Mbc3CartridgeProfile, Mbc3RomSize, Mbc3RtcMode,
+    Mbc3State, VmState,
+};
 use zksm83_jolt::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BlockCpuError, BlockCpuWitness,
     CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
     MAX_NATIVE_STREAM_RECEIPT_BYTES, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
     NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness,
-    PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
-    native_backend_digest, native_proof_phase_metrics, verify_native_spool_reader,
+    PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES,
+    UNIFORM_ROW_COUNT, commit_memory, commit_rom, native_backend_digest,
+    native_proof_phase_metrics, verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -44,7 +48,6 @@ const EXPECTED_CHECKPOINT_SCHEMA: &str = "zksm83-trace-checkpoint/v7";
 const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v5";
 const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v5";
 const INPUT_SCHEDULE_SCHEMA: &str = "zksm83-input-schedule/v1";
-const ROM_BYTE_LENGTH: usize = 1 << 20;
 const MAX_ROM_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_INPUT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -53,9 +56,15 @@ const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "zksm83-native-prover", version)]
 struct Args {
-    /// Exact one-MiB no-RTC MBC3 ROM image.
+    /// Supported MBC3 ROM image.
     #[arg(long)]
     rom: PathBuf,
+    /// Logical ROM profile size.
+    #[arg(long, value_enum, default_value_t = RomSizeArg::Auto)]
+    rom_size: RomSizeArg,
+    /// RTC-capable cartridge profile selection.
+    #[arg(long, value_enum, default_value_t = RtcArg::Auto)]
+    rtc: RtcArg,
     /// Raw private input or a versioned JSON input schedule.
     #[arg(long)]
     input: PathBuf,
@@ -89,6 +98,28 @@ struct Args {
         conflicts_with_all = ["resume", "segment_limit", "preflight_only"]
     )]
     inspect_progress_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RomSizeArg {
+    Auto,
+    #[value(name = "256k", alias = "256kib")]
+    Rom256KiB,
+    #[value(name = "1m", alias = "1mib")]
+    Rom1MiB,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RtcArg {
+    Auto,
+    Off,
+    On,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CartridgeSelection {
+    profile: Mbc3CartridgeProfile,
+    machine_profile: MachineProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +275,7 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<(), CliError> {
     let rom_bytes = read_bounded(&args.rom, "ROM", MAX_ROM_FILE_BYTES)?;
+    let cartridge = resolve_cartridge_selection(&args, &rom_bytes)?;
     let input = load_input(&args.input)?;
     let expected_bytes = read_bounded(
         &args.expected_checkpoint,
@@ -251,14 +283,14 @@ fn run(args: Args) -> Result<(), CliError> {
         MAX_CHECKPOINT_FILE_BYTES,
     )?;
     let expected: ExpectedCheckpoint = serde_json::from_slice(&expected_bytes)?;
-    validate_expected_artifact(&expected, &rom_bytes)?;
+    validate_expected_artifact(&expected, &rom_bytes, cartridge)?;
     let identities = InputIdentities {
         rom: sha256(&rom_bytes),
         input: sha256(&input),
         expected: sha256(&expected_bytes),
     };
     if args.preflight_only {
-        return preflight(&expected, &rom_bytes, &input, identities);
+        return preflight(&expected, &rom_bytes, &input, identities, cartridge);
     }
     let committed_rom = commit_rom(&rom_bytes)?;
     if args.inspect_progress_only {
@@ -278,7 +310,7 @@ fn run(args: Args) -> Result<(), CliError> {
     let (mut builder, mut initial_memory, completed, mut prover) = if args.resume {
         resume(&args, &rom_bytes, &input, identities, &committed_rom)?
     } else {
-        start(&args, &rom_bytes, &input, &committed_rom)?
+        start(&args, &rom_bytes, &input, &committed_rom, cartridge)?
     };
     let completed_steps = prove_segments(
         &args,
@@ -383,6 +415,7 @@ fn preflight(
     rom_bytes: &[u8],
     input: &[u8],
     identities: InputIdentities,
+    cartridge: CartridgeSelection,
 ) -> Result<(), CliError> {
     let capacity = u64::try_from(UNIFORM_ROW_COUNT)
         .map_err(|_| CliError::ProgressMismatch("segment capacity overflow"))?;
@@ -405,13 +438,16 @@ fn preflight(
     let memory_bytes = hex::decode(&expected.memory_hex)?;
     let memory_witness_root = MemoryImage::from_checkpoint_bytes(memory_bytes)?.root();
     println!(
-        "preflight=true receipt_version={} protocol_id={} proof_composition_revision={} backend_digest_sha256={} trace_schedule_sha256={} auxiliary_schedule_sha256={} steps={} relation_row_capacity={} worst_case_segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
+        "preflight=true receipt_version={} protocol_id={} proof_composition_revision={} backend_digest_sha256={} trace_schedule_sha256={} auxiliary_schedule_sha256={} machine_profile_code={} rom_bytes={} rtc_mode={:?} steps={} relation_row_capacity={} worst_case_segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
         NATIVE_RECEIPT_VERSION,
         PROTOCOL_ID,
         PROOF_COMPOSITION_REVISION_V2,
         hex::encode(native_backend_digest()),
         AKITA_SCHEDULE_SHA256,
         AKITA_AUXILIARY_SCHEDULE_SHA256,
+        cartridge.machine_profile.code(),
+        cartridge.profile.rom_size().byte_length(),
+        cartridge.profile.rtc(),
         expected.completed_steps,
         capacity,
         worst_case_segment_count,
@@ -431,6 +467,53 @@ struct InputIdentities {
     rom: [u8; 32],
     input: [u8; 32],
     expected: [u8; 32],
+}
+
+fn resolve_cartridge_selection(
+    args: &Args,
+    rom_bytes: &[u8],
+) -> Result<CartridgeSelection, CliError> {
+    let rom_size = resolve_rom_size(args.rom_size, rom_bytes.len())?;
+    let rtc = resolve_rtc_mode(args.rtc, rom_bytes);
+    let profile = Mbc3CartridgeProfile::new(rom_size, rtc);
+    Ok(CartridgeSelection {
+        profile,
+        machine_profile: MachineProfile::dmg_post_boot_for_cartridge(profile),
+    })
+}
+
+fn resolve_rom_size(selection: RomSizeArg, byte_length: usize) -> Result<Mbc3RomSize, CliError> {
+    match selection {
+        RomSizeArg::Auto => match byte_length {
+            ROM_256KIB_IMAGE_BYTES => Ok(Mbc3RomSize::Rom256KiB),
+            ROM_IMAGE_BYTES => Ok(Mbc3RomSize::Rom1MiB),
+            _ => Err(CliError::EndpointMismatch("unsupported ROM byte length")),
+        },
+        RomSizeArg::Rom256KiB if byte_length == ROM_256KIB_IMAGE_BYTES => {
+            Ok(Mbc3RomSize::Rom256KiB)
+        }
+        RomSizeArg::Rom1MiB if byte_length == ROM_IMAGE_BYTES => Ok(Mbc3RomSize::Rom1MiB),
+        RomSizeArg::Rom256KiB | RomSizeArg::Rom1MiB => Err(CliError::EndpointMismatch(
+            "ROM byte length does not match --rom-size",
+        )),
+    }
+}
+
+fn resolve_rtc_mode(selection: RtcArg, rom_bytes: &[u8]) -> Mbc3RtcMode {
+    match selection {
+        RtcArg::Auto => header_rtc_mode(rom_bytes).unwrap_or(Mbc3RtcMode::NoRtc),
+        RtcArg::Off => Mbc3RtcMode::NoRtc,
+        RtcArg::On => Mbc3RtcMode::RtcCapable,
+    }
+}
+
+fn header_rtc_mode(rom_bytes: &[u8]) -> Option<Mbc3RtcMode> {
+    let cartridge_type = *rom_bytes.get(0x0147)?;
+    match cartridge_type {
+        0x0f | 0x10 => Some(Mbc3RtcMode::RtcCapable),
+        0x11..=0x13 => Some(Mbc3RtcMode::NoRtc),
+        _ => None,
+    }
 }
 
 type FileProver<'a> = NativeReceiptStreamProver<'a, File>;
@@ -474,17 +557,19 @@ fn start<'a>(
     rom_bytes: &[u8],
     input: &[u8],
     committed_rom: &'a zksm83_jolt::CommittedRom,
+    cartridge: CartridgeSelection,
 ) -> Result<(TraceBuilder, CommittedMemory, u64, FileProver<'a>), CliError> {
     require_absent(&args.spool)?;
     require_absent(&args.progress_checkpoint)?;
     let memory = MemoryImage::zeroed()?;
     let memory_bytes = memory.checkpoint_bytes();
     let initial_memory = commit_memory(&memory_bytes)?;
-    let builder = TraceBuilder::new_dmg_post_boot_mbc3(
+    let builder = TraceBuilder::new_dmg_post_boot_mbc3_profile(
         RomImage::new(rom_bytes.to_vec())?,
         memory,
         input.to_vec(),
-    );
+        cartridge.machine_profile,
+    )?;
     let spool = open_new(&args.spool)?;
     let prover = NativeReceiptStreamProver::new(committed_rom, spool)?;
     Ok((builder, initial_memory, 0, prover))
@@ -808,6 +893,7 @@ fn finalize(args: &Args, prover: FileProver<'_>) -> Result<(), CliError> {
 fn validate_expected_artifact(
     expected: &ExpectedCheckpoint,
     rom_bytes: &[u8],
+    cartridge: CartridgeSelection,
 ) -> Result<(), CliError> {
     if expected.schema != EXPECTED_CHECKPOINT_SCHEMA {
         return Err(CliError::ExpectedSchema(expected.schema.clone()));
@@ -815,9 +901,21 @@ fn validate_expected_artifact(
     if expected.completed_steps == 0 {
         return Err(CliError::EndpointMismatch("zero relation steps"));
     }
-    if rom_bytes.len() != ROM_BYTE_LENGTH {
+    if rom_bytes.len() != cartridge.profile.rom_size().byte_length() {
         return Err(CliError::EndpointMismatch("ROM byte length"));
     }
+    if expected.state.profile != cartridge.machine_profile {
+        return Err(CliError::EndpointMismatch(
+            "expected checkpoint machine profile",
+        ));
+    }
+    Mbc3State::from_profile_parts(
+        cartridge.profile,
+        expected.state.mbc3.ram_enabled(),
+        expected.state.mbc3.rom_bank(),
+        expected.state.mbc3.ram_rtc_select(),
+    )
+    .map_err(|_| CliError::EndpointMismatch("expected MBC3 state profile"))?;
     let rom = RomImage::new(rom_bytes.to_vec())?;
     let _rom_witness_auth_root = rom.root();
     let memory_bytes = hex::decode(&expected.memory_hex)?;

@@ -9,8 +9,8 @@ use zksm83_memory::{
 };
 
 use crate::{
-    BusRole, DmgInterrupt, ImeState, MachineProfile, RunState, StepEffects, StepInput, StepKind,
-    VmState, VmStateError, WitnessKind, WitnessRequest,
+    BusRole, DmgInterrupt, ImeState, RunState, StepEffects, StepInput, StepKind, VmState,
+    VmStateError, WitnessKind, WitnessRequest,
     bus::{BusAuthentication, Executor},
     execute::{ImmediateBytes, execute},
 };
@@ -45,7 +45,7 @@ fn apply(
     input: StepInput,
     authentication: BusAuthentication,
 ) -> Result<(VmState, StepEffects), StepError> {
-    if state.profile() == MachineProfile::DmgPostBootMbc3V1 {
+    if state.profile().is_dmg_post_boot_mbc3() {
         if state.dmg_devices().dma_owed() != 0 {
             return dma_byte(state, input, authentication);
         }
@@ -182,6 +182,12 @@ pub enum StepError {
     /// Mutable-memory authentication failed.
     #[error(transparent)]
     MemoryAuthentication(#[from] MemoryTranscriptError),
+    /// The cartridge profile admits RTC headers, but this VM has no RTC register state yet.
+    #[error("MBC3 RTC register 0x{select:02x} is selected, but RTC execution is unsupported")]
+    Mbc3RtcRegisterUnavailable {
+        /// Selected RTC register number.
+        select: u8,
+    },
     /// Ordered input or output commitment could not advance.
     #[error(transparent)]
     LogCommitment(#[from] LogError),

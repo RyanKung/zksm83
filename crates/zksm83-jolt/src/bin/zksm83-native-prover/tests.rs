@@ -2,12 +2,16 @@ use super::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BASIC_BLOCK_INSTRUCTION_BOUND,
     CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, InputIdentities,
     MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
-    PROGRESS_SCHEMA, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ProverProgress, ROM_BYTE_LENGTH,
+    PROGRESS_SCHEMA, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ProverProgress, RtcArg,
     SpoolRecovery, UNIFORM_ROW_COUNT, fill_packed_segment_with_capacity, native_backend_digest,
-    spool_recovery, validate_endpoint, validate_expected_artifact, validate_progress,
-    validate_verified_counters,
+    resolve_cartridge_selection, spool_recovery, validate_endpoint, validate_expected_artifact,
+    validate_progress, validate_verified_counters,
 };
-use zksm83_core::{CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3State, VmState};
+use zksm83_core::{
+    CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3CartridgeProfile, Mbc3RomSize,
+    Mbc3RtcMode, Mbc3State, VmState,
+};
+use zksm83_jolt::ROM_IMAGE_BYTES;
 use zksm83_memory::{CommitmentRoot, LogAccumulator, LogKind, MemoryImage, RomImage};
 
 #[test]
@@ -31,8 +35,29 @@ fn legacy_roots_do_not_override_exact_native_endpoint_checks()
 #[test]
 fn preflight_rejects_a_short_rom() -> Result<(), Box<dyn std::error::Error>> {
     let (expected, _, _, _, _) = fixture()?;
-    assert!(validate_expected_artifact(&expected, &[0]).is_err());
+    let cartridge = super::CartridgeSelection {
+        profile: Mbc3CartridgeProfile::one_mib_no_rtc(),
+        machine_profile: MachineProfile::DmgPostBootMbc3V1,
+    };
+    assert!(validate_expected_artifact(&expected, &[0], cartridge).is_err());
     Ok(())
+}
+
+#[test]
+fn auto_cartridge_selection_accepts_gbstudio_mbc3_timer_rom() {
+    let mut args = fixture_args();
+    args.rtc = RtcArg::Auto;
+    let mut rom = vec![0_u8; 256 * 1024];
+    rom[0x0147] = 0x10;
+    let cartridge = resolve_cartridge_selection(&args, &rom).unwrap();
+    assert_eq!(
+        cartridge.profile,
+        Mbc3CartridgeProfile::new(Mbc3RomSize::Rom256KiB, Mbc3RtcMode::RtcCapable)
+    );
+    assert_eq!(
+        cartridge.machine_profile,
+        MachineProfile::DmgPostBootMbc3Rom256KiBRtcV1
+    );
 }
 
 #[test]
@@ -162,7 +187,7 @@ fn packed_segment_fills_rows_without_exceeding_raw_step_bound()
 }
 
 fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
-    let rom = vec![0_u8; ROM_BYTE_LENGTH];
+    let rom = vec![0_u8; ROM_IMAGE_BYTES];
     let rom_root = RomImage::new(rom.clone())?.root();
     let memory_image = MemoryImage::zeroed()?;
     let memory = memory_image.checkpoint_bytes();
@@ -199,3 +224,21 @@ fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
 }
 
 type Fixture = (ExpectedCheckpoint, VmState, Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn fixture_args() -> super::Args {
+    super::Args {
+        rom: "rom.gb".into(),
+        rom_size: super::RomSizeArg::Auto,
+        rtc: RtcArg::Auto,
+        input: "input.bin".into(),
+        expected_checkpoint: "expected.json".into(),
+        spool: "proof.spool".into(),
+        progress_checkpoint: "progress.json".into(),
+        receipt: "receipt.bin".into(),
+        statement: "statement.bin".into(),
+        resume: false,
+        segment_limit: None,
+        preflight_only: false,
+        inspect_progress_only: false,
+    }
+}

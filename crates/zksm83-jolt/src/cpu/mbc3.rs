@@ -9,7 +9,8 @@ use crate::{
 use super::{
     BUS_AUXILIARY_OFFSET, BUS_BEFORE_OFFSET, BUS_INDEX_OFFSET, BUS_PHYSICAL_ADDRESS_OFFSET,
     BUS_VALUE_OFFSET, ConstraintSink, RowView, STATE_MBC3_RAM_ENABLED, STATE_MBC3_RAM_RTC_SELECT,
-    STATE_MBC3_ROM_BANK, boolean, bus_field, packed_bits, zero_from_bits,
+    STATE_MBC3_ROM_BANK, STATE_PROFILE, boolean, bus_field, packed_bits, profile_256kib_selector,
+    profile_rtc_selector, zero_from_bits,
 };
 
 pub(super) fn constrain_mapper_and_rom(
@@ -30,6 +31,8 @@ fn constrain_external_ram_policy(
     let select_bits = TRACE_BEFORE_RAM_RTC_BITS_START;
     let available =
         ram_enabled * (one - view.value(select_bits + 2)?) * (one - view.value(select_bits + 3)?);
+    let rtc_register_selected = rtc_register_selected(view, select_bits)?;
+    let rtc_profile = profile_rtc_selector(view.before(STATE_PROFILE)?)?;
     for slot in 0..TRACE_BUS_SLOTS {
         let open_read = view.bus_kind_selector(slot, 9)?;
         let ignored_write = view.bus_kind_selector(slot, 10)?;
@@ -43,6 +46,7 @@ fn constrain_external_ram_policy(
         sink.push(selected * bus_field(view, slot, BUS_BEFORE_OFFSET)?)?;
         sink.push(selected * bus_field(view, slot, BUS_AUXILIARY_OFFSET)?)?;
         sink.push(selected * bus_field(view, slot, BUS_INDEX_OFFSET)?)?;
+        sink.push(selected * rtc_profile * rtc_register_selected)?;
         sink.push(
             open_read * (bus_field(view, slot, BUS_VALUE_OFFSET)? - NativeField::from_u64(0xff)),
         )?;
@@ -132,5 +136,38 @@ fn ram_enable_value(view: &RowView<'_>, value_bits: usize) -> Result<NativeField
 }
 
 fn mapped_rom_bank(view: &RowView<'_>, value_bits: usize) -> Result<NativeField, UniformError> {
-    Ok(packed_bits(view, value_bits, 6)? + zero_from_bits(view, value_bits, 6)?)
+    let one = NativeField::from_u64(1);
+    let size_256kib = profile_256kib_selector(view.before(STATE_PROFILE)?)?;
+    let one_mib_bank = packed_bits(view, value_bits, 6)? + zero_from_bits(view, value_bits, 6)?;
+    let smaller_bank = packed_bits(view, value_bits, 4)? + zero_from_bits(view, value_bits, 4)?;
+    Ok(size_256kib * smaller_bank + (one - size_256kib) * one_mib_bank)
+}
+
+fn rtc_register_selected(
+    view: &RowView<'_>,
+    select_bits: usize,
+) -> Result<NativeField, UniformError> {
+    let mut selected = NativeField::from_u64(0);
+    for register in 0x08..=0x0c {
+        selected += nibble_selector(view, select_bits, register)?;
+    }
+    Ok(selected)
+}
+
+fn nibble_selector(
+    view: &RowView<'_>,
+    select_bits: usize,
+    value: u8,
+) -> Result<NativeField, UniformError> {
+    let one = NativeField::from_u64(1);
+    let mut product = one;
+    for bit in 0..4 {
+        let witness = view.value(select_bits + bit)?;
+        product *= if value & (1 << bit) == 0 {
+            one - witness
+        } else {
+            witness
+        };
+    }
+    Ok(product)
 }

@@ -6,7 +6,8 @@ use zksm83_trace::{BASIC_BLOCK_BUS_EVENT_BOUND, BASIC_BLOCK_INSTRUCTION_BOUND};
 use super::{
     ConstraintSink, RowView, STATE_FLAGS, STATE_IME, STATE_MBC3_RAM_ENABLED,
     STATE_MBC3_RAM_RTC_SELECT, STATE_MBC3_ROM_BANK, STATE_PC, STATE_PROFILE, STATE_RUN_STATE,
-    STATE_SP, boolean, constrain_bit_range, enum_range, packed_bits, zero_from_bits,
+    STATE_SP, boolean, constrain_bit_range, enum_range, packed_bits, profile_256kib_selector,
+    zero_from_bits,
 };
 use crate::{
     BLOCK_CONTROL_COLUMN_COUNT, BLOCK_FRONTEND_COLUMN_COUNT, BLOCK_ISA_CONTROL_COLUMN_COUNT,
@@ -37,7 +38,7 @@ use crate::{
 };
 
 const CPU_BOUNDARY_RANGE_CONSTRAINT_COUNT: usize = 113;
-const MAPPER_BOUNDARY_RANGE_CONSTRAINT_COUNT: usize = 14;
+const MAPPER_BOUNDARY_RANGE_CONSTRAINT_COUNT: usize = 15;
 pub(crate) const PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT: usize =
     CPU_BOUNDARY_RANGE_CONSTRAINT_COUNT + MAPPER_BOUNDARY_RANGE_CONSTRAINT_COUNT;
 pub(crate) const PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT: usize =
@@ -46,8 +47,8 @@ pub(crate) const PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT: usize =
     (BASIC_BLOCK_INSTRUCTION_BOUND + 1) * PACKED_CPU_BOUNDARY_CONSTRAINT_COUNT;
 pub(crate) const PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT: usize = PACKED_CPU_BUS_MATCH_COLUMN_COUNT;
 
-const _: () = assert!(PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT == 254);
-const _: () = assert!(PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT == 635);
+const _: () = assert!(PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT == 256);
+const _: () = assert!(PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT == 640);
 const _: () = assert!(PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT == 60);
 
 pub(super) struct PackedProjection<'a> {
@@ -380,7 +381,7 @@ fn constrain_cpu_boundary(
     }
     sink.push(enum_range(state_value(view, after, STATE_IME)?, 3))?;
     sink.push(enum_range(state_value(view, after, STATE_RUN_STATE)?, 4))?;
-    sink.push(boolean(state_value(view, after, STATE_PROFILE)?))
+    sink.push(enum_range(state_value(view, after, STATE_PROFILE)?, 5))
 }
 
 fn constrain_mapper_boundary(
@@ -403,6 +404,10 @@ fn constrain_mapper_boundary(
     constrain_bit_range(view, sink, rom_bits, 6)?;
     sink.push(state_value(view, after, STATE_MBC3_ROM_BANK)? - packed_bits(view, rom_bits, 6)?)?;
     sink.push(zero_from_bits(view, rom_bits, 6)?)?;
+    sink.push(
+        profile_256kib_selector(state_value(view, after, STATE_PROFILE)?)?
+            * (state_value(view, after, STATE_MBC3_ROM_BANK)? - packed_bits(view, rom_bits, 4)?),
+    )?;
     constrain_bit_range(view, sink, select_bits, 4)?;
     sink.push(
         state_value(view, after, STATE_MBC3_RAM_RTC_SELECT)? - packed_bits(view, select_bits, 4)?,

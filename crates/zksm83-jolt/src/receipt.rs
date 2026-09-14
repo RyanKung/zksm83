@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::{
     BlockCpuWitness, CommittedMemory, CommittedRom, MemoryCommitment, NativeExecutionClaim,
     NativeProtocolVersion, NativeStateBoundary, PackedBlockProof, PackedBlockProofError,
-    PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError, ROM_IMAGE_BYTES,
-    RomCommitment, UNIFORM_ROW_COUNT, commit_packed_protocol_logs, prove_packed_block_components,
+    PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError, RomCommitment,
+    UNIFORM_ROW_COUNT, commit_packed_protocol_logs, prove_packed_block_components,
 };
 
 pub use identity::{
@@ -22,7 +22,7 @@ pub use identity::{
 
 use self::identity::{
     backend_digest, checked_delta, direct_memory_identity, direct_memory_identity_for,
-    direct_rom_identity, direct_rom_identity_for,
+    direct_rom_identity, direct_rom_identity_for, rom_byte_length_for_machine_profile,
 };
 use self::wire::{decode_receipt, decode_statement, encode_receipt, encode_statement};
 
@@ -144,7 +144,7 @@ pub enum NativeReceiptError {
     /// The bounded receipt worker panicked and its result was rejected.
     #[error("native receipt proof worker terminated unexpectedly")]
     WorkerPanicked,
-    /// The proof only supports the frozen DMG post-boot MBC3 profile.
+    /// The proof only supports declared DMG post-boot MBC3 profiles.
     #[error("native receipt machine profile is unsupported")]
     UnsupportedProfile,
     /// Protocol-log commitment construction or identity validation failed.
@@ -190,7 +190,7 @@ impl NativeStatement {
         self.machine_profile
     }
 
-    /// Returns the typed one-MiB ROM identity.
+    /// Returns the typed logical ROM identity.
     #[must_use]
     pub const fn rom(&self) -> &CommitmentIdentity {
         &self.rom
@@ -291,8 +291,7 @@ impl NativeStatement {
             protocol,
             backend_digest: backend_digest(protocol),
             machine_profile,
-            rom_byte_length: u64::try_from(ROM_IMAGE_BYTES)
-                .map_err(|_| NativeReceiptError::Counter)?,
+            rom_byte_length: rom.committed_length(),
             rom,
             initial,
             final_boundary,
@@ -314,11 +313,11 @@ impl NativeStatement {
         }
         let maximum =
             u64::try_from(MAX_NATIVE_SEGMENT_COUNT).map_err(|_| NativeReceiptError::Counter)?;
-        if self.backend_digest != backend_digest(self.protocol)
-            || self.rom_byte_length
-                != u64::try_from(ROM_IMAGE_BYTES).map_err(|_| NativeReceiptError::Counter)?
-        {
+        if self.backend_digest != backend_digest(self.protocol) {
             return Err(NativeReceiptError::UnsupportedBackend);
+        }
+        if self.rom_byte_length != rom_byte_length_for_machine_profile(self.machine_profile)? {
+            return Err(NativeReceiptError::InvalidStatement);
         }
         let maximum_transitions = self
             .relation_row_count

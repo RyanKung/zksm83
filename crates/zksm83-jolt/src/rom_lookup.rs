@@ -1,6 +1,7 @@
-//! PCS-bound Shout lookup for the statement-scoped one-MiB cartridge ROM.
+//! PCS-bound Shout lookup for the statement-scoped MBC3 cartridge ROM.
 
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -19,8 +20,10 @@ use crate::{
     },
 };
 
-/// Number of bytes in the current one-MiB MBC3 cartridge profile.
+/// Number of bytes in the padded one-MiB immutable-ROM lookup table.
 pub const ROM_IMAGE_BYTES: usize = 1 << ROM_ADDRESS_BIT_COUNT;
+/// Number of bytes in the supported 256-KiB MBC3 cartridge profile.
+pub const ROM_256KIB_IMAGE_BYTES: usize = 256 * 1024;
 /// Number of least-significant-bit-first physical ROM address columns.
 pub const ROM_ADDRESS_BIT_COUNT: usize = 20;
 
@@ -54,9 +57,10 @@ pub struct CommittedRom {
     commitment: RomCommitment,
 }
 
-/// Verifier-visible commitment to the exact one-MiB cartridge image.
+/// Verifier-visible commitment to the logical cartridge image and padded ROM table.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RomCommitment {
+    pub(crate) logical_byte_length: u64,
     pub(crate) inner: ColumnCommitments,
 }
 
@@ -77,13 +81,11 @@ pub struct RomLookupProof {
 /// Invalid ROM image, lookup layout, proof, or backend operation.
 #[derive(Debug, Error)]
 pub enum RomLookupError {
-    /// The cartridge image is not exactly one MiB.
-    #[error("ROM image has {actual} bytes, expected {expected}")]
+    /// The cartridge image is not one of the supported logical profile sizes.
+    #[error("ROM image has {actual} bytes; expected 262144 or 1048576")]
     InvalidRomLength {
         /// Supplied image length.
         actual: usize,
-        /// Required image length.
-        expected: usize,
     },
     /// Selector, address-bit, and value columns are invalid or overlap.
     #[error("native ROM lookup column layout is invalid")]
@@ -192,40 +194,75 @@ impl CommittedRom {
     pub const fn commitment(&self) -> &RomCommitment {
         &self.commitment
     }
+
+    /// Returns the statement-bound logical ROM byte length.
+    #[must_use]
+    pub const fn logical_byte_length(&self) -> u64 {
+        self.commitment.logical_byte_length
+    }
 }
 
 impl RomCommitment {
+    /// Returns the statement-bound logical ROM byte length.
+    #[must_use]
+    pub const fn logical_byte_length(&self) -> u64 {
+        self.logical_byte_length
+    }
+
     /// Returns the canonical protocol encoding of this ROM commitment.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RomLookupError> {
-        self.inner.canonical_bytes(ROM_LAYOUT).map_err(Into::into)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.logical_byte_length.to_le_bytes());
+        bytes.extend_from_slice(&self.inner.canonical_bytes(ROM_LAYOUT)?);
+        Ok(bytes)
     }
 
     /// Returns SHA-256 of the canonical ROM commitment encoding.
     pub fn digest(&self) -> Result<[u8; 32], RomLookupError> {
-        self.inner.digest(ROM_LAYOUT).map_err(Into::into)
+        Ok(Sha256::digest(self.canonical_bytes()?).into())
     }
 
-    fn validate(&self) -> Result<(), RomLookupError> {
+    pub(crate) fn validate(&self) -> Result<(), RomLookupError> {
+        let length = usize::try_from(self.logical_byte_length)
+            .map_err(|_| RomLookupError::InvalidRomLength { actual: usize::MAX })?;
+        validate_rom_length(length)?;
         self.inner.validate(ROM_LAYOUT).map_err(Into::into)
     }
 }
 
-/// Commits the exact one-MiB cartridge ROM used by a public statement.
+/// Commits a supported logical cartridge ROM, padded to the one-MiB lookup table.
 pub fn commit_rom(image: &[u8]) -> Result<CommittedRom, RomLookupError> {
-    if image.len() != ROM_IMAGE_BYTES {
-        return Err(RomLookupError::InvalidRomLength {
-            actual: image.len(),
-            expected: ROM_IMAGE_BYTES,
-        });
-    }
+    validate_rom_length(image.len())?;
     on_worker(|| {
-        let column = image.iter().copied().map(u64::from).collect::<Vec<_>>();
+        let logical_byte_length =
+            u64::try_from(image.len()).map_err(|_| RomLookupError::InvalidRomLength {
+                actual: image.len(),
+            })?;
+        let mut padded = Vec::with_capacity(ROM_IMAGE_BYTES);
+        padded.extend_from_slice(image);
+        padded.resize(ROM_IMAGE_BYTES, 0);
+        let column = padded.iter().copied().map(u64::from).collect::<Vec<_>>();
         let inner = commit_columns(ROM_LAYOUT, &[column])?;
         let commitment = RomCommitment {
+            logical_byte_length,
             inner: inner.commitments().clone(),
         };
         Ok(CommittedRom { inner, commitment })
     })
+}
+
+/// Returns whether the native proof supports a logical ROM byte length.
+#[must_use]
+pub const fn is_supported_rom_length(length: usize) -> bool {
+    matches!(length, ROM_256KIB_IMAGE_BYTES | ROM_IMAGE_BYTES)
+}
+
+fn validate_rom_length(length: usize) -> Result<(), RomLookupError> {
+    if is_supported_rom_length(length) {
+        Ok(())
+    } else {
+        Err(RomLookupError::InvalidRomLength { actual: length })
+    }
 }
 
 /// Proves all selected immutable-ROM reads against one public ROM commitment.
@@ -819,6 +856,21 @@ mod tests {
             commit_rom(&[0; 32]),
             Err(RomLookupError::InvalidRomLength { .. })
         ));
+    }
+
+    #[test]
+    fn commits_supported_256kib_logical_rom_length() -> Result<(), RomLookupError> {
+        let image = vec![0x5a; super::ROM_256KIB_IMAGE_BYTES];
+        let committed = commit_rom(&image)?;
+        assert_eq!(
+            committed.logical_byte_length(),
+            u64::try_from(super::ROM_256KIB_IMAGE_BYTES).map_err(|_| RomLookupError::Shape)?
+        );
+        assert_eq!(
+            committed.commitment().logical_byte_length(),
+            u64::try_from(super::ROM_256KIB_IMAGE_BYTES).map_err(|_| RomLookupError::Shape)?
+        );
+        Ok(())
     }
 
     #[test]
