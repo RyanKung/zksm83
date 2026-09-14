@@ -350,7 +350,7 @@ pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
 
 /// Explicit proof/receipt composition revision bound by current backend identities.
 pub const PROOF_COMPOSITION_REVISION_V2: &str =
-    "packed-block-committed-bus-matches-compact-sumchecks-shared-isa-table-wire-v2";
+    "packed-block-projected-composites-batched-isa-lanes-selective-openings-native-only-wire-v2";
 
 /// The sole native receipt protocol revision supported by this build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -461,8 +461,6 @@ pub struct BackendIdentity {
     pub commitment_group_columns: usize,
     /// Implemented witness-privacy guarantee.
     pub privacy: ProofPrivacy,
-    /// Whether execution passes through a RISC-V guest.
-    pub uses_rv64_guest: bool,
 }
 
 /// Returns the exact backend identity that receipts must bind.
@@ -494,7 +492,6 @@ pub const fn backend_identity_for(protocol: NativeProtocolVersion) -> BackendIde
         max_constraint_degree: BLOCK_CPU_MAX_DEGREE,
         commitment_group_columns: COMMITMENT_GROUP_COLUMNS,
         privacy: ProofPrivacy::Transparent,
-        uses_rv64_guest: false,
     }
 }
 
@@ -508,9 +505,8 @@ mod tests {
     };
 
     #[test]
-    fn backend_identity_excludes_rv64_and_witness_hiding() {
+    fn backend_identity_exposes_transparent_privacy() {
         let identity = backend_identity();
-        assert!(!identity.uses_rv64_guest);
         assert_eq!(identity.privacy, ProofPrivacy::Transparent);
         assert!(!identity.privacy.hides_witness());
     }

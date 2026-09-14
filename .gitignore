@@ -4,10 +4,6 @@ coverage/
 *.profraw
 *.rs.bk
 
-# Local history and backend experiments
-/backup/
-/jolt-zksm83/
-
 # User-supplied cartridge and save data
 /roms/
 *.gb

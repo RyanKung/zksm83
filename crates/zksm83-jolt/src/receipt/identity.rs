@@ -668,7 +668,6 @@ pub(super) fn backend_digest(protocol: NativeProtocolVersion) -> [u8; 32] {
         hash.u64(value as u64);
     }
     hash.u64(u64::from(backend.privacy.hides_witness()));
-    hash.u64(u64::from(backend.uses_rv64_guest));
     hash.finish()
 }
 

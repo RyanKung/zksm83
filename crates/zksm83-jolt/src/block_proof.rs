@@ -5,19 +5,19 @@ use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlockLaneIndex};
 
 use crate::{
     BlockCpuRelation, BlockCpuWitness, BlockFrontendError, CommittedMemory, CommittedProtocolLogs,
-    CommittedRom, ContinuityError, IsaLookupError, IsaLookupProof, MemoryCommitment,
-    MutableMemoryError, NativeExecutionClaim, NativeProtocolVersion, PackedContinuityProof,
-    PackedMutableMemoryProof, PackedProtocolLogClaim, PackedProtocolLogProof,
-    ProtocolLogCommitments, ProtocolLogError, RomCommitment, RomLookupError, RomLookupProof,
-    UniformError, UniformRelationProof, WitnessCommitments, commit_witness, prove_rom_lookup,
-    prove_uniform_committed,
+    CommittedRom, ContinuityError, IsaLookupColumns, IsaLookupError, IsaLookupProof,
+    MemoryCommitment, MutableMemoryError, NativeExecutionClaim, NativeProtocolVersion,
+    PackedContinuityProof, PackedMutableMemoryProof, PackedProtocolLogClaim,
+    PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError, RomCommitment,
+    RomLookupError, RomLookupProof, UniformError, UniformRelationProof, WitnessCommitments,
+    commit_witness, prove_rom_lookup, prove_uniform_committed,
 };
 use crate::{
     continuity::{
         prepare_packed_continuity, prove_prepared_packed_continuity,
         verify_packed_continuity_for_protocol,
     },
-    isa_lookup::{prove_isa_lookups, verify_isa_lookup_for_protocol},
+    isa_lookup::{prove_isa_lookups, verify_isa_lookups_for_protocol},
     logs::{
         prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs,
         verify_packed_protocol_logs_for_protocol,
@@ -61,7 +61,7 @@ pub(crate) struct PackedBlockVerificationInputs<'a> {
 pub struct PackedBlockProof {
     pub(crate) commitments: WitnessCommitments,
     pub(crate) relation: UniformRelationProof,
-    pub(crate) isa_lookups: [IsaLookupProof; PACKED_BLOCK_ISA_LOOKUP_COUNT],
+    pub(crate) isa_lookup: IsaLookupProof,
     pub(crate) rom_lookup: RomLookupProof,
     pub(crate) memory: PackedMutableMemoryProof,
     pub(crate) continuity: PackedContinuityProof,
@@ -132,18 +132,18 @@ pub fn prove_packed_block_components(
     let logs =
         prove_prepared_packed_protocol_logs(prepared_logs, &witness, logs, claim, log_claim)?;
     let relation = prove_uniform_committed(&BlockCpuRelation, &witness)?;
-    let isa_layouts = PACKED_LANES
+    let isa_layouts: [IsaLookupColumns; PACKED_BLOCK_ISA_LOOKUP_COUNT] = PACKED_LANES
         .map(BlockCpuWitness::lane_isa_lookup_columns)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?
         .try_into()
         .map_err(|_| BlockFrontendError::Shape)?;
-    let isa_lookups = prove_isa_lookups(isa_layouts, &witness)?;
+    let isa_lookup = prove_isa_lookups(isa_layouts, &witness)?;
     let rom_lookup = prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?;
     Ok(PackedBlockProof {
         commitments: witness.into_commitments(),
         relation,
-        isa_lookups,
+        isa_lookup,
         rom_lookup,
         memory,
         continuity,
@@ -186,14 +186,13 @@ pub(crate) fn verify_packed_block_components_for_protocol(
         &proof.commitments,
         &proof.relation,
     )?;
-    for (lane, lookup) in PACKED_LANES.into_iter().zip(proof.isa_lookups.iter()) {
-        verify_isa_lookup_for_protocol(
-            protocol,
-            BlockCpuWitness::lane_isa_lookup_columns(lane)?,
-            &proof.commitments,
-            lookup,
-        )?;
-    }
+    let isa_layouts: [IsaLookupColumns; PACKED_BLOCK_ISA_LOOKUP_COUNT] = PACKED_LANES
+        .map(BlockCpuWitness::lane_isa_lookup_columns)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| BlockFrontendError::Shape)?;
+    verify_isa_lookups_for_protocol(protocol, isa_layouts, &proof.commitments, &proof.isa_lookup)?;
     verify_rom_lookup_for_protocol(
         protocol,
         BlockCpuWitness::rom_lookup_columns()?,

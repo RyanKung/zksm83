@@ -2,8 +2,8 @@ use akita_pcs::Ring;
 use rayon::prelude::*;
 
 use super::{
-    NativeField, ProductSumcheckError, SumcheckTable, pair_values, usize_to_field,
-    validate_factors, validate_tables, validate_terms,
+    NativeField, ProductSumcheckError, SumcheckTable, pair_values, usize_to_field, validate_tables,
+    validate_terms,
 };
 
 const PARALLEL_MIN_ROWS: usize = 256;
@@ -20,24 +20,6 @@ pub(super) fn inner_product(
         .zip(right.par_iter().with_min_len(PARALLEL_MIN_ROWS).copied())
         .map(|(left, right)| left * right)
         .reduce(|| NativeField::from_u64(0), |sum, value| sum + value))
-}
-
-pub(super) fn sum_of_products<T: SumcheckTable>(
-    factors: &[T],
-) -> Result<NativeField, ProductSumcheckError> {
-    validate_factors(factors)?;
-    let length = factors
-        .first()
-        .map(SumcheckTable::table_len)
-        .ok_or(ProductSumcheckError::EmptyFactors)?;
-    (0..length)
-        .into_par_iter()
-        .with_min_len(PARALLEL_MIN_ROWS)
-        .try_fold(
-            || NativeField::from_u64(0),
-            |sum, index| Ok(sum + product_at(factors, index)?),
-        )
-        .try_reduce(|| NativeField::from_u64(0), |left, right| Ok(left + right))
 }
 
 pub(super) fn shared_sum_of_term_products<T: SumcheckTable>(
@@ -94,27 +76,6 @@ pub(super) fn product_round(
         )
 }
 
-pub(super) fn multi_product_round<T: SumcheckTable>(
-    factors: &[T],
-) -> Result<Vec<NativeField>, ProductSumcheckError> {
-    validate_factors(factors)?;
-    let length = factors
-        .first()
-        .map(SumcheckTable::table_len)
-        .ok_or(ProductSumcheckError::EmptyFactors)?;
-    if length == 1 {
-        return Err(ProductSumcheckError::FoldingShape);
-    }
-    let evaluation_count = factors
-        .len()
-        .checked_add(1)
-        .ok_or(ProductSumcheckError::ProofShape)?;
-    let points = interpolation_points(evaluation_count)?;
-    parallel_round(length / 2, evaluation_count, |pair_index, evaluations| {
-        accumulate_factor_pair(factors, pair_index, &points, evaluations)
-    })
-}
-
 pub(super) fn shared_sum_product_round<T: SumcheckTable>(
     shared: &T,
     terms: &[Vec<T>],
@@ -130,86 +91,96 @@ pub(super) fn shared_sum_product_round<T: SumcheckTable>(
         .checked_add(2)
         .ok_or(ProductSumcheckError::ProofShape)?;
     let points = interpolation_points(evaluation_count)?;
-    parallel_round(length / 2, evaluation_count, |pair_index, evaluations| {
-        let pair_start = pair_index
-            .checked_mul(2)
-            .ok_or(ProductSumcheckError::FoldingShape)?;
-        let pair_end = pair_start
-            .checked_add(1)
-            .ok_or(ProductSumcheckError::FoldingShape)?;
-        let shared_zero = shared.table_value(pair_start)?;
-        let shared_one = shared.table_value(pair_end)?;
-        for (point, evaluation) in points.iter().copied().zip(evaluations) {
-            let shared_value = shared_zero + point * (shared_one - shared_zero);
-            let term_sum =
-                terms
-                    .iter()
-                    .try_fold(NativeField::from_u64(0), |term_sum, factors| {
-                        let product = factors.iter().try_fold(
-                            NativeField::from_u64(1),
-                            |product, factor| {
-                                let zero = factor.table_value(pair_start)?;
-                                let one = factor.table_value(pair_end)?;
-                                Ok::<_, ProductSumcheckError>(
-                                    product * (zero + point * (one - zero)),
-                                )
-                            },
-                        )?;
-                        Ok::<_, ProductSumcheckError>(term_sum + product)
-                    })?;
-            *evaluation += shared_value * term_sum;
-        }
-        Ok(())
-    })
-}
-
-fn parallel_round(
-    pair_count: usize,
-    evaluation_count: usize,
-    accumulate: impl Fn(usize, &mut [NativeField]) -> Result<(), ProductSumcheckError> + Sync,
-) -> Result<Vec<NativeField>, ProductSumcheckError> {
-    (0..pair_count)
+    (0..length / 2)
         .into_par_iter()
         .with_min_len(PARALLEL_MIN_ROWS)
         .try_fold(
-            || vec![NativeField::from_u64(0); evaluation_count],
-            |mut evaluations, pair_index| {
-                accumulate(pair_index, &mut evaluations)?;
-                Ok(evaluations)
+            || {
+                (
+                    vec![NativeField::from_u64(0); evaluation_count],
+                    vec![NativeField::from_u64(1); evaluation_count],
+                )
+            },
+            |(mut evaluations, mut products), pair_index| {
+                accumulate_shared_pair(
+                    shared,
+                    terms,
+                    pair_index,
+                    &points,
+                    &mut evaluations,
+                    &mut products,
+                )?;
+                Ok((evaluations, products))
             },
         )
         .try_reduce(
-            || vec![NativeField::from_u64(0); evaluation_count],
-            |mut left, right| {
+            || {
+                (
+                    vec![NativeField::from_u64(0); evaluation_count],
+                    vec![NativeField::from_u64(1); evaluation_count],
+                )
+            },
+            |(mut left, products), (right, _)| {
                 for (target, value) in left.iter_mut().zip(right) {
                     *target += value;
                 }
-                Ok(left)
+                Ok((left, products))
             },
         )
+        .map(|(evaluations, _)| evaluations)
 }
 
-fn accumulate_factor_pair<T: SumcheckTable>(
-    factors: &[T],
+fn accumulate_shared_pair<T: SumcheckTable>(
+    shared: &T,
+    terms: &[Vec<T>],
     pair_index: usize,
     points: &[NativeField],
     evaluations: &mut [NativeField],
+    products: &mut [NativeField],
 ) -> Result<(), ProductSumcheckError> {
+    if points.len() != evaluations.len() || points.len() != products.len() || points.len() < 2 {
+        return Err(ProductSumcheckError::ProofShape);
+    }
     let pair_start = pair_index
         .checked_mul(2)
         .ok_or(ProductSumcheckError::FoldingShape)?;
     let pair_end = pair_start
         .checked_add(1)
         .ok_or(ProductSumcheckError::FoldingShape)?;
-    for (point, evaluation) in points.iter().copied().zip(evaluations) {
-        let product = factors
-            .iter()
-            .try_fold(NativeField::from_u64(1), |product, factor| {
-                let zero = factor.table_value(pair_start)?;
-                let one = factor.table_value(pair_end)?;
-                Ok::<_, ProductSumcheckError>(product * (zero + point * (one - zero)))
-            })?;
-        *evaluation += product;
+    let shared_zero = shared.table_value(pair_start)?;
+    let shared_one = shared.table_value(pair_end)?;
+    let one = NativeField::from_u64(1);
+    for factors in terms {
+        products.fill(one);
+        for factor in factors {
+            let zero = factor.table_value(pair_start)?;
+            let one_value = factor.table_value(pair_end)?;
+            *products
+                .first_mut()
+                .ok_or(ProductSumcheckError::ProofShape)? *= zero;
+            *products
+                .get_mut(1)
+                .ok_or(ProductSumcheckError::ProofShape)? *= one_value;
+            for (product, point) in products.iter_mut().skip(2).zip(points.iter().skip(2)) {
+                *product *= zero + *point * (one_value - zero);
+            }
+        }
+        for (index, (evaluation, product)) in
+            evaluations.iter_mut().zip(products.iter()).enumerate()
+        {
+            let shared_value = match index {
+                0 => shared_zero,
+                1 => shared_one,
+                _ => {
+                    let point = points
+                        .get(index)
+                        .copied()
+                        .ok_or(ProductSumcheckError::ProofShape)?;
+                    shared_zero + point * (shared_one - shared_zero)
+                }
+            };
+            *evaluation += shared_value * *product;
+        }
     }
     Ok(())
 }

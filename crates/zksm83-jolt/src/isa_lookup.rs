@@ -12,11 +12,11 @@ use crate::{
         prove_opening, verify_opening,
     },
     sumcheck::{
-        MultiProductSumcheckProof, ProductSumcheckError, ProductSumcheckProof, SumcheckFactor,
+        ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_opening,
-        verify_witness_opening_for_protocol,
+        CommittedWitness, WitnessCommitments, prove_witness_selected_opening,
+        verify_witness_selected_opening_for_protocol,
     },
 };
 
@@ -28,6 +28,7 @@ pub const FIXED_ISA_TABLE_COMMITMENT_SHA256: &str =
     "fc4afaeb9c3d6a7dc063e2927caee773ae4a29f3c16e7d3f1aa5f266ea3f9c9a";
 
 const ISA_TABLE_NUM_VARIABLES: usize = 9;
+const MAX_BATCHED_ISA_LOOKUPS: usize = 4;
 const ISA_LOOKUP_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-isa-shout/v2";
 const ISA_TABLE_COMMITMENT_DOMAIN: &[u8] = b"zksm83/native-isa-table-commitment/v1";
 const ISA_TABLE_OPENING_DOMAIN: &[u8] = b"zksm83-native-isa-table-opening/v1";
@@ -60,7 +61,7 @@ pub struct IsaLookupProof {
     pub(crate) table_commitments: FixedIsaCommitments,
     pub(crate) claimed_output: NativeField,
     pub(crate) table_sumcheck: ProductSumcheckProof,
-    pub(crate) address_sumcheck: MultiProductSumcheckProof,
+    pub(crate) address_sumcheck: SumOfProductsSumcheckProof,
     pub(crate) table_values: Vec<NativeField>,
     pub(crate) trace_cycle_values: Vec<NativeField>,
     pub(crate) trace_address_values: Vec<NativeField>,
@@ -173,6 +174,72 @@ impl IsaLookupColumns {
     }
 }
 
+fn validate_layouts(
+    layouts: &[IsaLookupColumns],
+    column_count: usize,
+) -> Result<(), IsaLookupError> {
+    if layouts.is_empty() || layouts.len() > MAX_BATCHED_ISA_LOOKUPS {
+        return Err(IsaLookupError::Shape);
+    }
+    let columns_per_layout = ISA_ADDRESS_BIT_COUNT
+        .checked_add(ISA_OUTPUT_COUNT)
+        .ok_or(IsaLookupError::Shape)?;
+    let capacity = layouts
+        .len()
+        .checked_mul(columns_per_layout)
+        .ok_or(IsaLookupError::Shape)?;
+    let mut columns = Vec::with_capacity(capacity);
+    for layout in layouts.iter().copied() {
+        layout.validate(column_count)?;
+        columns.extend_from_slice(&layout.address_bits);
+        columns.extend_from_slice(&layout.outputs);
+    }
+    columns.sort_unstable();
+    if columns
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left == right))
+    {
+        return Err(IsaLookupError::InvalidColumnLayout);
+    }
+    Ok(())
+}
+
+fn selected_output_columns(layouts: &[IsaLookupColumns]) -> Result<Vec<usize>, IsaLookupError> {
+    let expected = layouts
+        .len()
+        .checked_mul(ISA_OUTPUT_COUNT)
+        .ok_or(IsaLookupError::Shape)?;
+    let mut columns = Vec::with_capacity(expected);
+    for layout in layouts {
+        columns.extend_from_slice(&layout.outputs);
+    }
+    canonical_selected_columns(columns, expected)
+}
+
+fn selected_address_columns(layouts: &[IsaLookupColumns]) -> Result<Vec<usize>, IsaLookupError> {
+    let expected = layouts
+        .len()
+        .checked_mul(ISA_ADDRESS_BIT_COUNT)
+        .ok_or(IsaLookupError::Shape)?;
+    let mut columns = Vec::with_capacity(expected);
+    for layout in layouts {
+        columns.extend_from_slice(&layout.address_bits);
+    }
+    canonical_selected_columns(columns, expected)
+}
+
+fn canonical_selected_columns(
+    mut columns: Vec<usize>,
+    expected: usize,
+) -> Result<Vec<usize>, IsaLookupError> {
+    columns.sort_unstable();
+    columns.dedup();
+    if columns.len() != expected {
+        return Err(IsaLookupError::InvalidColumnLayout);
+    }
+    Ok(columns)
+}
+
 impl FixedIsaCommitments {
     /// Returns the canonical verifier-facing commitment encoding.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, IsaLookupError> {
@@ -202,22 +269,17 @@ pub fn prove_isa_lookup(
 ) -> Result<IsaLookupProof, IsaLookupError> {
     on_worker(|| {
         let table = commit_fixed_table()?;
-        prove_isa_lookup_on_worker(layout, witness, &table)
+        prove_isa_lookups_on_worker(std::slice::from_ref(&layout), witness, &table)
     })
 }
 
 pub(crate) fn prove_isa_lookups<const N: usize>(
     layouts: [IsaLookupColumns; N],
     witness: &CommittedWitness,
-) -> Result<[IsaLookupProof; N], IsaLookupError> {
+) -> Result<IsaLookupProof, IsaLookupError> {
     on_worker(|| {
         let table = commit_fixed_table()?;
-        layouts
-            .into_iter()
-            .map(|layout| prove_isa_lookup_on_worker(layout, witness, &table))
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .map_err(|_| IsaLookupError::Shape)
+        prove_isa_lookups_on_worker(&layouts, witness, &table)
     })
 }
 
@@ -241,24 +303,42 @@ pub(crate) fn verify_isa_lookup_for_protocol(
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
 ) -> Result<(), IsaLookupError> {
-    on_worker(|| verify_isa_lookup_on_worker(protocol, layout, trace_commitments, proof))
+    on_worker(|| {
+        verify_isa_lookups_on_worker(
+            protocol,
+            std::slice::from_ref(&layout),
+            trace_commitments,
+            proof,
+        )
+    })
 }
 
-fn prove_isa_lookup_on_worker(
-    layout: IsaLookupColumns,
+pub(crate) fn verify_isa_lookups_for_protocol<const N: usize>(
+    protocol: NativeProtocolVersion,
+    layouts: [IsaLookupColumns; N],
+    trace_commitments: &WitnessCommitments,
+    proof: &IsaLookupProof,
+) -> Result<(), IsaLookupError> {
+    on_worker(|| verify_isa_lookups_on_worker(protocol, &layouts, trace_commitments, proof))
+}
+
+fn prove_isa_lookups_on_worker(
+    layouts: &[IsaLookupColumns],
     witness: &CommittedWitness,
     table: &CommittedColumns,
 ) -> Result<IsaLookupProof, IsaLookupError> {
-    layout.validate(witness.commitments().column_count())?;
+    validate_layouts(layouts, witness.commitments().column_count())?;
     let table_commitments = FixedIsaCommitments {
         inner: table.commitments().clone(),
     };
     let protocol = NativeProtocolVersion::current();
     let descriptor =
-        instance_descriptor(protocol, layout, &table_commitments, witness.commitments())?;
+        instance_descriptor(protocol, layouts, &table_commitments, witness.commitments())?;
     let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let output_mix = nonzero_challenge(&mut transcript, b"isa-output-mix")?;
     let coefficients = challenge_powers(output_mix, ISA_OUTPUT_COUNT);
+    let lane_mix = nonzero_challenge(&mut transcript, b"isa-lane-mix")?;
+    let lane_coefficients = challenge_powers(lane_mix, layouts.len());
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"isa-cycle-point");
     let table_columns = table.field_columns()?;
     let trace_columns = witness.field_columns()?;
@@ -267,12 +347,21 @@ fn prove_isa_lookup_on_worker(
         &canonical_indices(),
         &coefficients,
     )?;
-    let mixed_trace = mix_columns(trace_columns.as_slice(), &layout.outputs, &coefficients)?;
+    let mixed_trace = mix_trace_outputs(
+        trace_columns.as_slice(),
+        layouts,
+        &lane_coefficients,
+        &coefficients,
+    )?;
     let claimed_output = evaluate_mle(&mixed_trace, &cycle_point)?;
     transcript.append_field(b"isa-claimed-output", &claimed_output);
-    let addresses = trace_addresses(trace_columns.as_slice(), &layout.address_bits)?;
     let cycle_weights = equality_evaluations(&cycle_point);
-    let read_address = read_address_table(&addresses, &cycle_weights)?;
+    let read_address = read_address_table(
+        trace_columns.as_slice(),
+        layouts,
+        &lane_coefficients,
+        &cycle_weights,
+    )?;
     let (table_sumcheck, actual_claim, table_point) =
         ProductSumcheckProof::prove(&read_address, &mixed_table, &mut transcript)?;
     if actual_claim != claimed_output {
@@ -286,33 +375,39 @@ fn prove_isa_lookup_on_worker(
         table_sumcheck.final_right(),
         IsaLookupError::TableOpeningMismatch,
     )?;
-    let address_factors = address_binding_factors(
+    let address_terms = address_binding_terms(
         &cycle_weights,
         trace_columns.as_slice(),
-        &layout.address_bits,
+        layouts,
+        &lane_coefficients,
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        MultiProductSumcheckProof::prove(address_factors, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(address_terms, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(IsaLookupError::AddressBindingMismatch);
     }
-    let trace_cycle_values = evaluate_columns(trace_columns.as_slice(), &cycle_point)?;
-    require_mixed_value(
+    let cycle_columns = selected_output_columns(layouts)?;
+    let (trace_cycle_values, trace_cycle_opening) =
+        prove_witness_selected_opening(witness, &cycle_point, &cycle_columns, &descriptor)?;
+    require_batched_mixed_value(
         &trace_cycle_values,
-        &layout.outputs,
+        layouts,
+        &lane_coefficients,
         &coefficients,
         claimed_output,
-        IsaLookupError::OutputClaimMismatch,
     )?;
-    let trace_address_values = evaluate_columns(trace_columns.as_slice(), &address_point)?;
+    let address_columns = selected_address_columns(layouts)?;
+    let (trace_address_values, trace_address_opening) =
+        prove_witness_selected_opening(witness, &address_point, &address_columns, &descriptor)?;
     verify_address_terminal(
         &address_sumcheck,
+        layouts,
+        &lane_coefficients,
         &cycle_point,
         &table_point,
         &address_point,
         &trace_address_values,
-        &layout.address_bits,
     )?;
     let table_opening = prove_opening(
         ISA_TABLE_LAYOUT,
@@ -321,10 +416,6 @@ fn prove_isa_lookup_on_worker(
         &table_values,
         &descriptor,
     )?;
-    let trace_cycle_opening =
-        prove_witness_opening(witness, &cycle_point, &trace_cycle_values, &descriptor)?;
-    let trace_address_opening =
-        prove_witness_opening(witness, &address_point, &trace_address_values, &descriptor)?;
     Ok(IsaLookupProof {
         table_commitments,
         claimed_output,
@@ -339,23 +430,25 @@ fn prove_isa_lookup_on_worker(
     })
 }
 
-fn verify_isa_lookup_on_worker(
+fn verify_isa_lookups_on_worker(
     protocol: NativeProtocolVersion,
-    layout: IsaLookupColumns,
+    layouts: &[IsaLookupColumns],
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
 ) -> Result<(), IsaLookupError> {
-    layout.validate(trace_commitments.column_count())?;
+    validate_layouts(layouts, trace_commitments.column_count())?;
     validate_fixed_commitments(&proof.table_commitments)?;
     let descriptor = instance_descriptor(
         protocol,
-        layout,
+        layouts,
         &proof.table_commitments,
         trace_commitments,
     )?;
     let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Verifier);
     let output_mix = nonzero_challenge(&mut transcript, b"isa-output-mix")?;
     let coefficients = challenge_powers(output_mix, ISA_OUTPUT_COUNT);
+    let lane_mix = nonzero_challenge(&mut transcript, b"isa-lane-mix")?;
+    let lane_coefficients = challenge_powers(lane_mix, layouts.len());
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"isa-cycle-point");
     transcript.append_field(b"isa-claimed-output", &proof.claimed_output);
     let table_point = proof.table_sumcheck.verify(
@@ -381,39 +474,45 @@ fn verify_isa_lookup_on_worker(
     let address_point = proof.address_sumcheck.verify(
         proof.table_sumcheck.final_left(),
         UNIFORM_NUM_VARIABLES,
+        layouts.len(),
         ISA_ADDRESS_BIT_COUNT + 1,
         &mut transcript,
     )?;
-    verify_witness_opening_for_protocol(
+    let cycle_columns = selected_output_columns(layouts)?;
+    verify_witness_selected_opening_for_protocol(
         protocol,
         trace_commitments,
         &cycle_point,
         &proof.trace_cycle_values,
+        &cycle_columns,
         &descriptor,
         &proof.trace_cycle_opening,
     )?;
-    require_mixed_value(
+    require_batched_mixed_value(
         &proof.trace_cycle_values,
-        &layout.outputs,
+        layouts,
+        &lane_coefficients,
         &coefficients,
         proof.claimed_output,
-        IsaLookupError::OutputClaimMismatch,
     )?;
-    verify_witness_opening_for_protocol(
+    let address_columns = selected_address_columns(layouts)?;
+    verify_witness_selected_opening_for_protocol(
         protocol,
         trace_commitments,
         &address_point,
         &proof.trace_address_values,
+        &address_columns,
         &descriptor,
         &proof.trace_address_opening,
     )?;
     verify_address_terminal(
         &proof.address_sumcheck,
+        layouts,
+        &lane_coefficients,
         &cycle_point,
         &table_point,
         &address_point,
         &proof.trace_address_values,
-        &layout.address_bits,
     )
 }
 
@@ -496,77 +595,121 @@ fn trace_addresses(
 }
 
 fn read_address_table(
-    addresses: &[usize],
+    columns: &[impl AsRef<[NativeField]>],
+    layouts: &[IsaLookupColumns],
+    lane_coefficients: &[NativeField],
     cycle_weights: &[NativeField],
 ) -> Result<Vec<NativeField>, IsaLookupError> {
-    if addresses.len() != cycle_weights.len() {
+    if layouts.len() != lane_coefficients.len() {
         return Err(IsaLookupError::Shape);
     }
     let mut read_address = vec![NativeField::from_u64(0); ISA_TABLE_ROW_COUNT];
-    for (address, weight) in addresses.iter().copied().zip(cycle_weights) {
-        let target = read_address
-            .get_mut(address)
-            .ok_or(IsaLookupError::AddressOutOfRange)?;
-        *target += *weight;
+    for (layout, lane_coefficient) in layouts.iter().zip(lane_coefficients) {
+        let addresses = trace_addresses(columns, &layout.address_bits)?;
+        if addresses.len() != cycle_weights.len() {
+            return Err(IsaLookupError::Shape);
+        }
+        for (address, weight) in addresses.into_iter().zip(cycle_weights) {
+            let target = read_address
+                .get_mut(address)
+                .ok_or(IsaLookupError::AddressOutOfRange)?;
+            *target += *lane_coefficient * *weight;
+        }
     }
     Ok(read_address)
 }
 
-fn address_binding_factors<'a>(
+fn address_binding_terms<'a>(
     cycle_weights: &'a [NativeField],
     columns: &'a [impl AsRef<[NativeField]>],
-    address_bits: &[usize; ISA_ADDRESS_BIT_COUNT],
+    layouts: &[IsaLookupColumns],
+    lane_coefficients: &[NativeField],
     table_point: &[NativeField],
-) -> Result<Vec<SumcheckFactor<'a>>, IsaLookupError> {
-    if table_point.len() != ISA_ADDRESS_BIT_COUNT {
+) -> Result<Vec<Vec<SumcheckFactor<'a>>>, IsaLookupError> {
+    if table_point.len() != ISA_ADDRESS_BIT_COUNT || layouts.len() != lane_coefficients.len() {
         return Err(IsaLookupError::Shape);
     }
     let one = NativeField::from_u64(1);
-    let mut factors = Vec::with_capacity(ISA_ADDRESS_BIT_COUNT + 1);
-    factors.push(SumcheckFactor::borrowed(cycle_weights));
-    for (column_index, point) in address_bits.iter().copied().zip(table_point) {
-        let column = columns
-            .get(column_index)
-            .map(AsRef::as_ref)
-            .ok_or(IsaLookupError::Shape)?;
-        if column.len() != cycle_weights.len() {
-            return Err(IsaLookupError::Shape);
-        }
-        factors.push(SumcheckFactor::affine(
-            column,
-            NativeField::from_u64(2) * *point - one,
-            one - *point,
-        ));
-    }
-    Ok(factors)
+    layouts
+        .iter()
+        .zip(lane_coefficients)
+        .map(|(layout, lane_coefficient)| {
+            let mut factors = Vec::with_capacity(ISA_ADDRESS_BIT_COUNT + 1);
+            factors.push(SumcheckFactor::borrowed(cycle_weights));
+            for (bit, (column_index, point)) in layout
+                .address_bits
+                .iter()
+                .copied()
+                .zip(table_point)
+                .enumerate()
+            {
+                let column = columns
+                    .get(column_index)
+                    .map(AsRef::as_ref)
+                    .ok_or(IsaLookupError::Shape)?;
+                if column.len() != cycle_weights.len() {
+                    return Err(IsaLookupError::Shape);
+                }
+                let coefficient = if bit == 0 { *lane_coefficient } else { one };
+                factors.push(SumcheckFactor::affine(
+                    column,
+                    coefficient * (NativeField::from_u64(2) * *point - one),
+                    coefficient * (one - *point),
+                ));
+            }
+            Ok(factors)
+        })
+        .collect()
 }
 
 fn verify_address_terminal(
-    proof: &MultiProductSumcheckProof,
+    proof: &SumOfProductsSumcheckProof,
+    layouts: &[IsaLookupColumns],
+    lane_coefficients: &[NativeField],
     cycle_point: &[NativeField],
     table_point: &[NativeField],
     address_point: &[NativeField],
     trace_values: &[NativeField],
-    address_bits: &[usize; ISA_ADDRESS_BIT_COUNT],
 ) -> Result<(), IsaLookupError> {
-    let factors = proof.final_factors();
-    if factors.len() != ISA_ADDRESS_BIT_COUNT + 1 || table_point.len() != ISA_ADDRESS_BIT_COUNT {
+    if proof.final_terms().len() != layouts.len()
+        || layouts.len() != lane_coefficients.len()
+        || table_point.len() != ISA_ADDRESS_BIT_COUNT
+    {
         return Err(IsaLookupError::Shape);
     }
     let expected_weight = equality_evaluation(cycle_point, address_point)?;
-    if factors.first().copied() != Some(expected_weight) {
-        return Err(IsaLookupError::AddressBindingMismatch);
-    }
     let one = NativeField::from_u64(1);
-    for ((factor, column_index), point) in factors.iter().skip(1).zip(address_bits).zip(table_point)
+    for ((factors, layout), lane_coefficient) in proof
+        .final_terms()
+        .iter()
+        .zip(layouts)
+        .zip(lane_coefficients)
     {
-        let bit = trace_values
-            .get(*column_index)
-            .copied()
-            .ok_or(IsaLookupError::Shape)?;
-        let expected = bit * *point + (one - bit) * (one - *point);
-        if *factor != expected {
+        if factors.len() != ISA_ADDRESS_BIT_COUNT + 1
+            || factors.first().copied() != Some(expected_weight)
+        {
             return Err(IsaLookupError::AddressBindingMismatch);
+        }
+        for (bit_index, ((factor, column_index), point)) in factors
+            .iter()
+            .skip(1)
+            .zip(layout.address_bits)
+            .zip(table_point)
+            .enumerate()
+        {
+            let address_bit = trace_values
+                .get(column_index)
+                .copied()
+                .ok_or(IsaLookupError::Shape)?;
+            let equality = address_bit * *point + (one - address_bit) * (one - *point);
+            let expected = if bit_index == 0 {
+                *lane_coefficient * equality
+            } else {
+                equality
+            };
+            if *factor != expected {
+                return Err(IsaLookupError::AddressBindingMismatch);
+            }
         }
     }
     Ok(())
@@ -574,7 +717,7 @@ fn verify_address_terminal(
 
 fn instance_descriptor(
     protocol: NativeProtocolVersion,
-    layout: IsaLookupColumns,
+    layouts: &[IsaLookupColumns],
     table_commitments: &FixedIsaCommitments,
     trace_commitments: &WitnessCommitments,
 ) -> Result<Vec<u8>, IsaLookupError> {
@@ -584,8 +727,11 @@ fn instance_descriptor(
     push_bytes(&mut descriptor, &fixed_isa_table_digest()?)?;
     push_usize(&mut descriptor, ISA_TABLE_ROW_COUNT)?;
     push_usize(&mut descriptor, ISA_OUTPUT_COUNT)?;
-    push_indices(&mut descriptor, &layout.address_bits)?;
-    push_indices(&mut descriptor, &layout.outputs)?;
+    push_usize(&mut descriptor, layouts.len())?;
+    for layout in layouts {
+        push_indices(&mut descriptor, &layout.address_bits)?;
+        push_indices(&mut descriptor, &layout.outputs)?;
+    }
     push_bytes(&mut descriptor, &table_commitments.canonical_bytes()?)?;
     push_bytes(
         &mut descriptor,
@@ -679,6 +825,40 @@ fn mix_columns(
     Ok(mixed)
 }
 
+fn mix_trace_outputs(
+    columns: &[impl AsRef<[NativeField]>],
+    layouts: &[IsaLookupColumns],
+    lane_coefficients: &[NativeField],
+    output_coefficients: &[NativeField],
+) -> Result<Vec<NativeField>, IsaLookupError> {
+    if layouts.len() != lane_coefficients.len() || output_coefficients.len() != ISA_OUTPUT_COUNT {
+        return Err(IsaLookupError::Shape);
+    }
+    let row_count = columns
+        .first()
+        .map(|column| column.as_ref().len())
+        .ok_or(IsaLookupError::Shape)?;
+    let mut mixed = vec![NativeField::from_u64(0); row_count];
+    for (layout, lane_coefficient) in layouts.iter().zip(lane_coefficients) {
+        for (column_index, output_coefficient) in
+            layout.outputs.iter().copied().zip(output_coefficients)
+        {
+            let column = columns
+                .get(column_index)
+                .map(AsRef::as_ref)
+                .ok_or(IsaLookupError::Shape)?;
+            if column.len() != row_count {
+                return Err(IsaLookupError::Shape);
+            }
+            let coefficient = *lane_coefficient * *output_coefficient;
+            for (target, value) in mixed.iter_mut().zip(column) {
+                *target += coefficient * *value;
+            }
+        }
+    }
+    Ok(mixed)
+}
+
 fn require_mixed_value(
     values: &[NativeField],
     indices: &[usize],
@@ -701,6 +881,39 @@ fn require_mixed_value(
     )?;
     if actual != expected {
         return Err(error);
+    }
+    Ok(())
+}
+
+fn require_batched_mixed_value(
+    values: &[NativeField],
+    layouts: &[IsaLookupColumns],
+    lane_coefficients: &[NativeField],
+    output_coefficients: &[NativeField],
+    expected: NativeField,
+) -> Result<(), IsaLookupError> {
+    if layouts.len() != lane_coefficients.len() || output_coefficients.len() != ISA_OUTPUT_COUNT {
+        return Err(IsaLookupError::Shape);
+    }
+    let actual = layouts.iter().zip(lane_coefficients).try_fold(
+        NativeField::from_u64(0),
+        |sum, (layout, lane_coefficient)| {
+            layout
+                .outputs
+                .iter()
+                .copied()
+                .zip(output_coefficients)
+                .try_fold(sum, |sum, (column, output_coefficient)| {
+                    values
+                        .get(column)
+                        .copied()
+                        .map(|value| sum + *lane_coefficient * *output_coefficient * value)
+                        .ok_or(IsaLookupError::Shape)
+                })
+        },
+    )?;
+    if actual != expected {
+        return Err(IsaLookupError::OutputClaimMismatch);
     }
     Ok(())
 }
@@ -783,104 +996,4 @@ fn on_worker<T: Send>(
 }
 
 #[cfg(test)]
-mod tests {
-    use akita_pcs::Ring;
-    use sha2::{Digest, Sha256};
-
-    use super::{
-        FIXED_ISA_TABLE_COMMITMENT_SHA256, ISA_OUTPUT_COUNT, ISA_SCHEDULE_ARTIFACT,
-        ISA_TABLE_LAYOUT, IsaLookupColumns, IsaLookupError, canonical_indices, fixed_table_columns,
-        hex_digest, prove_isa_lookup, verify_isa_lookup,
-    };
-    use crate::{
-        AKITA_ISA_TABLE_SCHEDULE_SHA256, ISA_ADDRESS_BIT_COUNT, UNIFORM_ROW_COUNT, commit_witness,
-        fixed_isa_table, pcs::scheme,
-    };
-
-    #[test]
-    fn pinned_isa_schedule_has_only_the_frozen_shape() -> Result<(), IsaLookupError> {
-        let scheme = scheme(ISA_TABLE_LAYOUT)?;
-        let rows = scheme.schedules().catalog().rows().collect::<Vec<_>>();
-        let row = rows.first().ok_or(IsaLookupError::Shape)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(row.profiles().final_group.group.num_vars(), 9);
-        assert_eq!(
-            row.profiles().final_group.group.num_polynomials(),
-            crate::COMMITMENT_GROUP_COLUMNS
-        );
-        assert!(row.profiles().precommitteds.is_empty());
-        assert_eq!(
-            format!("{:x}", Sha256::digest(ISA_SCHEDULE_ARTIFACT)),
-            AKITA_ISA_TABLE_SCHEDULE_SHA256
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn fixed_table_columns_preserve_all_outputs() -> Result<(), IsaLookupError> {
-        let columns = fixed_table_columns()?;
-        assert_eq!(columns.len(), ISA_OUTPUT_COUNT);
-        assert!(columns.iter().all(|column| column.len() == 512));
-        Ok(())
-    }
-
-    #[test]
-    fn overlapping_or_repeated_layout_is_rejected() {
-        let address = std::array::from_fn(|index| index);
-        let repeated_outputs = [0; ISA_OUTPUT_COUNT];
-        assert!(IsaLookupColumns::new(address, repeated_outputs).is_err());
-        assert_eq!(canonical_indices().len(), ISA_OUTPUT_COUNT);
-    }
-
-    #[test]
-    #[ignore = "expensive shared-trace and fixed-table Akita Shout gate"]
-    fn committed_isa_lookup_verifies_and_rejects_tampering() -> Result<(), IsaLookupError> {
-        let address_bits = std::array::from_fn(|index| index);
-        let outputs = std::array::from_fn(|index| ISA_ADDRESS_BIT_COUNT + index);
-        let layout = IsaLookupColumns::new(address_bits, outputs)?;
-        let table = fixed_isa_table()?;
-        let mut columns = (0..(ISA_ADDRESS_BIT_COUNT + ISA_OUTPUT_COUNT))
-            .map(|_| vec![0_u64; UNIFORM_ROW_COUNT])
-            .collect::<Vec<_>>();
-        for row_index in 0..UNIFORM_ROW_COUNT {
-            let address = row_index % table.len();
-            for (bit, column_index) in address_bits.iter().copied().enumerate() {
-                let value = u64::from(((address >> bit) & 1) != 0);
-                let column = columns.get_mut(column_index).ok_or(IsaLookupError::Shape)?;
-                *column.get_mut(row_index).ok_or(IsaLookupError::Shape)? = value;
-            }
-            let table_outputs = table
-                .get(address)
-                .copied()
-                .ok_or(IsaLookupError::Shape)?
-                .outputs();
-            for (column_index, value) in outputs.iter().copied().zip(table_outputs) {
-                let column = columns.get_mut(column_index).ok_or(IsaLookupError::Shape)?;
-                *column.get_mut(row_index).ok_or(IsaLookupError::Shape)? = value;
-            }
-        }
-        let witness = commit_witness(&columns)?;
-        let proof = prove_isa_lookup(layout, &witness)?;
-        verify_isa_lookup(layout, witness.commitments(), &proof)?;
-        assert_eq!(
-            hex_digest(proof.table_commitments().digest()?),
-            FIXED_ISA_TABLE_COMMITMENT_SHA256
-        );
-
-        let mut tampered = proof.clone();
-        let first_round = tampered
-            .table_sumcheck
-            .rounds
-            .first_mut()
-            .ok_or(IsaLookupError::Shape)?;
-        let first_value = first_round.first_mut().ok_or(IsaLookupError::Shape)?;
-        *first_value += crate::NativeField::from_u64(1);
-        assert!(verify_isa_lookup(layout, witness.commitments(), &tampered).is_err());
-
-        let mut reordered_outputs = outputs;
-        reordered_outputs.swap(0, 1);
-        let reordered_layout = IsaLookupColumns::new(address_bits, reordered_outputs)?;
-        assert!(verify_isa_lookup(reordered_layout, witness.commitments(), &proof).is_err());
-        Ok(())
-    }
-}
+mod tests;

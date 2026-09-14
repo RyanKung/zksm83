@@ -4,6 +4,8 @@
 use akita_config::proof_optimized::fp128;
 #[cfg(test)]
 use akita_pcs::AkitaCommitmentScheme;
+use jolt_field::Ring;
+use rayon::prelude::*;
 
 #[cfg(test)]
 use crate::pcs::scheme as pcs_scheme;
@@ -12,7 +14,9 @@ use crate::{
     pcs::{
         ColumnCommitments, CommittedColumns, FieldColumnView, OpeningProof as PcsOpeningProof,
         PcsError, PcsLayout, commit_columns as commit_pcs_columns,
-        prove_opening as prove_pcs_opening, verify_opening as verify_pcs_opening,
+        prove_opening as prove_pcs_opening, prove_selected_opening as prove_pcs_selected_opening,
+        selected_logical_columns, verify_opening as verify_pcs_opening,
+        verify_selected_opening as verify_pcs_selected_opening,
     },
 };
 
@@ -169,6 +173,67 @@ pub(super) fn verify_opening_for_protocol(
         &commitments.inner,
         point,
         logical_values,
+        instance_descriptor,
+        opening,
+    )
+    .map_err(map_pcs_error)
+}
+
+pub(super) fn prove_selected_opening(
+    witness: &CommittedWitness,
+    point: &[NativeField],
+    selected_columns: &[usize],
+    instance_descriptor: &[u8],
+) -> Result<(Vec<NativeField>, OpeningProof), UniformError> {
+    let layout = witness.inner.layout();
+    let columns = witness.field_columns()?;
+    let selected = selected_logical_columns(layout, &witness.commitments.inner, selected_columns)
+        .map_err(map_pcs_error)?;
+    let evaluated = selected
+        .par_iter()
+        .copied()
+        .map(|index| {
+            let column = columns
+                .as_slice()
+                .get(index)
+                .copied()
+                .ok_or(UniformError::Shape)?;
+            crate::field_fold::evaluate_mle(column, point)
+                .map(|value| (index, value))
+                .map_err(|_| UniformError::Shape)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = vec![NativeField::from_u64(0); witness.commitments.column_count()];
+    for (index, value) in evaluated {
+        *values.get_mut(index).ok_or(UniformError::Shape)? = value;
+    }
+    let opening = prove_pcs_selected_opening(
+        layout,
+        &witness.inner,
+        point,
+        &values,
+        selected_columns,
+        instance_descriptor,
+    )
+    .map_err(map_pcs_error)?;
+    Ok((values, opening))
+}
+
+pub(super) fn verify_selected_opening_for_protocol(
+    protocol: NativeProtocolVersion,
+    commitments: &WitnessCommitments,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    selected_columns: &[usize],
+    instance_descriptor: &[u8],
+    opening: &OpeningProof,
+) -> Result<(), UniformError> {
+    verify_pcs_selected_opening(
+        layout_for(protocol, commitments.column_count()),
+        &commitments.inner,
+        point,
+        logical_values,
+        selected_columns,
         instance_descriptor,
         opening,
     )

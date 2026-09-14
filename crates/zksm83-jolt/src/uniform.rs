@@ -17,9 +17,13 @@ use thiserror::Error;
 
 use crate::{AkitaWorkerError, NativeProtocolVersion};
 pub use commitment::{CommittedWitness, WitnessCommitments};
-use commitment::{OpeningProof, commit_columns, prove_opening, verify_opening_for_protocol};
+use commitment::{
+    OpeningProof, commit_columns, prove_opening, prove_selected_opening,
+    verify_opening_for_protocol, verify_selected_opening_for_protocol,
+};
 pub(crate) use composite::{
-    CompositeUniformRelationProof, prove_uniform_composite, verify_uniform_composite_for_protocol,
+    CompositeUniformRelationProof, ProjectedRelation, prove_uniform_composite,
+    verify_uniform_composite_for_protocol,
 };
 pub use relation::ConstraintOutput;
 use relation::initialize_constraint_output;
@@ -272,6 +276,35 @@ pub(crate) fn verify_witness_opening_for_protocol(
     opening: &crate::pcs::OpeningProof,
 ) -> Result<(), UniformError> {
     verify_opening_for_protocol(protocol, commitments, point, values, descriptor, opening)
+}
+
+pub(crate) fn prove_witness_selected_opening(
+    witness: &CommittedWitness,
+    point: &[NativeField],
+    selected_columns: &[usize],
+    descriptor: &[u8],
+) -> Result<(Vec<NativeField>, crate::pcs::OpeningProof), UniformError> {
+    prove_selected_opening(witness, point, selected_columns, descriptor)
+}
+
+pub(crate) fn verify_witness_selected_opening_for_protocol(
+    protocol: NativeProtocolVersion,
+    commitments: &WitnessCommitments,
+    point: &[NativeField],
+    values: &[NativeField],
+    selected_columns: &[usize],
+    descriptor: &[u8],
+    opening: &crate::pcs::OpeningProof,
+) -> Result<(), UniformError> {
+    verify_selected_opening_for_protocol(
+        protocol,
+        commitments,
+        point,
+        values,
+        selected_columns,
+        descriptor,
+        opening,
+    )
 }
 
 fn prove_uniform_committed_on_worker(

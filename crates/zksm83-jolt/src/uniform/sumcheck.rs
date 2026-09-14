@@ -338,11 +338,25 @@ where
 {
     load_pair_rows(columns, pair_index, low_row, row_deltas)?;
     let (weight_low, weight_delta) = pair_low_and_delta(weights, pair_index)?;
-    for (point, evaluation) in points.iter().copied().zip(message) {
-        interpolate_loaded_row(low_row, row_deltas, point, row)?;
-        let weight = weight_low + point * weight_delta;
-        *evaluation +=
-            weight * combined_relation_with_powers(relation, row, constraint_powers, constraints)?;
+    for (point_index, (point, evaluation)) in points.iter().copied().zip(message).enumerate() {
+        let (interpolated_row, weight) = match point_index {
+            0 => (&*low_row, weight_low),
+            1 => {
+                interpolate_loaded_row_at_one(low_row, row_deltas, row)?;
+                (&*row, weight_low + weight_delta)
+            }
+            _ => {
+                interpolate_loaded_row(low_row, row_deltas, point, row)?;
+                (&*row, weight_low + point * weight_delta)
+            }
+        };
+        *evaluation += weight
+            * combined_relation_with_powers(
+                relation,
+                interpolated_row,
+                constraint_powers,
+                constraints,
+            )?;
     }
     Ok(())
 }
@@ -430,6 +444,20 @@ fn interpolate_loaded_row(
     Ok(())
 }
 
+fn interpolate_loaded_row_at_one(
+    low_row: &[NativeField],
+    row_deltas: &[NativeField],
+    output: &mut [NativeField],
+) -> Result<(), UniformError> {
+    if low_row.len() != row_deltas.len() || low_row.len() != output.len() {
+        return Err(UniformError::Shape);
+    }
+    for ((output, low), delta) in output.iter_mut().zip(low_row).zip(row_deltas) {
+        *output = *low + *delta;
+    }
+    Ok(())
+}
+
 fn combined_relation(
     relation: &impl UniformRelation,
     row: &[NativeField],
@@ -469,7 +497,9 @@ fn combined_relation_with_powers(
     let mut combined = zero;
     let mixed_constraints = trim_zero_suffix(constraints);
     for (constraint, power) in mixed_constraints.iter().copied().zip(constraint_powers) {
-        combined += *power * constraint;
+        if constraint != zero {
+            combined += *power * constraint;
+        }
     }
     Ok(combined)
 }

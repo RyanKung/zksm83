@@ -19,8 +19,8 @@ use crate::{
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
     uniform::{
-        CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        verify_uniform_composite_for_protocol,
+        CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
+        prove_uniform_composite, verify_uniform_composite_for_protocol,
     },
 };
 
@@ -247,7 +247,11 @@ pub(crate) fn prove_prepared_packed_mutable_memory(
         phase_one,
         challenges,
     } = prepared;
-    let relation = block_event::BlockMemoryEventRelation::new(challenges);
+    let relation = ProjectedRelation::new(
+        block_event::BlockMemoryEventRelation::new(challenges),
+        BLOCK_CPU_COLUMN_COUNT,
+        block_event::trace_columns()?,
+    )?;
     let event_relation = prove_uniform_composite(&relation, trace_witness, &trace_inverses)?;
     let clock = clock::prove_at(trace_witness, &phase_one, BLOCK_MEMORY_ROW_BITS_START)?;
     let full = full_descriptor(
@@ -315,7 +319,11 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
         &proof.final_timestamps,
     )?;
     let challenges = challenges(&phase_one)?;
-    let relation = block_event::BlockMemoryEventRelation::new(challenges);
+    let relation = ProjectedRelation::new(
+        block_event::BlockMemoryEventRelation::new(challenges),
+        BLOCK_CPU_COLUMN_COUNT,
+        block_event::trace_columns()?,
+    )?;
     verify_uniform_composite_for_protocol(
         protocol,
         &relation,

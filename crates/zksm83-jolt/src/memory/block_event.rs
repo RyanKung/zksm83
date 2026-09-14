@@ -37,6 +37,41 @@ impl BlockMemoryEventRelation {
     }
 }
 
+pub(super) fn trace_columns() -> Result<Vec<usize>, MutableMemoryError> {
+    let mut columns =
+        Vec::with_capacity(UNIFORM_NUM_VARIABLES + BUS_SLOTS * (5 + TRACE_MEMORY_TIMESTAMP_BITS));
+    for bit in 0..UNIFORM_NUM_VARIABLES {
+        columns.push(
+            BLOCK_MEMORY_ROW_BITS_START
+                .checked_add(bit)
+                .ok_or(MutableMemoryError::Shape)?,
+        );
+    }
+    for slot in 0..BUS_SLOTS {
+        columns.push(memory_selector_column(slot)?);
+        columns.push(memory_write_selector_column(slot)?);
+        for bit in 0..TRACE_MEMORY_TIMESTAMP_BITS {
+            columns.push(memory_predecessor_bit_column(slot, bit)?);
+        }
+        for relative in [
+            slot_physical_address_column(slot)?,
+            slot_before_column(slot)?,
+            slot_value_column(slot)?,
+        ] {
+            columns.push(packed_bus_column(relative)?);
+        }
+    }
+    columns.sort_unstable();
+    columns.dedup();
+    if columns
+        .iter()
+        .any(|column| *column >= BLOCK_CPU_COLUMN_COUNT)
+    {
+        return Err(MutableMemoryError::Shape);
+    }
+    Ok(columns)
+}
+
 impl UniformRelation for BlockMemoryEventRelation {
     fn domain(&self) -> &'static [u8] {
         b"zksm83/native-block-memory-event-inverses/v2"

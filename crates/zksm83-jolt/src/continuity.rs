@@ -18,8 +18,8 @@ use crate::{
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::OpeningProof,
     uniform::{
-        CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        prove_witness_opening, verify_uniform_composite_for_protocol,
+        CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
+        prove_uniform_composite, prove_witness_opening, verify_uniform_composite_for_protocol,
         verify_witness_opening_for_protocol,
     },
 };
@@ -220,7 +220,11 @@ pub(crate) fn prove_prepared_packed_continuity(
         phase_one,
         challenges,
     } = prepared;
-    let relation = ContinuityRelation::new(layout, challenges);
+    let relation = ProjectedRelation::new(
+        ContinuityRelation::new(layout, challenges),
+        layout.trace_column_count(),
+        layout.trace_columns()?,
+    )?;
     let relation_proof = prove_uniform_composite(&relation, trace_witness, &inverses)?;
     let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
     let sum = on_worker(|| prove_sum(protocol, layout, &inverses, claim, challenges, &full))?;
@@ -269,7 +273,11 @@ fn verify_for_layout(
     claim.validate()?;
     let phase_one = phase_one_descriptor(protocol, layout, trace, claim)?;
     let challenges = challenges(protocol, layout, &phase_one)?;
-    let relation = ContinuityRelation::new(layout, challenges);
+    let relation = ProjectedRelation::new(
+        ContinuityRelation::new(layout, challenges),
+        layout.trace_column_count(),
+        layout.trace_columns()?,
+    )?;
     verify_uniform_composite_for_protocol(
         protocol,
         &relation,
@@ -335,6 +343,41 @@ impl ContinuityLayout {
             device_state_column(after, scalar)
         }?;
         BLOCK_ROUTING_COLUMN_COUNT.checked_add(relative)
+    }
+
+    fn trace_columns(self) -> Result<Vec<usize>, UniformError> {
+        let mut columns = Vec::with_capacity(
+            2 + BASIC_BLOCK_INSTRUCTION_BOUND + TRACE_ROW_BIT_COUNT + STATE_SCALAR_COUNT * 2,
+        );
+        columns.push(self.active_column());
+        columns.push(crate::block_metadata::INSTRUCTION_BLOCK);
+        for lane in 0..BASIC_BLOCK_INSTRUCTION_BOUND {
+            columns.push(crate::block_metadata::lane_column(lane).ok_or(UniformError::Shape)?);
+        }
+        for bit in 0..TRACE_ROW_BIT_COUNT {
+            columns.push(
+                self.row_bits_start()
+                    .checked_add(bit)
+                    .ok_or(UniformError::Shape)?,
+            );
+        }
+        for after in [false, true] {
+            for scalar in 0..STATE_SCALAR_COUNT {
+                columns.push(
+                    self.state_column(after, scalar)
+                        .ok_or(UniformError::Shape)?,
+                );
+            }
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        if columns
+            .iter()
+            .any(|column| *column >= self.trace_column_count())
+        {
+            return Err(UniformError::Shape);
+        }
+        Ok(columns)
     }
 }
 

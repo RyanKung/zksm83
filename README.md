@@ -1,8 +1,7 @@
 # zksm83
 
-`zksm83` is a native SM83 proof-system research workspace. It executes the
-SM83 transition relation directly; no RV64 guest, compiler, or emulator replay
-exists in the proving or verification path.
+`zksm83` is a native SM83 proof-system research workspace. It executes and
+proves the SM83 transition relation directly.
 
 The only proof pipeline is `zksm83-jolt`: a transparent Akita lattice-PCS
 receipt over a shared native witness. It binds the complete SM83 CPU/ISA
@@ -18,9 +17,20 @@ commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
 New statements and receipts use a hard-cut native receipt v2. Its 4,565-column
-packed CPU plane forms 36 ordered commitment groups opened as 18
-schedule-bound adjacent pairs. High-level encoders and decoders reject v1;
-there is no legacy receipt fallback.
+packed CPU plane forms 36 ordered commitment groups. The full CPU relation
+opens all 18 schedule-bound adjacent pairs. Memory-event, continuity, and log
+sumchecks use transcript-bound projections containing only the main columns
+they consume. The four ISA lanes are reduced by one Fiat-Shamir random linear
+combination and share one table proof plus two trace openings; ISA, ROM,
+fixed-clock, and projected composite checks open only the adjacent pairs they
+consume. High-level encoders and decoders reject v1; there is no legacy
+receipt fallback.
+
+Source-level accounting for one segment now schedules 33 main-trace
+group-pair opening proofs instead of the former 270: 18 for the full CPU
+relation and 15 across projected memory, continuity, logs, batched ISA, ROM,
+and fixed clock checks. ISA table proofs fall from four to one. These are
+algorithmic operation counts; no proof timing is inferred from them.
 
 The former one-transition CPU, continuity, mutable-memory, and protocol-log
 proof APIs and their wire layouts have been deleted. The one-transition trace

@@ -14,8 +14,8 @@ use crate::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_opening,
-        verify_witness_opening_for_protocol,
+        CommittedWitness, WitnessCommitments, prove_witness_selected_opening,
+        verify_witness_selected_opening_for_protocol,
     },
 };
 
@@ -314,14 +314,21 @@ fn prove_on_worker(
     if address_claim != table_sumcheck.final_left() {
         return Err(RomLookupError::AddressBindingMismatch);
     }
-    let trace_cycle_values = evaluate_columns(trace_columns.as_slice(), &cycle_point)?;
+    let (trace_cycle_values, trace_cycle_opening) =
+        prove_witness_selected_opening(witness, &cycle_point, &layout.values, &descriptor)?;
     require_mixed_value(
         &trace_cycle_values,
         &layout.values,
         &coefficients,
         claimed_output,
     )?;
-    let trace_address_values = evaluate_columns(trace_columns.as_slice(), &address_point)?;
+    let address_opening_columns = address_opening_columns(layout);
+    let (trace_address_values, trace_address_opening) = prove_witness_selected_opening(
+        witness,
+        &address_point,
+        &address_opening_columns,
+        &descriptor,
+    )?;
     verify_address_terminal(
         &address_sumcheck,
         layout,
@@ -338,10 +345,6 @@ fn prove_on_worker(
         &table_values,
         &descriptor,
     )?;
-    let trace_cycle_opening =
-        prove_witness_opening(witness, &cycle_point, &trace_cycle_values, &descriptor)?;
-    let trace_address_opening =
-        prove_witness_opening(witness, &address_point, &trace_address_values, &descriptor)?;
     Ok(RomLookupProof {
         claimed_output,
         table_sumcheck,
@@ -390,11 +393,12 @@ fn verify_on_worker(
         ROM_LOOKUP_FACTOR_COUNT,
         &mut transcript,
     )?;
-    verify_witness_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol(
         protocol,
         trace_commitments,
         &cycle_point,
         &proof.trace_cycle_values,
+        &layout.values,
         &descriptor,
         &proof.trace_cycle_opening,
     )?;
@@ -404,11 +408,13 @@ fn verify_on_worker(
         &coefficients,
         proof.claimed_output,
     )?;
-    verify_witness_opening_for_protocol(
+    let address_opening_columns = address_opening_columns(layout);
+    verify_witness_selected_opening_for_protocol(
         protocol,
         trace_commitments,
         &address_point,
         &proof.trace_address_values,
+        &address_opening_columns,
         &descriptor,
         &proof.trace_address_opening,
     )?;
@@ -421,6 +427,14 @@ fn verify_on_worker(
         &address_point,
         &proof.trace_address_values,
     )
+}
+
+fn address_opening_columns(layout: RomLookupColumns) -> Vec<usize> {
+    layout
+        .selectors
+        .into_iter()
+        .chain(layout.address_bits.into_iter().flatten())
+        .collect()
 }
 
 fn read_address_entries(

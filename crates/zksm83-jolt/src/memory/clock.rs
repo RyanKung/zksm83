@@ -4,7 +4,10 @@ use crate::{
     NativeField, NativeProtocolVersion, TRACE_ROW_BIT_COUNT, UNIFORM_NUM_VARIABLES,
     WitnessCommitments,
     pcs::OpeningProof,
-    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
+    uniform::{
+        CommittedWitness, prove_witness_selected_opening,
+        verify_witness_selected_opening_for_protocol,
+    },
 };
 
 use super::{MutableMemoryError, push_bytes, transcript};
@@ -24,14 +27,10 @@ pub(super) fn prove_at(
 ) -> Result<ClockProof, MutableMemoryError> {
     let descriptor = descriptor(phase_one)?;
     let point = point(&descriptor);
-    let columns = trace.field_columns()?;
-    let values = columns
-        .as_slice()
-        .iter()
-        .map(|column| super::evaluate_field_column(column, &point))
-        .collect::<Result<Vec<_>, _>>()?;
+    let selected_columns = row_bit_columns(row_bits_start)?;
+    let (values, opening) =
+        prove_witness_selected_opening(trace, &point, &selected_columns, &descriptor)?;
     check_row_bits(&values, &point, row_bits_start)?;
-    let opening = prove_witness_opening(trace, &point, &values, &descriptor)?;
     Ok(ClockProof { values, opening })
 }
 
@@ -44,15 +43,24 @@ pub(super) fn verify_at(
 ) -> Result<(), MutableMemoryError> {
     let descriptor = descriptor(phase_one)?;
     let point = point(&descriptor);
-    verify_witness_opening_for_protocol(
+    let selected_columns = row_bit_columns(row_bits_start)?;
+    verify_witness_selected_opening_for_protocol(
         protocol,
         trace,
         &point,
         &proof.values,
+        &selected_columns,
         &descriptor,
         &proof.opening,
     )?;
     check_row_bits(&proof.values, &point, row_bits_start)
+}
+
+fn row_bit_columns(row_bits_start: usize) -> Result<Vec<usize>, MutableMemoryError> {
+    let end = row_bits_start
+        .checked_add(TRACE_ROW_BIT_COUNT)
+        .ok_or(MutableMemoryError::Shape)?;
+    Ok((row_bits_start..end).collect())
 }
 
 fn descriptor(phase_one: &[u8]) -> Result<Vec<u8>, MutableMemoryError> {

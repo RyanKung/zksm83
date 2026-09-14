@@ -546,6 +546,61 @@ pub(crate) fn prove_opening(
     Ok(OpeningProof { groups })
 }
 
+pub(crate) fn prove_selected_opening(
+    layout: PcsLayout,
+    columns: &CommittedColumns,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    selected_columns: &[usize],
+    instance_descriptor: &[u8],
+) -> Result<OpeningProof, PcsError> {
+    let opening_indices = selected_opening_indices(layout, &columns.commitments, selected_columns)?;
+    validate_selected_opening_shape(
+        layout,
+        &columns.commitments,
+        point,
+        logical_values,
+        &opening_indices,
+        opening_indices.len(),
+    )?;
+    let _phase = metrics::start(Phase::Opening);
+    let prover = columns.context.context(layout)?;
+    let stack = prover.stack()?;
+    let mut groups = Vec::with_capacity(opening_indices.len());
+    for opening_index in opening_indices {
+        let group_start = opening_index
+            .checked_mul(layout.groups_per_opening())
+            .ok_or(PcsError::Shape)?;
+        let group_end = group_start
+            .checked_add(layout.groups_per_opening())
+            .ok_or(PcsError::Shape)?;
+        let commitments = columns
+            .commitments
+            .groups
+            .get(group_start..group_end)
+            .ok_or(PcsError::Shape)?;
+        let batches = columns
+            .batches
+            .get(group_start..group_end)
+            .ok_or(PcsError::Shape)?;
+        let values = (group_start..group_end)
+            .map(|group_index| padded_group_values(layout, logical_values, group_index))
+            .collect::<Result<Vec<_>, _>>()?;
+        groups.push(prove_group_batch(
+            layout,
+            prover,
+            &stack,
+            commitments,
+            batches,
+            point,
+            values,
+            instance_descriptor,
+            opening_index,
+        )?);
+    }
+    Ok(OpeningProof { groups })
+}
+
 fn prove_independent_openings(
     layout: PcsLayout,
     prover: &PcsProverContext,
@@ -728,6 +783,91 @@ pub(crate) fn verify_opening(
     Ok(())
 }
 
+pub(crate) fn verify_selected_opening(
+    layout: PcsLayout,
+    commitments: &ColumnCommitments,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    selected_columns: &[usize],
+    instance_descriptor: &[u8],
+    opening: &OpeningProof,
+) -> Result<(), PcsError> {
+    let opening_indices = selected_opening_indices(layout, commitments, selected_columns)?;
+    validate_selected_opening_shape(
+        layout,
+        commitments,
+        point,
+        logical_values,
+        &opening_indices,
+        opening.groups.len(),
+    )?;
+    let scheme = scheme(layout)?;
+    let (schedule, _) = validate_schedule(layout, &scheme)?;
+    let prover_setup = scheme.setup_prover(layout.num_variables, layout.setup_capacity()?)?;
+    let verifier_setup = match layout.opening_mode {
+        PcsOpeningMode::Independent => scheme.setup_verifier(&prover_setup)?,
+        PcsOpeningMode::Paired => {
+            let sizes = vec![layout.group_columns; layout.groups_per_opening()];
+            let claims_layout =
+                OpeningClaimsLayout::from_group_sizes(layout.num_variables, &sizes)?;
+            scheme.setup_verifier_for_schedule(&prover_setup, &schedule, &claims_layout)?
+        }
+    };
+    for (opening_index, group_opening) in opening_indices.into_iter().zip(&opening.groups) {
+        let group_start = opening_index
+            .checked_mul(layout.groups_per_opening())
+            .ok_or(PcsError::Shape)?;
+        let group_end = group_start
+            .checked_add(layout.groups_per_opening())
+            .ok_or(PcsError::Shape)?;
+        let committed_groups = commitments
+            .groups
+            .get(group_start..group_end)
+            .ok_or(PcsError::Shape)?;
+        verify_group_batch(
+            layout,
+            &scheme,
+            &verifier_setup,
+            committed_groups,
+            point,
+            logical_values,
+            instance_descriptor,
+            opening_index,
+            group_opening,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn selected_logical_columns(
+    layout: PcsLayout,
+    commitments: &ColumnCommitments,
+    selected_columns: &[usize],
+) -> Result<Vec<usize>, PcsError> {
+    let opening_indices = selected_opening_indices(layout, commitments, selected_columns)?;
+    let columns_per_opening = layout
+        .group_columns
+        .checked_mul(layout.groups_per_opening())
+        .ok_or(PcsError::Shape)?;
+    let mut columns = Vec::with_capacity(
+        opening_indices
+            .len()
+            .checked_mul(columns_per_opening)
+            .ok_or(PcsError::Shape)?,
+    );
+    for opening_index in opening_indices {
+        let start = opening_index
+            .checked_mul(columns_per_opening)
+            .ok_or(PcsError::Shape)?;
+        let end = start
+            .checked_add(columns_per_opening)
+            .map(|end| end.min(commitments.logical_column_count))
+            .ok_or(PcsError::Shape)?;
+        columns.extend(start..end);
+    }
+    Ok(columns)
+}
+
 pub(crate) fn scheme(layout: PcsLayout) -> Result<AkitaCommitmentScheme<Config>, PcsError> {
     AkitaCommitmentScheme::<Config>::from_schedule_artifact(layout.schedule_artifact)
         .map_err(PcsError::Akita)
@@ -906,6 +1046,90 @@ fn validate_opening_shape(
         return Err(PcsError::Shape);
     }
     Ok(())
+}
+
+fn validate_selected_opening_shape(
+    layout: PcsLayout,
+    commitments: &ColumnCommitments,
+    point: &[NativeField],
+    logical_values: &[NativeField],
+    opening_indices: &[usize],
+    opening_count: usize,
+) -> Result<(), PcsError> {
+    commitments.validate(layout)?;
+    if point.len() != layout.num_variables
+        || logical_values.len() != commitments.logical_column_count
+        || opening_indices.is_empty()
+        || opening_count != opening_indices.len()
+    {
+        return Err(PcsError::Shape);
+    }
+    let selected = selected_logical_columns_from_indices(layout, commitments, opening_indices)?;
+    let zero = NativeField::from_u64(0);
+    let mut selected_cursor = selected.into_iter().peekable();
+    for (index, value) in logical_values.iter().copied().enumerate() {
+        if selected_cursor.peek().copied() == Some(index) {
+            let _selected = selected_cursor.next();
+        } else if value != zero {
+            return Err(PcsError::Shape);
+        }
+    }
+    if selected_cursor.next().is_some() {
+        return Err(PcsError::Shape);
+    }
+    Ok(())
+}
+
+fn selected_opening_indices(
+    layout: PcsLayout,
+    commitments: &ColumnCommitments,
+    selected_columns: &[usize],
+) -> Result<Vec<usize>, PcsError> {
+    commitments.validate(layout)?;
+    if selected_columns.is_empty() {
+        return Err(PcsError::Shape);
+    }
+    let opening_count = layout.opening_count(commitments.groups.len())?;
+    let columns_per_opening = layout
+        .group_columns
+        .checked_mul(layout.groups_per_opening())
+        .ok_or(PcsError::Shape)?;
+    let mut selected = vec![false; opening_count];
+    for column in selected_columns {
+        if *column >= commitments.logical_column_count {
+            return Err(PcsError::Shape);
+        }
+        let opening_index = column / columns_per_opening;
+        *selected.get_mut(opening_index).ok_or(PcsError::Shape)? = true;
+    }
+    Ok(selected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, selected)| selected.then_some(index))
+        .collect())
+}
+
+fn selected_logical_columns_from_indices(
+    layout: PcsLayout,
+    commitments: &ColumnCommitments,
+    opening_indices: &[usize],
+) -> Result<Vec<usize>, PcsError> {
+    let columns_per_opening = layout
+        .group_columns
+        .checked_mul(layout.groups_per_opening())
+        .ok_or(PcsError::Shape)?;
+    let mut columns = Vec::new();
+    for opening_index in opening_indices {
+        let start = opening_index
+            .checked_mul(columns_per_opening)
+            .ok_or(PcsError::Shape)?;
+        let end = start
+            .checked_add(columns_per_opening)
+            .map(|end| end.min(commitments.logical_column_count))
+            .ok_or(PcsError::Shape)?;
+        columns.extend(start..end);
+    }
+    Ok(columns)
 }
 
 fn padded_group_values(

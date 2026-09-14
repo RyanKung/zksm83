@@ -17,8 +17,8 @@ use crate::{
     block_metadata::{lane_column, lane_value},
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     uniform::{
-        CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
-        verify_uniform_composite_for_protocol,
+        CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
+        prove_uniform_composite, verify_uniform_composite_for_protocol,
     },
 };
 
@@ -37,6 +37,58 @@ const PACKED_LANES: [zksm83_trace::BasicBlockLaneIndex; PACKED_ISA_LANES] = [
     zksm83_trace::BasicBlockLaneIndex::Lane2,
     zksm83_trace::BasicBlockLaneIndex::Lane3,
 ];
+
+fn relation_trace_columns() -> Result<Vec<usize>, ProtocolLogError> {
+    let mut columns = Vec::with_capacity(
+        crate::UNIFORM_NUM_VARIABLES
+            + TRACE_BUS_SLOTS * (TRACE_BUS_KIND_BITS + 7)
+            + PACKED_ISA_LANES * 3,
+    );
+    for bit in 0..crate::UNIFORM_NUM_VARIABLES {
+        columns.push(
+            BLOCK_MEMORY_ROW_BITS_START
+                .checked_add(bit)
+                .ok_or(ProtocolLogError::Shape)?,
+        );
+    }
+    for slot in 0..TRACE_BUS_SLOTS {
+        columns.push(packed_bus_trace_column(slot_active_column(slot)?)?);
+        for bit in 0..TRACE_BUS_KIND_BITS {
+            columns.push(packed_bus_trace_column(slot_kind_bit_column(slot, bit)?)?);
+        }
+        for relative in [
+            slot_address_column(slot)?,
+            slot_physical_address_column(slot)?,
+            slot_before_column(slot)?,
+            slot_auxiliary_column(slot)?,
+            slot_value_column(slot)?,
+            slot_index_column(slot)?,
+        ] {
+            columns.push(packed_bus_trace_column(relative)?);
+        }
+    }
+    for (lane, typed_lane) in PACKED_LANES.iter().copied().enumerate() {
+        columns.push(lane_column(lane).ok_or(ProtocolLogError::Shape)?);
+        let outputs = BlockCpuWitness::lane_isa_lookup_columns(typed_lane)
+            .map_err(|_| ProtocolLogError::Shape)?
+            .outputs();
+        columns.push(*outputs.get(ISA_PACKED_LOW).ok_or(ProtocolLogError::Shape)?);
+        columns.push(
+            *outputs
+                .get(ISA_PACKED_HIGH)
+                .ok_or(ProtocolLogError::Shape)?,
+        );
+    }
+    columns.sort_unstable();
+    columns.dedup();
+    if columns
+        .iter()
+        .any(|column| *column >= BLOCK_CPU_COLUMN_COUNT)
+    {
+        return Err(ProtocolLogError::Shape);
+    }
+    Ok(columns)
+}
 
 pub(super) fn log_columns(trace: &BlockCpuWitness) -> Result<Vec<Vec<u64>>, ProtocolLogError> {
     let entries = extract_entries(trace)?;
@@ -195,8 +247,12 @@ pub(super) fn prove(
     inverses: &CommittedWitness,
     challenges: LogChallenges,
 ) -> Result<CompositeUniformRelationProof, ProtocolLogError> {
-    prove_uniform_composite(&PackedTraceLogRelation { challenges }, trace, inverses)
-        .map_err(Into::into)
+    let relation = ProjectedRelation::new(
+        PackedTraceLogRelation { challenges },
+        BLOCK_CPU_COLUMN_COUNT,
+        relation_trace_columns()?,
+    )?;
+    prove_uniform_composite(&relation, trace, inverses).map_err(Into::into)
 }
 
 pub(super) fn verify(
@@ -206,14 +262,13 @@ pub(super) fn verify(
     challenges: LogChallenges,
     proof: &CompositeUniformRelationProof,
 ) -> Result<(), ProtocolLogError> {
-    verify_uniform_composite_for_protocol(
-        protocol,
-        &PackedTraceLogRelation { challenges },
-        trace,
-        inverses,
-        proof,
-    )
-    .map_err(Into::into)
+    let relation = ProjectedRelation::new(
+        PackedTraceLogRelation { challenges },
+        BLOCK_CPU_COLUMN_COUNT,
+        relation_trace_columns()?,
+    )?;
+    verify_uniform_composite_for_protocol(protocol, &relation, trace, inverses, proof)
+        .map_err(Into::into)
 }
 
 struct PackedTraceLogRelation {
@@ -555,10 +610,14 @@ fn packed_bus_value(
     relative: usize,
     row: usize,
 ) -> Result<u64, ProtocolLogError> {
-    let column = BLOCK_ISA_CONTROL_COLUMN_COUNT
-        .checked_add(relative)
-        .ok_or(ProtocolLogError::Shape)?;
+    let column = packed_bus_trace_column(relative)?;
     trace_value(trace.columns(), column, row)
+}
+
+fn packed_bus_trace_column(relative: usize) -> Result<usize, ProtocolLogError> {
+    BLOCK_ISA_CONTROL_COLUMN_COUNT
+        .checked_add(relative)
+        .ok_or(ProtocolLogError::Shape)
 }
 
 fn push_selected(
