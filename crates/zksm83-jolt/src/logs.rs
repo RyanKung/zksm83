@@ -12,7 +12,8 @@ use jolt_field::CanonicalBytes;
 use thiserror::Error;
 
 use crate::{
-    AkitaWorkerError, NativeField, NativeProtocolVersion, UniformError, WitnessCommitments,
+    AkitaWorkerError, FieldFoldError, NativeField, NativeProtocolVersion, UniformError,
+    WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
 };
@@ -76,7 +77,9 @@ pub use packed::{
     PackedProtocolLogClaim, PackedProtocolLogProof, commit_packed_protocol_logs,
     prove_packed_protocol_logs, verify_packed_protocol_logs,
 };
-pub(crate) use packed::{prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs};
+pub(crate) use packed::{
+    prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs_with_backend,
+};
 
 /// Invalid log table, cursor claim, proof shape, or backend operation.
 #[derive(Debug, Error)]
@@ -99,6 +102,9 @@ pub enum ProtocolLogError {
     /// A sumcheck transcript was rejected.
     #[error("native protocol-log sumcheck failed")]
     Sumcheck,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// A trace-side uniform relation or opening was rejected.
     #[error(transparent)]
     Uniform(#[from] UniformError),
@@ -175,8 +181,11 @@ impl From<PcsError> for ProtocolLogError {
 }
 
 impl From<ProductSumcheckError> for ProtocolLogError {
-    fn from(_: ProductSumcheckError) -> Self {
-        Self::Sumcheck
+    fn from(error: ProductSumcheckError) -> Self {
+        match error {
+            ProductSumcheckError::FieldFold(source) => Self::FieldFold(source),
+            _ => Self::Sumcheck,
+        }
     }
 }
 

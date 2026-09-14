@@ -130,10 +130,19 @@ about **6 hours**, with **8–10 hours** as a conservative planning number. That
 is roughly **2,000–3,600 times slower than real time**. Workload-dependent
 packing makes this range wide; it is not a formal upper bound.
 
-The current code has no CUDA prover. Merely running it on a machine containing
-an NVIDIA V100 does not provide a GPU speedup; field arithmetic, sumcheck,
-folding, and Akita commitment/opening kernels would first need a real CUDA
-implementation and separate measurement.
+The native prover has an optional experimental CUDA execution backend. Its
+first bounded slice offloads dense binary field-fold layers used by uniform and
+product sumchecks. Witness construction, relation evaluation, Akita
+commitments/openings, transcript handling, encoding, and verification remain
+on the CPU, so this must not yet be reported as a complete GPU prover or a
+measured end-to-end speedup.
+
+CUDA support lives in `crates/zksm83-cuda` and is disabled by default. The
+kernel uses a portable two-limb implementation over the native field. `sm_70`
+is only the minimum cuda-oxide capability for this implementation, not a fixed
+deployment target: `cargo oxide run` detects device 0, `--arch` or
+`CUDA_OXIDE_TARGET` can select another build target, and the prover separately
+selects its runtime device with `--cuda-device`.
 
 Nightstream is tracked only as an implementation reference for lattice CCS
 folding architecture, optimized oracle/sumcheck code shape, and Ajtai
@@ -211,6 +220,31 @@ cargo run --release -p zksm83-jolt --bin zksm83-native-prover -- \
 Replace `--preflight-only` with `--segment-limit 1` for a bounded first proof
 run. Repeat the same command with `--resume` to verify the durable prefix and
 continue from the exact saved boundary.
+
+The normal command uses `--proof-backend cpu` by default. On a Linux CUDA host,
+build and run through cuda-oxide to select the optional backend:
+
+```sh
+cd crates/zksm83-jolt
+cargo +nightly-2026-08-28 oxide run --features cuda \
+  --bin zksm83-native-prover -- \
+  --rom /absolute/path/cartridge.gb \
+  --input /absolute/path/input-schedule.json \
+  --expected-checkpoint /absolute/path/expected-endpoint.json \
+  --spool /absolute/path/native.spool \
+  --progress-checkpoint /absolute/path/native.progress.json \
+  --receipt /absolute/path/native.receipt.bin \
+  --statement /absolute/path/native.statement.bin \
+  --proof-backend cuda \
+  --cuda-device 0 \
+  --segment-limit 1
+```
+
+An explicit CUDA request fails if the feature, Linux host, selected device, or
+kernel launch is unavailable; it never silently falls back to CPU. Backend
+selection is execution-only and does not enter proof bytes, receipts,
+statements, transcripts, or the protocol backend digest. A resumed spool may
+therefore continue with a different execution backend.
 
 Use `--inspect-progress-only` with the same paths to verify an existing
 progress/spool pair without opening it for writing. Inspection checks every

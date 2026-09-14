@@ -9,7 +9,7 @@ use super::{
     push_usize, replay_sumcheck, sample_point, validate_relation, verify_opening_for_protocol,
     verify_selected_opening_for_protocol,
 };
-use crate::NativeProtocolVersion;
+use crate::{NativeProtocolVersion, NativeProverBackend};
 
 const PROJECTED_RELATION_DOMAIN: &[u8] = b"zksm83/native-projected-relation/v2";
 
@@ -217,12 +217,21 @@ pub(crate) struct CompositeUniformRelationProof {
     pub(crate) right_opening: OpeningProof,
 }
 
-pub(crate) fn prove_uniform_composite<R: UniformRelation>(
+pub(crate) fn prove_uniform_composite_with_backend<R: UniformRelation>(
     relation: &ProjectedRelation<R>,
     left: &CommittedWitness,
     right: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<CompositeUniformRelationProof, UniformError> {
-    super::on_worker(|| prove_on_worker(NativeProtocolVersion::current(), relation, left, right))
+    super::on_worker(|| {
+        prove_on_worker(
+            NativeProtocolVersion::current(),
+            relation,
+            left,
+            right,
+            backend,
+        )
+    })
 }
 
 pub(crate) fn verify_uniform_composite_for_protocol<R: UniformRelation>(
@@ -240,6 +249,7 @@ fn prove_on_worker<R: UniformRelation>(
     relation: &ProjectedRelation<R>,
     left: &CommittedWitness,
     right: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<CompositeUniformRelationProof, UniformError> {
     validate_shapes(protocol, relation, left.commitments(), right.commitments())?;
     let left_columns = left.field_columns()?;
@@ -264,8 +274,14 @@ fn prove_on_worker<R: UniformRelation>(
         return Err(UniformError::ZeroChallenge);
     }
     let weights = super::equality_evaluations(&row_point);
-    let (rounds, opening_point, opened_values) =
-        prove_sumcheck(relation, &columns, weights, constraint_mix, &mut transcript)?;
+    let (rounds, opening_point, opened_values) = prove_sumcheck(
+        relation,
+        &columns,
+        weights,
+        constraint_mix,
+        backend,
+        &mut transcript,
+    )?;
     let split = relation.trace_columns().len();
     let selected_values = opened_values.get(..split).ok_or(UniformError::Shape)?;
     let right_values = opened_values

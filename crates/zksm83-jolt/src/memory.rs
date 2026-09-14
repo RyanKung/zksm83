@@ -13,14 +13,14 @@ use thiserror::Error;
 
 use crate::{
     AKITA_MEMORY_SCHEDULE_SHA256, AkitaWorkerError, BLOCK_CPU_COLUMN_COUNT, BlockCpuWitness,
-    NativeField, NativeProtocolVersion, TRACE_MEMORY_TIMESTAMP_BITS, UniformError,
-    WitnessCommitments,
+    FieldFoldError, NativeField, NativeProtocolVersion, NativeProverBackend,
+    TRACE_MEMORY_TIMESTAMP_BITS, UniformError, WitnessCommitments,
     block_memory::BLOCK_MEMORY_ROW_BITS_START,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
-        prove_uniform_composite, verify_uniform_composite_for_protocol,
+        prove_uniform_composite_with_backend, verify_uniform_composite_for_protocol,
     },
 };
 
@@ -108,6 +108,9 @@ pub enum MutableMemoryError {
     /// A sumcheck transcript was rejected.
     #[error("native mutable-memory sumcheck failed")]
     Sumcheck,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// Shared trace relation or opening verification failed.
     #[error(transparent)]
     Uniform(#[from] UniformError),
@@ -135,8 +138,11 @@ impl From<PcsError> for MutableMemoryError {
 }
 
 impl From<ProductSumcheckError> for MutableMemoryError {
-    fn from(_: ProductSumcheckError) -> Self {
-        Self::Sumcheck
+    fn from(error: ProductSumcheckError) -> Self {
+        match error {
+            ProductSumcheckError::FieldFold(source) => Self::FieldFold(source),
+            _ => Self::Sumcheck,
+        }
     }
 }
 
@@ -192,7 +198,13 @@ pub fn prove_packed_mutable_memory(
     final_memory: &CommittedMemory,
 ) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
     let prepared = prepare_packed_mutable_memory(trace, trace_witness, initial, final_memory)?;
-    prove_prepared_packed_mutable_memory(prepared, trace_witness, initial, final_memory)
+    prove_prepared_packed_mutable_memory_with_backend(
+        prepared,
+        trace_witness,
+        initial,
+        final_memory,
+        &NativeProverBackend::cpu(),
+    )
 }
 
 pub(crate) fn prepare_packed_mutable_memory(
@@ -232,11 +244,12 @@ pub(crate) fn prepare_packed_mutable_memory(
     })
 }
 
-pub(crate) fn prove_prepared_packed_mutable_memory(
+pub(crate) fn prove_prepared_packed_mutable_memory_with_backend(
     prepared: PreparedPackedMutableMemory,
     trace_witness: &CommittedWitness,
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
+    backend: &NativeProverBackend,
 ) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
     let protocol = NativeProtocolVersion::current();
     let PreparedPackedMutableMemory {
@@ -252,7 +265,8 @@ pub(crate) fn prove_prepared_packed_mutable_memory(
         BLOCK_CPU_COLUMN_COUNT,
         block_event::trace_columns()?,
     )?;
-    let event_relation = prove_uniform_composite(&relation, trace_witness, &trace_inverses)?;
+    let event_relation =
+        prove_uniform_composite_with_backend(&relation, trace_witness, &trace_inverses, backend)?;
     let clock = clock::prove_at(trace_witness, &phase_one, BLOCK_MEMORY_ROW_BITS_START)?;
     let full = full_descriptor(
         protocol,
@@ -269,6 +283,7 @@ pub(crate) fn prove_prepared_packed_mutable_memory(
         &final_inverses,
         challenges,
         &full,
+        backend,
     )?;
     let multiset_sum = sum::prove(&trace_inverses, &initial_inverses, &final_inverses, &full)?;
     Ok(PackedMutableMemoryProof {

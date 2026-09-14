@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AKITA_ROM_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeProtocolVersion,
-    TRACE_BUS_SLOTS, UNIFORM_NUM_VARIABLES,
+    AKITA_ROM_SCHEDULE_SHA256, AkitaWorkerError, FieldFoldError, NativeField,
+    NativeProtocolVersion, NativeProverBackend, TRACE_BUS_SLOTS, UNIFORM_NUM_VARIABLES,
     pcs::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
         prove_opening, verify_opening,
@@ -111,6 +111,9 @@ pub enum RomLookupError {
     /// A native-field sumcheck failed.
     #[error("native ROM lookup sumcheck failed")]
     Sumcheck,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// An Akita commitment or opening operation failed.
     #[error("native ROM lookup Akita operation failed: {0}")]
     Pcs(String),
@@ -126,8 +129,11 @@ pub enum RomLookupError {
 }
 
 impl From<ProductSumcheckError> for RomLookupError {
-    fn from(_: ProductSumcheckError) -> Self {
-        Self::Sumcheck
+    fn from(error: ProductSumcheckError) -> Self {
+        match error {
+            ProductSumcheckError::FieldFold(source) => Self::FieldFold(source),
+            _ => Self::Sumcheck,
+        }
     }
 }
 
@@ -271,7 +277,16 @@ pub fn prove_rom_lookup(
     rom: &CommittedRom,
     witness: &CommittedWitness,
 ) -> Result<RomLookupProof, RomLookupError> {
-    on_worker(|| prove_on_worker(layout, rom, witness))
+    prove_rom_lookup_with_backend(layout, rom, witness, &NativeProverBackend::cpu())
+}
+
+pub(crate) fn prove_rom_lookup_with_backend(
+    layout: RomLookupColumns,
+    rom: &CommittedRom,
+    witness: &CommittedWitness,
+    backend: &NativeProverBackend,
+) -> Result<RomLookupProof, RomLookupError> {
+    on_worker(|| prove_on_worker(layout, rom, witness, backend))
 }
 
 /// Verifies ROM reads without receiving the image, addresses, or read bytes.
@@ -304,6 +319,7 @@ fn prove_on_worker(
     layout: RomLookupColumns,
     rom: &CommittedRom,
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<RomLookupProof, RomLookupError> {
     layout.validate(witness.commitments().column_count())?;
     rom.commitment.validate()?;
@@ -332,6 +348,7 @@ fn prove_on_worker(
         read_address,
         ROM_IMAGE_BYTES,
         table,
+        backend,
         &mut transcript,
     )?;
     if actual_claim != claimed_output {
@@ -347,7 +364,7 @@ fn prove_on_worker(
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        SumOfProductsSumcheckProof::prove_shared_first(terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(terms, backend, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(RomLookupError::AddressBindingMismatch);
     }

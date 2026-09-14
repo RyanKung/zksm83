@@ -12,8 +12,9 @@ use super::{
     EXECUTION_LOOKUP_OUTPUT_BIT_SHIFTS, EXECUTION_LOOKUPS_PER_BLOCK, ExecutionLookupColumns,
 };
 use crate::{
-    AkitaWorkerError, BlockCpuWitness, CommittedWitness, NativeField, NativeProtocolVersion,
-    UNIFORM_NUM_VARIABLES, UniformError, WitnessCommitments,
+    AkitaWorkerError, BlockCpuWitness, CommittedWitness, FieldFoldError, NativeField,
+    NativeProtocolVersion, NativeProverBackend, UNIFORM_NUM_VARIABLES, UniformError,
+    WitnessCommitments,
     sumcheck::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
@@ -73,6 +74,9 @@ pub enum ExecutionLookupProofError {
     /// A native-field product sumcheck failed.
     #[error("native execution lookup sumcheck failed")]
     Sumcheck,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// A shared-witness opening operation failed.
     #[error("native execution lookup shared witness opening failed: {0}")]
     SharedOpening(#[from] UniformError),
@@ -85,15 +89,19 @@ pub enum ExecutionLookupProofError {
 }
 
 impl From<ProductSumcheckError> for ExecutionLookupProofError {
-    fn from(_: ProductSumcheckError) -> Self {
-        Self::Sumcheck
+    fn from(error: ProductSumcheckError) -> Self {
+        match error {
+            ProductSumcheckError::FieldFold(source) => Self::FieldFold(source),
+            _ => Self::Sumcheck,
+        }
     }
 }
 
-pub(crate) fn prove_execution_lookups(
+pub(crate) fn prove_execution_lookups_with_backend(
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<ExecutionLookupProof, ExecutionLookupProofError> {
-    on_worker(|| prove_execution_lookups_on_worker(witness))
+    on_worker(|| prove_execution_lookups_on_worker(witness, backend))
 }
 
 pub(crate) fn verify_execution_lookups_for_protocol(
@@ -106,6 +114,7 @@ pub(crate) fn verify_execution_lookups_for_protocol(
 
 fn prove_execution_lookups_on_worker(
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<ExecutionLookupProof, ExecutionLookupProofError> {
     let layouts = canonical_layouts()?;
     validate_layouts(&layouts, witness.commitments().column_count())?;
@@ -132,7 +141,7 @@ fn prove_execution_lookups_on_worker(
     )?;
     let fixed_table = fixed_packed_table()?;
     let (table_sumcheck, actual_claim, table_point) =
-        ProductSumcheckProof::prove(&read_address, fixed_table, &mut transcript)?;
+        ProductSumcheckProof::prove(&read_address, fixed_table, backend, &mut transcript)?;
     if actual_claim != claimed_output {
         return Err(ExecutionLookupProofError::OutputClaimMismatch);
     }
@@ -148,7 +157,7 @@ fn prove_execution_lookups_on_worker(
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        SumOfProductsSumcheckProof::prove_shared_first(address_terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(address_terms, backend, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(ExecutionLookupProofError::AddressBindingMismatch);
     }

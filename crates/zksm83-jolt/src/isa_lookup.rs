@@ -4,9 +4,10 @@ use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use thiserror::Error;
 
 use crate::{
-    AKITA_ISA_TABLE_SCHEDULE_SHA256, AkitaWorkerError, COMMITMENT_GROUP_COLUMNS, ISA_OUTPUT_COUNT,
-    ISA_TABLE_ROW_COUNT, IsaTableError, NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES,
-    UniformError, fixed_isa_table, fixed_isa_table_digest,
+    AKITA_ISA_TABLE_SCHEDULE_SHA256, AkitaWorkerError, COMMITMENT_GROUP_COLUMNS, FieldFoldError,
+    ISA_OUTPUT_COUNT, ISA_TABLE_ROW_COUNT, IsaTableError, NativeField, NativeProtocolVersion,
+    NativeProverBackend, UNIFORM_NUM_VARIABLES, UniformError, fixed_isa_table,
+    fixed_isa_table_digest,
     pcs::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
         prove_opening, verify_opening,
@@ -106,6 +107,9 @@ pub enum IsaLookupError {
     /// A native-field product sumcheck failed.
     #[error("native ISA lookup sumcheck failed")]
     Sumcheck,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// An Akita commitment or opening operation failed.
     #[error("native ISA lookup Akita operation failed")]
     Pcs,
@@ -121,8 +125,11 @@ pub enum IsaLookupError {
 }
 
 impl From<ProductSumcheckError> for IsaLookupError {
-    fn from(_: ProductSumcheckError) -> Self {
-        Self::Sumcheck
+    fn from(error: ProductSumcheckError) -> Self {
+        match error {
+            ProductSumcheckError::FieldFold(source) => Self::FieldFold(source),
+            _ => Self::Sumcheck,
+        }
     }
 }
 
@@ -267,19 +274,28 @@ pub fn prove_isa_lookup(
     layout: IsaLookupColumns,
     witness: &CommittedWitness,
 ) -> Result<IsaLookupProof, IsaLookupError> {
-    on_worker(|| {
-        let table = commit_fixed_table()?;
-        prove_isa_lookups_on_worker(std::slice::from_ref(&layout), witness, &table)
-    })
+    prove_isa_lookup_with_backend(layout, witness, &NativeProverBackend::cpu())
 }
 
-pub(crate) fn prove_isa_lookups<const N: usize>(
-    layouts: [IsaLookupColumns; N],
+pub(crate) fn prove_isa_lookup_with_backend(
+    layout: IsaLookupColumns,
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<IsaLookupProof, IsaLookupError> {
     on_worker(|| {
         let table = commit_fixed_table()?;
-        prove_isa_lookups_on_worker(&layouts, witness, &table)
+        prove_isa_lookups_on_worker(std::slice::from_ref(&layout), witness, &table, backend)
+    })
+}
+
+pub(crate) fn prove_isa_lookups_with_backend<const N: usize>(
+    layouts: [IsaLookupColumns; N],
+    witness: &CommittedWitness,
+    backend: &NativeProverBackend,
+) -> Result<IsaLookupProof, IsaLookupError> {
+    on_worker(|| {
+        let table = commit_fixed_table()?;
+        prove_isa_lookups_on_worker(&layouts, witness, &table, backend)
     })
 }
 
@@ -326,6 +342,7 @@ fn prove_isa_lookups_on_worker(
     layouts: &[IsaLookupColumns],
     witness: &CommittedWitness,
     table: &CommittedColumns,
+    backend: &NativeProverBackend,
 ) -> Result<IsaLookupProof, IsaLookupError> {
     validate_layouts(layouts, witness.commitments().column_count())?;
     let table_commitments = FixedIsaCommitments {
@@ -363,7 +380,7 @@ fn prove_isa_lookups_on_worker(
         &cycle_weights,
     )?;
     let (table_sumcheck, actual_claim, table_point) =
-        ProductSumcheckProof::prove(&read_address, &mixed_table, &mut transcript)?;
+        ProductSumcheckProof::prove(&read_address, &mixed_table, backend, &mut transcript)?;
     if actual_claim != claimed_output {
         return Err(IsaLookupError::OutputClaimMismatch);
     }
@@ -383,7 +400,7 @@ fn prove_isa_lookups_on_worker(
         &table_point,
     )?;
     let (address_sumcheck, address_claim, address_point) =
-        SumOfProductsSumcheckProof::prove_shared_first(address_terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(address_terms, backend, &mut transcript)?;
     if address_claim != table_sumcheck.final_left() {
         return Err(IsaLookupError::AddressBindingMismatch);
     }

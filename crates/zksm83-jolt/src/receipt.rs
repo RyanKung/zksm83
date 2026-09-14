@@ -10,9 +10,10 @@ use thiserror::Error;
 
 use crate::{
     BlockCpuWitness, CommittedMemory, CommittedRom, MemoryCommitment, NativeExecutionClaim,
-    NativeProtocolVersion, NativeStateBoundary, PackedBlockProof, PackedBlockProofError,
-    PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError, RomCommitment,
-    UNIFORM_ROW_COUNT, commit_packed_protocol_logs, prove_packed_block_components,
+    NativeProtocolVersion, NativeProverBackend, NativeStateBoundary, PackedBlockProof,
+    PackedBlockProofError, PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError,
+    RomCommitment, UNIFORM_ROW_COUNT, commit_packed_protocol_logs,
+    prove_packed_block_components_with_backend,
 };
 
 pub use identity::{
@@ -50,7 +51,8 @@ pub use stream::{
 ///
 /// Progress checkpoints use this value to reject a spool before decoding its
 /// frames when the compiled trace layout, relation, schedules, or transcript
-/// differs from the process that created it.
+/// differs from the process that created it. The CPU/CUDA prover execution
+/// selection is deliberately excluded because it does not change proof bytes.
 #[must_use]
 pub fn native_backend_digest() -> [u8; 32] {
     backend_digest(NativeProtocolVersion::current())
@@ -440,6 +442,7 @@ fn prove_segment(
     initial: NativeBoundary,
     witness: NativeSegmentWitness<'_>,
     rom: &CommittedRom,
+    backend: &NativeProverBackend,
 ) -> Result<(NativeSegmentReceipt, NativeBoundary), NativeReceiptError> {
     let NativeSegmentWitness {
         trace,
@@ -473,7 +476,7 @@ fn prove_segment(
         segment_index,
         log_counts,
     )?;
-    let proof = prove_packed_block_components(
+    let proof = prove_packed_block_components_with_backend(
         trace,
         &claim,
         log_claim,
@@ -481,6 +484,7 @@ fn prove_segment(
         rom,
         initial_memory,
         final_memory,
+        backend,
     )?;
     let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| NativeReceiptError::Counter)?;
     let padded_row_count = capacity

@@ -4,6 +4,7 @@ use rayon::prelude::*;
 
 use super::relation::{initialize_constraint_output, trim_zero_suffix};
 use super::{NativeField, UniformError, UniformRelation};
+use crate::NativeProverBackend;
 
 type SumcheckOutput = (Vec<Vec<NativeField>>, Vec<NativeField>, Vec<NativeField>);
 
@@ -15,6 +16,7 @@ pub(super) fn prove_sumcheck<C>(
     columns: &[C],
     mut weights: Vec<NativeField>,
     constraint_mix: NativeField,
+    backend: &NativeProverBackend,
     transcript: &mut AkitaTranscript<NativeField>,
 ) -> Result<SumcheckOutput, UniformError>
 where
@@ -55,8 +57,8 @@ where
     absorb_round(transcript, rounds.len(), &message)?;
     let challenge = transcript.challenge_scalar(b"sumcheck-round");
     claim = evaluate_lagrange(&message, challenge)?;
-    let mut columns = fold_borrowed_columns(columns, challenge)?;
-    fold_column(&mut weights, challenge)?;
+    let mut columns = fold_borrowed_columns(columns, challenge, backend)?;
+    backend.fold_binary_layer(&mut weights, challenge)?;
     rounds.push(message);
     opening_point.push(challenge);
     while weights.len() > 1 {
@@ -75,8 +77,8 @@ where
         absorb_round(transcript, rounds.len(), &message)?;
         let challenge = transcript.challenge_scalar(b"sumcheck-round");
         claim = evaluate_lagrange(&message, challenge)?;
-        fold_columns(&mut columns, challenge)?;
-        fold_column(&mut weights, challenge)?;
+        fold_columns(&mut columns, challenge, backend)?;
+        backend.fold_binary_layer(&mut weights, challenge)?;
         rounds.push(message);
         opening_point.push(challenge);
     }
@@ -528,15 +530,19 @@ fn interpolation_points(count: usize) -> Result<Vec<NativeField>, UniformError> 
 fn fold_columns(
     columns: &mut [Vec<NativeField>],
     challenge: NativeField,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    columns
-        .par_iter_mut()
-        .try_for_each(|column| fold_column(column, challenge))
+    columns.par_iter_mut().try_for_each(|column| {
+        backend
+            .fold_binary_layer(column, challenge)
+            .map_err(Into::into)
+    })
 }
 
 fn fold_borrowed_columns<C>(
     columns: &[C],
     challenge: NativeField,
+    backend: &NativeProverBackend,
 ) -> Result<Vec<Vec<NativeField>>, UniformError>
 where
     C: AsRef<[NativeField]> + Sync,
@@ -544,14 +550,11 @@ where
     columns
         .par_iter()
         .map(|column| {
-            crate::field_fold::fold_binary_layer_from_slice(column.as_ref(), challenge)
-                .map_err(|_| UniformError::Shape)
+            backend
+                .fold_binary_layer_from_slice(column.as_ref(), challenge)
+                .map_err(Into::into)
         })
         .collect()
-}
-
-fn fold_column(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), UniformError> {
-    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| UniformError::Shape)
 }
 
 fn evaluate_lagrange(

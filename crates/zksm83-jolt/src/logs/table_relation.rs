@@ -3,7 +3,7 @@ use std::sync::Arc;
 use akita_pcs::{Ring, Transcript};
 
 use crate::{
-    NativeField,
+    NativeField, NativeProverBackend,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
     sumcheck::{SumOfProductsSumcheckProof, SumcheckFactor},
@@ -39,6 +39,7 @@ pub(super) fn prove(
     inverses: &CommittedLogColumns,
     challenges: LogChallenges,
     full_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<TableRelationProof, ProtocolLogError> {
     let descriptor = descriptor(full_descriptor)?;
     let mut transcript = transcript(RELATION_DOMAIN, &descriptor);
@@ -49,7 +50,7 @@ pub(super) fn prove(
     }
     let terms = relation_terms(logs, &inverses.inner, challenges, &row_point, mix)?;
     let (sumcheck, claim, opening_point) =
-        SumOfProductsSumcheckProof::prove_shared_first(terms, &mut transcript)?;
+        SumOfProductsSumcheckProof::prove_shared_first(terms, backend, &mut transcript)?;
     if claim != NativeField::from_u64(0) {
         return Err(ProtocolLogError::Unsatisfied);
     }

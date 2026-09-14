@@ -1,0 +1,32 @@
+[package]
+name = "zksm83-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "zksm83-cuda-fold-smoke"
+
+[features]
+default = []
+cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
+
+[dependencies]
+jolt-field.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cuda-core = { version = "=0.3.1", optional = true }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6abfaa091e29a6275c1943895bfbc97efa306e98", optional = true }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6abfaa091e29a6275c1943895bfbc97efa306e98", optional = true }
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

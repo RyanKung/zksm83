@@ -2,8 +2,9 @@ use super::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BASIC_BLOCK_INSTRUCTION_BOUND,
     CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, InputIdentities,
     MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
-    PROGRESS_SCHEMA, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ProverProgress, RtcArg,
-    SpoolRecovery, UNIFORM_ROW_COUNT, fill_packed_segment_with_capacity, native_backend_digest,
+    NativeProverBackendKind, PROGRESS_SCHEMA, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID,
+    ProofBackendArg, ProverProgress, RtcArg, SpoolRecovery, UNIFORM_ROW_COUNT,
+    fill_packed_segment_with_capacity, native_backend_digest, prover_backend_kind,
     resolve_cartridge_selection, spool_recovery, validate_endpoint, validate_expected_artifact,
     validate_progress, validate_verified_counters,
 };
@@ -78,6 +79,27 @@ fn spool_length_policy_rejects_loss_and_discards_only_uncheckpointed_tail() {
             "spool is shorter than checkpoint"
         ))
     ));
+}
+
+#[test]
+fn prover_backend_selection_is_explicit_and_device_agnostic() -> Result<(), CliError> {
+    assert_eq!(
+        prover_backend_kind(ProofBackendArg::Cpu, None)?,
+        NativeProverBackendKind::Cpu
+    );
+    assert!(matches!(
+        prover_backend_kind(ProofBackendArg::Cpu, Some(0)),
+        Err(CliError::CudaDeviceWithCpuBackend)
+    ));
+    assert_eq!(
+        prover_backend_kind(ProofBackendArg::Cuda, None)?,
+        NativeProverBackendKind::Cuda { device_ordinal: 0 }
+    );
+    assert_eq!(
+        prover_backend_kind(ProofBackendArg::Cuda, Some(4))?,
+        NativeProverBackendKind::Cuda { device_ordinal: 4 }
+    );
+    Ok(())
 }
 
 #[test]
@@ -243,6 +265,8 @@ fn fixture_args() -> super::Args {
         statement: "statement.bin".into(),
         resume: false,
         segment_limit: None,
+        proof_backend: ProofBackendArg::Cpu,
+        cuda_device: None,
         preflight_only: false,
         inspect_progress_only: false,
     }

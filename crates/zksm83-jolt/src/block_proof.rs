@@ -7,29 +7,31 @@ use crate::{
     BlockCpuRelation, BlockCpuWitness, BlockFrontendError, CommittedMemory, CommittedProtocolLogs,
     CommittedRom, ContinuityError, ExecutionLookupProof, ExecutionLookupProofError,
     IsaLookupColumns, IsaLookupError, IsaLookupProof, MemoryCommitment, MutableMemoryError,
-    NativeExecutionClaim, NativeProtocolVersion, PackedContinuityProof, PackedMutableMemoryProof,
-    PackedProtocolLogClaim, PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError,
-    RomCommitment, RomLookupError, RomLookupProof, UniformError, UniformRelationProof,
-    WitnessCommitments, commit_witness, packed_block_obligation_metadata, prove_rom_lookup,
-    prove_uniform_committed,
+    NativeExecutionClaim, NativeProtocolVersion, NativeProverBackend, PackedContinuityProof,
+    PackedMutableMemoryProof, PackedProtocolLogClaim, PackedProtocolLogProof,
+    ProtocolLogCommitments, ProtocolLogError, RomCommitment, RomLookupError, RomLookupProof,
+    UniformError, UniformRelationProof, WitnessCommitments, commit_witness,
+    packed_block_obligation_metadata,
 };
 use crate::{
     continuity::{
-        prepare_packed_continuity, prove_prepared_packed_continuity,
+        prepare_packed_continuity, prove_prepared_packed_continuity_with_backend,
         verify_packed_continuity_for_protocol,
     },
-    execution_lookup::proof::{prove_execution_lookups, verify_execution_lookups_for_protocol},
-    isa_lookup::{prove_isa_lookups, verify_isa_lookups_for_protocol},
+    execution_lookup::proof::{
+        prove_execution_lookups_with_backend, verify_execution_lookups_for_protocol,
+    },
+    isa_lookup::{prove_isa_lookups_with_backend, verify_isa_lookups_for_protocol},
     logs::{
-        prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs,
+        prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs_with_backend,
         verify_packed_protocol_logs_for_protocol,
     },
     memory::{
-        prepare_packed_mutable_memory, prove_prepared_packed_mutable_memory,
+        prepare_packed_mutable_memory, prove_prepared_packed_mutable_memory_with_backend,
         verify_packed_mutable_memory_for_protocol,
     },
-    rom_lookup::verify_rom_lookup_for_protocol,
-    uniform::verify_uniform_committed_for_protocol,
+    rom_lookup::{prove_rom_lookup_with_backend, verify_rom_lookup_for_protocol},
+    uniform::{prove_uniform_committed_with_backend, verify_uniform_committed_for_protocol},
 };
 
 /// Number of independent fixed-ISA queries carried by one packed block row.
@@ -128,6 +130,33 @@ pub fn prove_packed_block_components(
     initial_memory: &CommittedMemory,
     final_memory: &CommittedMemory,
 ) -> Result<PackedBlockProof, PackedBlockProofError> {
+    prove_packed_block_components_with_backend(
+        trace,
+        claim,
+        log_claim,
+        logs,
+        rom,
+        initial_memory,
+        final_memory,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+/// Proves packed-block components with an explicitly initialized execution backend.
+///
+/// Backend selection affects prover execution only. It does not alter the
+/// transcript, proof encoding, commitment digests, or verifier behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_block_components_with_backend(
+    trace: BlockCpuWitness,
+    claim: &NativeExecutionClaim,
+    log_claim: PackedProtocolLogClaim,
+    logs: &CommittedProtocolLogs,
+    rom: &CommittedRom,
+    initial_memory: &CommittedMemory,
+    final_memory: &CommittedMemory,
+    backend: &NativeProverBackend,
+) -> Result<PackedBlockProof, PackedBlockProofError> {
     let witness = commit_witness(trace.columns())?;
     let prepared_memory =
         prepare_packed_mutable_memory(&trace, &witness, initial_memory, final_memory)?;
@@ -136,33 +165,51 @@ pub fn prove_packed_block_components(
     drop(trace);
     let memory = {
         let _phase = crate::metrics::start(crate::metrics::Phase::MutableMemoryProof);
-        prove_prepared_packed_mutable_memory(
+        prove_prepared_packed_mutable_memory_with_backend(
             prepared_memory,
             &witness,
             initial_memory,
             final_memory,
+            backend,
         )?
     };
     let continuity = {
         let _phase = crate::metrics::start(crate::metrics::Phase::ContinuityProof);
-        prove_prepared_packed_continuity(prepared_continuity, &witness, claim)?
+        prove_prepared_packed_continuity_with_backend(
+            prepared_continuity,
+            &witness,
+            claim,
+            backend,
+        )?
     };
     let logs = {
         let _phase = crate::metrics::start(crate::metrics::Phase::ProtocolLogProof);
-        prove_prepared_packed_protocol_logs(prepared_logs, &witness, logs, claim, log_claim)?
+        prove_prepared_packed_protocol_logs_with_backend(
+            prepared_logs,
+            &witness,
+            logs,
+            claim,
+            log_claim,
+            backend,
+        )?
     };
-    let relation = prove_uniform_committed(&BlockCpuRelation, &witness)?;
+    let relation = prove_uniform_committed_with_backend(&BlockCpuRelation, &witness, backend)?;
     let isa_layouts: [IsaLookupColumns; PACKED_BLOCK_ISA_LOOKUP_COUNT] = PACKED_LANES
         .map(BlockCpuWitness::lane_isa_lookup_columns)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?
         .try_into()
         .map_err(|_| BlockFrontendError::Shape)?;
-    let isa_lookup = prove_isa_lookups(isa_layouts, &witness)?;
-    let execution_lookup = prove_execution_lookups(&witness)?;
+    let isa_lookup = prove_isa_lookups_with_backend(isa_layouts, &witness, backend)?;
+    let execution_lookup = prove_execution_lookups_with_backend(&witness, backend)?;
     let rom_lookup = {
         let _phase = crate::metrics::start(crate::metrics::Phase::RomLookup);
-        prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?
+        prove_rom_lookup_with_backend(
+            BlockCpuWitness::rom_lookup_columns()?,
+            rom,
+            &witness,
+            backend,
+        )?
     };
     Ok(PackedBlockProof {
         commitments: witness.into_commitments(),

@@ -23,10 +23,10 @@ use zksm83_jolt::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BlockCpuError, BlockCpuWitness,
     CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
     MAX_NATIVE_STREAM_RECEIPT_BYTES, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
-    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness,
-    PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES,
-    UNIFORM_ROW_COUNT, commit_memory, commit_rom, native_backend_digest,
-    native_proof_phase_metrics, verify_native_spool_reader,
+    NativeProverBackend, NativeProverBackendError, NativeProverBackendKind, NativeReceiptError,
+    NativeReceiptStreamProver, NativeSegmentWitness, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID,
+    ROM_256KIB_IMAGE_BYTES, ROM_IMAGE_BYTES, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
+    native_backend_digest, native_proof_phase_metrics, verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -89,6 +89,12 @@ struct Args {
     /// Stop successfully after this many new segments without finalizing a receipt.
     #[arg(long)]
     segment_limit: Option<u64>,
+    /// Prover execution backend. CUDA requires a feature-enabled Linux build.
+    #[arg(long, value_enum, default_value_t = ProofBackendArg::Cpu)]
+    proof_backend: ProofBackendArg,
+    /// Zero-based CUDA device ordinal; valid only with `--proof-backend cuda`.
+    #[arg(long)]
+    cuda_device: Option<usize>,
     /// Validate identities, endpoint data, and protocol bounds without proving.
     #[arg(long)]
     preflight_only: bool,
@@ -120,6 +126,12 @@ enum RtcArg {
 struct CartridgeSelection {
     profile: Mbc3CartridgeProfile,
     machine_profile: MachineProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ProofBackendArg {
+    Cpu,
+    Cuda,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +257,10 @@ enum CliError {
     ProgressMemoryCommitment { spooled: String, checkpoint: String },
     #[error("expected execution endpoint mismatch: {0}")]
     EndpointMismatch(&'static str),
+    #[error("--cuda-device requires --proof-backend cuda")]
+    CudaDeviceWithCpuBackend,
+    #[error(transparent)]
+    ProverBackend(#[from] NativeProverBackendError),
     #[error(transparent)]
     Receipt(#[from] NativeReceiptError),
     #[error(transparent)]
@@ -307,10 +323,25 @@ fn run(args: Args) -> Result<(), CliError> {
     if !args.resume {
         require_absent(&args.statement)?;
     }
+    let backend = initialize_prover_backend(args.proof_backend, args.cuda_device)?;
     let (mut builder, mut initial_memory, completed, mut prover) = if args.resume {
-        resume(&args, &rom_bytes, &input, identities, &committed_rom)?
+        resume(
+            &args,
+            &rom_bytes,
+            &input,
+            identities,
+            &committed_rom,
+            backend,
+        )?
     } else {
-        start(&args, &rom_bytes, &input, &committed_rom, cartridge)?
+        start(
+            &args,
+            &rom_bytes,
+            &input,
+            &committed_rom,
+            cartridge,
+            backend,
+        )?
     };
     let completed_steps = prove_segments(
         &args,
@@ -323,7 +354,8 @@ fn run(args: Args) -> Result<(), CliError> {
     )?;
     if completed_steps != expected.completed_steps {
         println!(
-            "paused segments={} completed_steps={} relation_rows={} spool_bytes={}",
+            "paused proof_backend={} segments={} completed_steps={} relation_rows={} spool_bytes={}",
+            prover.backend_kind(),
             prover.segment_count(),
             completed_steps,
             prover.relation_row_count(),
@@ -341,6 +373,27 @@ fn run(args: Args) -> Result<(), CliError> {
     )?;
     finalize(&args, prover)?;
     Ok(())
+}
+
+fn initialize_prover_backend(
+    selection: ProofBackendArg,
+    cuda_device: Option<usize>,
+) -> Result<NativeProverBackend, CliError> {
+    NativeProverBackend::initialize(prover_backend_kind(selection, cuda_device)?)
+        .map_err(Into::into)
+}
+
+fn prover_backend_kind(
+    selection: ProofBackendArg,
+    cuda_device: Option<usize>,
+) -> Result<NativeProverBackendKind, CliError> {
+    match (selection, cuda_device) {
+        (ProofBackendArg::Cpu, None) => Ok(NativeProverBackendKind::Cpu),
+        (ProofBackendArg::Cpu, Some(_)) => Err(CliError::CudaDeviceWithCpuBackend),
+        (ProofBackendArg::Cuda, device_ordinal) => Ok(NativeProverBackendKind::Cuda {
+            device_ordinal: device_ordinal.unwrap_or(0),
+        }),
+    }
 }
 
 fn inspect_progress(
@@ -558,6 +611,7 @@ fn start<'a>(
     input: &[u8],
     committed_rom: &'a zksm83_jolt::CommittedRom,
     cartridge: CartridgeSelection,
+    backend: NativeProverBackend,
 ) -> Result<(TraceBuilder, CommittedMemory, u64, FileProver<'a>), CliError> {
     require_absent(&args.spool)?;
     require_absent(&args.progress_checkpoint)?;
@@ -571,7 +625,7 @@ fn start<'a>(
         cartridge.machine_profile,
     )?;
     let spool = open_new(&args.spool)?;
-    let prover = NativeReceiptStreamProver::new(committed_rom, spool)?;
+    let prover = NativeReceiptStreamProver::new_with_backend(committed_rom, spool, backend)?;
     Ok((builder, initial_memory, 0, prover))
 }
 
@@ -581,6 +635,7 @@ fn resume<'a>(
     input: &[u8],
     identities: InputIdentities,
     committed_rom: &'a zksm83_jolt::CommittedRom,
+    backend: NativeProverBackend,
 ) -> Result<(TraceBuilder, CommittedMemory, u64, FileProver<'a>), CliError> {
     let progress_bytes = read_bounded(
         &args.progress_checkpoint,
@@ -604,7 +659,7 @@ fn resume<'a>(
             .sync_all()
             .map_err(|source| io_error("sync", &args.spool, source))?;
     }
-    let prover = NativeReceiptStreamProver::resume(committed_rom, spool)?;
+    let prover = NativeReceiptStreamProver::resume_with_backend(committed_rom, spool, backend)?;
     let final_boundary = prover.current_boundary().ok_or(CliError::ProgressMismatch(
         "verified spool has no final boundary",
     ))?;
@@ -751,7 +806,8 @@ fn prove_segments(
         write_progress(args, identities, builder, prover)?;
         let phases = native_proof_phase_metrics().since(phases_before);
         println!(
-            "segment={} steps={} segment_relation_rows={} completed_steps={} relation_rows={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} relation_eval_seconds={:.3} commit_seconds={:.3} rom_lookup_seconds={:.3} mutable_memory_seconds={:.3} continuity_seconds={:.3} protocol_log_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
+            "proof_backend={} segment={} steps={} segment_relation_rows={} completed_steps={} relation_rows={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} relation_eval_seconds={:.3} commit_seconds={:.3} rom_lookup_seconds={:.3} mutable_memory_seconds={:.3} continuity_seconds={:.3} protocol_log_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
+            prover.backend_kind(),
             prover.segment_count() - 1,
             segment_steps,
             segment_relation_rows,

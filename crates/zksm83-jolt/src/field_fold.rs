@@ -2,15 +2,29 @@ use thiserror::Error;
 
 use crate::NativeField;
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum FieldFoldError {
+#[derive(Debug, Error)]
+/// Failure to fold a native-field evaluation layer on a selected prover backend.
+pub enum FieldFoldError {
+    /// A binary fold requires at least one complete pair and no trailing value.
     #[error("binary field fold requires a nontrivial even-length layer")]
     InvalidLength,
+    /// Checked pair-index arithmetic overflowed.
     #[error("binary field fold index arithmetic overflowed")]
     IndexOverflow,
+    /// CUDA initialization, transfer, launch, or output validation failed.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[error(transparent)]
+    Cuda(#[from] zksm83_cuda::CudaFoldError),
 }
 
 pub(crate) fn fold_binary_layer(
+    values: &mut Vec<NativeField>,
+    challenge: NativeField,
+) -> Result<(), FieldFoldError> {
+    fold_binary_layer_cpu(values, challenge)
+}
+
+pub(crate) fn fold_binary_layer_cpu(
     values: &mut Vec<NativeField>,
     challenge: NativeField,
 ) -> Result<(), FieldFoldError> {
@@ -43,6 +57,13 @@ pub(crate) fn fold_binary_layer(
 }
 
 pub(crate) fn fold_binary_layer_from_slice(
+    values: &[NativeField],
+    challenge: NativeField,
+) -> Result<Vec<NativeField>, FieldFoldError> {
+    fold_binary_layer_from_slice_cpu(values, challenge)
+}
+
+pub(crate) fn fold_binary_layer_from_slice_cpu(
     values: &[NativeField],
     challenge: NativeField,
 ) -> Result<Vec<NativeField>, FieldFoldError> {
