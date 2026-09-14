@@ -44,12 +44,16 @@ fn preflight_rejects_a_short_rom() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn auto_cartridge_selection_accepts_gbstudio_mbc3_timer_rom() {
+fn auto_cartridge_selection_accepts_gbstudio_mbc3_timer_rom()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut args = fixture_args();
     args.rtc = RtcArg::Auto;
     let mut rom = vec![0_u8; 256 * 1024];
-    rom[0x0147] = 0x10;
-    let cartridge = resolve_cartridge_selection(&args, &rom).unwrap();
+    let cartridge_type = rom
+        .get_mut(0x0147)
+        .ok_or_else(|| std::io::Error::other("missing cartridge type header"))?;
+    *cartridge_type = 0x10;
+    let cartridge = resolve_cartridge_selection(&args, &rom)?;
     assert_eq!(
         cartridge.profile,
         Mbc3CartridgeProfile::new(Mbc3RomSize::Rom256KiB, Mbc3RtcMode::RtcCapable)
@@ -58,6 +62,7 @@ fn auto_cartridge_selection_accepts_gbstudio_mbc3_timer_rom() {
         cartridge.machine_profile,
         MachineProfile::DmgPostBootMbc3Rom256KiBRtcV1
     );
+    Ok(())
 }
 
 #[test]

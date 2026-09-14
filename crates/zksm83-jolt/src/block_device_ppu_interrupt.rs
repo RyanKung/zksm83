@@ -2,7 +2,7 @@
 
 use akita_pcs::Ring;
 use thiserror::Error;
-use zksm83_core::DmgDeviceState;
+use zksm83_core::{DmgDeviceState, StepKind};
 use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlock};
 
 use crate::{
@@ -216,7 +216,11 @@ fn append_ppu_interrupt(
         .m_cycle_count()
         .checked_mul(4)
         .ok_or(BlockDevicePpuInterruptError::InvalidTransition { block: block_index })?;
-    let stat_event = append_stat_interval(row, before, after, ticks)?;
+    let stat_event = if halt_until_vblank_block(block) {
+        false
+    } else {
+        append_stat_interval(row, before, after, ticks)?
+    };
     let vblank_event = append_vblank_interval(row, before, ticks)?;
     append_final_pending_prefix(row, before_device, after_device)?;
     validate_interrupts(
@@ -227,6 +231,14 @@ fn append_ppu_interrupt(
         interrupt_acknowledged_mask(block),
         block_index,
     )
+}
+
+fn halt_until_vblank_block(block: &BasicBlock) -> bool {
+    block.row_count() == 1
+        && block
+            .rows()
+            .next()
+            .is_some_and(|row| row.effects().kind() == StepKind::HaltUntilVBlank)
 }
 
 fn append_final_pending_prefix(
@@ -677,7 +689,7 @@ fn constrain_stat_interval(
 ) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
     let enabled = low_pack_bit_value(timer_core, false, 39)?;
-    let active = quiet * enabled;
+    let active = quiet * enabled * (one - halt_until_vblank_value(timer_core)?);
     let dot = device_state_value(boundary, false, STATE_PPU_DOT_INDEX)?;
     let below_80 = state_value(auxiliary, false, STATE_BELOW_80)?;
     let below_252 = state_value(auxiliary, false, STATE_BELOW_252)?;

@@ -296,9 +296,9 @@ mod tests {
     }
 
     #[test]
-    fn rtc_register_selection_is_explicitly_classified() {
+    fn rtc_register_selection_is_explicitly_classified() -> Result<(), Box<dyn std::error::Error>> {
         let profile = Mbc3CartridgeProfile::new(Mbc3RomSize::Rom256KiB, Mbc3RtcMode::RtcCapable);
-        let state = Mbc3State::from_profile_parts(profile, true, 1, 0x08).unwrap();
+        let state = Mbc3State::from_profile_parts(profile, true, 1, 0x08)?;
         assert_eq!(
             state.external_window_for(profile, 0xa123),
             Mbc3ExternalWindow::RtcRegister(0x08)
@@ -309,6 +309,7 @@ mod tests {
             state.external_window_for(no_rtc, 0xa123),
             Mbc3ExternalWindow::Unavailable
         );
+        Ok(())
     }
 
     #[test]

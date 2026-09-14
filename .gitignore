@@ -11,6 +11,8 @@ coverage/
 *.rom
 *.sav
 *.srm
+!/roms/
+!/roms/test.gb
 
 # Local cartridge inputs and endpoint schedules
 /examples/
