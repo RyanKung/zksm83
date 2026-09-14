@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/zksm83-logo.png" alt="zksm83 logo" width="420">
+</p>
+
 # zksm83
 
 `zksm83` is an experimental proof system for the SM83 CPU core used by the
