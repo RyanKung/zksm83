@@ -10,17 +10,17 @@ use zksm83_trace::BASIC_BLOCK_INSTRUCTION_BOUND;
 
 use crate::{
     AkitaWorkerError, BLOCK_CPU_COLUMN_COUNT, BLOCK_ROUTING_COLUMN_COUNT, BlockCpuWitness,
-    ConstraintOutput, NativeField, NativeProtocolVersion, NativeStateBoundary, STATE_SCALAR_COUNT,
-    TRACE_ROW_BIT_COUNT, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT, UniformError, UniformRelation,
-    WitnessCommitments,
+    ConstraintOutput, NativeField, NativeProtocolVersion, NativeProverBackend, NativeStateBoundary,
+    STATE_SCALAR_COUNT, TRACE_ROW_BIT_COUNT, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
+    UniformError, UniformRelation, WitnessCommitments,
     block_boundary::{BLOCK_LOCAL_STATE_SCALAR_COUNT, device_state_column, local_state_column},
     block_memory::BLOCK_MEMORY_ROW_BITS_START,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::OpeningProof,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
-        prove_uniform_composite, prove_witness_opening, verify_uniform_composite_for_protocol,
-        verify_witness_opening_for_protocol,
+        prove_uniform_composite_with_backend, prove_witness_opening,
+        verify_uniform_composite_for_protocol, verify_witness_opening_for_protocol,
     },
 };
 
@@ -186,7 +186,12 @@ pub fn prove_packed_continuity(
     claim: &NativeExecutionClaim,
 ) -> Result<PackedContinuityProof, ContinuityError> {
     let prepared = prepare_packed_continuity(trace, trace_witness, claim)?;
-    prove_prepared_packed_continuity(prepared, trace_witness, claim)
+    prove_prepared_packed_continuity_with_backend(
+        prepared,
+        trace_witness,
+        claim,
+        &NativeProverBackend::cpu(),
+    )
 }
 
 pub(crate) fn prepare_packed_continuity(
@@ -208,10 +213,11 @@ pub(crate) fn prepare_packed_continuity(
     })
 }
 
-pub(crate) fn prove_prepared_packed_continuity(
+pub(crate) fn prove_prepared_packed_continuity_with_backend(
     prepared: PreparedPackedContinuity,
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
+    backend: &NativeProverBackend,
 ) -> Result<PackedContinuityProof, ContinuityError> {
     let protocol = NativeProtocolVersion::current();
     let layout = ContinuityLayout::Packed;
@@ -225,7 +231,8 @@ pub(crate) fn prove_prepared_packed_continuity(
         layout.trace_column_count(),
         layout.trace_columns()?,
     )?;
-    let relation_proof = prove_uniform_composite(&relation, trace_witness, &inverses)?;
+    let relation_proof =
+        prove_uniform_composite_with_backend(&relation, trace_witness, &inverses, backend)?;
     let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
     let sum = on_worker(|| prove_sum(protocol, layout, &inverses, claim, challenges, &full))?;
     Ok(PackedContinuityProof {

@@ -4,7 +4,8 @@ use akita_pcs::AkitaTranscript;
 
 use crate::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_LOG_SCHEDULE_SHA256, BlockCpuWitness,
-    NativeExecutionClaim, NativeField, NativeProtocolVersion, TRACE_BUS_SLOTS, WitnessCommitments,
+    NativeExecutionClaim, NativeField, NativeProtocolVersion, NativeProverBackend, TRACE_BUS_SLOTS,
+    WitnessCommitments,
     pcs::{ColumnCommitments, commit_columns},
     uniform::{CommittedWitness, CompositeUniformRelationProof},
 };
@@ -190,7 +191,14 @@ pub fn prove_packed_protocol_logs(
     claim: PackedProtocolLogClaim,
 ) -> Result<PackedProtocolLogProof, ProtocolLogError> {
     let prepared = prepare_packed_protocol_logs(trace, trace_witness, logs, execution, claim)?;
-    prove_prepared_packed_protocol_logs(prepared, trace_witness, logs, execution, claim)
+    prove_prepared_packed_protocol_logs_with_backend(
+        prepared,
+        trace_witness,
+        logs,
+        execution,
+        claim,
+        &NativeProverBackend::cpu(),
+    )
 }
 
 pub(crate) fn prepare_packed_protocol_logs(
@@ -225,12 +233,13 @@ pub(crate) fn prepare_packed_protocol_logs(
     })
 }
 
-pub(crate) fn prove_prepared_packed_protocol_logs(
+pub(crate) fn prove_prepared_packed_protocol_logs_with_backend(
     prepared: PreparedPackedProtocolLogs,
     trace_witness: &CommittedWitness,
     logs: &CommittedProtocolLogs,
     execution: &NativeExecutionClaim,
     claim: PackedProtocolLogClaim,
+    backend: &NativeProverBackend,
 ) -> Result<PackedProtocolLogProof, ProtocolLogError> {
     let protocol = NativeProtocolVersion::current();
     let PreparedPackedProtocolLogs {
@@ -239,14 +248,16 @@ pub(crate) fn prove_prepared_packed_protocol_logs(
         phase_one,
         challenges,
     } = prepared;
-    let trace_relation = packed_trace_relation::prove(trace_witness, &trace_inverses, challenges)?;
+    let trace_relation =
+        packed_trace_relation::prove(trace_witness, &trace_inverses, challenges, backend)?;
     let full = full_descriptor(
         protocol,
         &phase_one,
         trace_inverses.commitments(),
         table_inverses.commitments(),
     )?;
-    let table_relation = table_relation::prove(&logs.inner, &table_inverses, challenges, &full)?;
+    let table_relation =
+        table_relation::prove(&logs.inner, &table_inverses, challenges, &full, backend)?;
     let counts = claim.counts(execution)?;
     let sum = on_worker(|| {
         sum::prove(

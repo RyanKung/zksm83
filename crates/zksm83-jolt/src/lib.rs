@@ -46,6 +46,7 @@ mod metrics;
 mod optimization;
 mod pcs;
 mod pcs_batch_gate;
+mod prover_backend;
 mod receipt;
 mod rom_lookup;
 mod state;
@@ -202,7 +203,8 @@ pub use block_memory::{
 };
 pub use block_proof::{
     PACKED_BLOCK_ISA_LOOKUP_COUNT, PackedBlockProof, PackedBlockProofError,
-    prove_packed_block_components, verify_packed_block_components,
+    prove_packed_block_components, prove_packed_block_components_with_backend,
+    verify_packed_block_components,
 };
 pub use block_routing::{
     BLOCK_ROUTING_COLUMN_COUNT, BLOCK_ROUTING_CONSTRAINT_COUNT, BLOCK_ROUTING_MAX_DEGREE,
@@ -221,6 +223,7 @@ pub use execution_lookup::{
     ExecutionLookupProofError, ExecutionLookupWellFormedRelation, ExecutionLookupWitness,
     ExecutionLookupWitnessError, evaluate_packed_execution_table_entry,
 };
+pub use field_fold::FieldFoldError;
 pub use isa::{
     ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_BASE_M_CYCLES, ISA_DATA_READS,
     ISA_DATA_WRITES, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES, ISA_OPERATION_BITS_START,
@@ -253,6 +256,7 @@ pub use pcs_batch_gate::{
     PcsBatchGateError, PcsBatchGateMode, PcsBatchPathReport, PcsBatchTamperReport,
     run_pcs_batch_gate_worker,
 };
+pub use prover_backend::{NativeProverBackend, NativeProverBackendError, NativeProverBackendKind};
 pub use receipt::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
     MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,

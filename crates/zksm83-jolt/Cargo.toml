@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+cuda = ["dep:zksm83-cuda", "zksm83-cuda/cuda"]
+
 [dependencies]
 akita-config.workspace = true
 akita-pcs.workspace = true
@@ -20,6 +24,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zksm83-core.workspace = true
+zksm83-cuda = { workspace = true, optional = true }
 zksm83-isa.workspace = true
 zksm83-memory.workspace = true
 zksm83-trace.workspace = true

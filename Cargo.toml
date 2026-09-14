@@ -5,6 +5,7 @@ members = [
     "crates/zksm83-memory",
     "crates/zksm83-trace",
     "crates/zksm83-jolt",
+    "crates/zksm83-cuda",
 ]
 resolver = "2"
 
@@ -30,6 +31,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.20"
 
 zksm83-core = { path = "crates/zksm83-core" }
+zksm83-cuda = { path = "crates/zksm83-cuda" }
 zksm83-jolt = { path = "crates/zksm83-jolt" }
 zksm83-isa = { path = "crates/zksm83-isa" }
 zksm83-memory = { path = "crates/zksm83-memory" }

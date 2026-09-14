@@ -15,14 +15,14 @@ use akita_serialization::SerializationError;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::{AkitaWorkerError, NativeProtocolVersion};
+use crate::{AkitaWorkerError, FieldFoldError, NativeProtocolVersion, NativeProverBackend};
 pub use commitment::{CommittedWitness, WitnessCommitments};
 use commitment::{
     OpeningProof, commit_columns, prove_opening, prove_selected_opening,
     verify_opening_for_protocol, verify_selected_opening_for_protocol,
 };
 pub(crate) use composite::{
-    CompositeUniformRelationProof, ProjectedRelation, prove_uniform_composite,
+    CompositeUniformRelationProof, ProjectedRelation, prove_uniform_composite_with_backend,
     verify_uniform_composite_for_protocol,
 };
 pub use relation::ConstraintOutput;
@@ -166,6 +166,9 @@ pub enum UniformError {
     /// A fixed interpolation denominator unexpectedly had no inverse.
     #[error("native uniform interpolation denominator is not invertible")]
     NonInvertibleInterpolation,
+    /// The selected prover backend could not fold a field-evaluation layer.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
     /// Akita rejected setup, commitment, opening construction, or verification.
     #[error("Akita rejected the native uniform proof: {0}")]
     Akita(#[from] AkitaError),
@@ -203,10 +206,22 @@ pub fn prove_uniform(
     relation: &impl UniformRelation,
     columns: &[Vec<u64>],
 ) -> Result<UniformProof, UniformError> {
+    prove_uniform_with_backend(relation, columns, &NativeProverBackend::cpu())
+}
+
+/// Commits and proves one uniform relation with an explicitly selected execution backend.
+///
+/// Backend selection changes only prover execution. It does not alter the
+/// transcript, commitments, proof encoding, or verifier.
+pub fn prove_uniform_with_backend(
+    relation: &impl UniformRelation,
+    columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<UniformProof, UniformError> {
     on_worker(|| {
         validate_uniform_witness(relation, columns)?;
         let witness = commit_columns(columns)?;
-        let relation_proof = prove_satisfied_uniform_on_worker(relation, &witness)?;
+        let relation_proof = prove_satisfied_uniform_on_worker(relation, &witness, backend)?;
         Ok(UniformProof {
             commitments: witness.into_commitments(),
             relation: relation_proof,
@@ -232,7 +247,15 @@ pub fn prove_uniform_committed(
     relation: &impl UniformRelation,
     witness: &CommittedWitness,
 ) -> Result<UniformRelationProof, UniformError> {
-    on_worker(|| prove_uniform_committed_on_worker(relation, witness))
+    prove_uniform_committed_with_backend(relation, witness, &NativeProverBackend::cpu())
+}
+
+pub(crate) fn prove_uniform_committed_with_backend(
+    relation: &impl UniformRelation,
+    witness: &CommittedWitness,
+    backend: &NativeProverBackend,
+) -> Result<UniformRelationProof, UniformError> {
+    on_worker(|| prove_uniform_committed_on_worker(relation, witness, backend))
 }
 
 /// Verifies a relation proof against caller-supplied shared commitments.
@@ -310,17 +333,19 @@ pub(crate) fn verify_witness_selected_opening_for_protocol(
 fn prove_uniform_committed_on_worker(
     relation: &impl UniformRelation,
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<UniformRelationProof, UniformError> {
     let protocol = NativeProtocolVersion::current();
     validate_committed_relation(protocol, relation, witness.commitments())?;
     let field_columns = witness.field_columns()?;
     ensure_relation_holds(relation, field_columns.as_slice(), UNIFORM_ROW_COUNT)?;
-    prove_satisfied_uniform_on_worker(relation, witness)
+    prove_satisfied_uniform_on_worker(relation, witness, backend)
 }
 
 fn prove_satisfied_uniform_on_worker(
     relation: &impl UniformRelation,
     witness: &CommittedWitness,
+    backend: &NativeProverBackend,
 ) -> Result<UniformRelationProof, UniformError> {
     let protocol = NativeProtocolVersion::current();
     validate_committed_relation(protocol, relation, witness.commitments())?;
@@ -338,6 +363,7 @@ fn prove_satisfied_uniform_on_worker(
         field_columns.as_slice(),
         weights,
         constraint_mix,
+        backend,
         &mut transcript,
     )?;
     let opening = prove_opening(witness, &opening_point, &opened_values, &descriptor)?;

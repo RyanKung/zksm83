@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    NativeField,
+    FieldFoldError, NativeField, NativeProverBackend,
     metrics::{self, Phase},
 };
 
@@ -35,7 +35,7 @@ pub(crate) struct SumOfProductsSumcheckProof {
 }
 
 /// Invalid product-sumcheck witness, proof, or transcript reduction.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub(crate) enum ProductSumcheckError {
     /// At least one factor table is required.
     #[error("sumcheck factor list is empty")]
@@ -64,12 +64,16 @@ pub(crate) enum ProductSumcheckError {
     /// Internal pair folding lost a table element.
     #[error("sumcheck folding shape invariant failed")]
     FoldingShape,
+    /// The selected prover backend could not fold an evaluation table.
+    #[error(transparent)]
+    FieldFold(#[from] FieldFoldError),
 }
 
 impl ProductSumcheckProof {
     pub(crate) fn prove(
         left: &[NativeField],
         right: &[NativeField],
+        backend: &NativeProverBackend,
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
@@ -84,8 +88,8 @@ impl ProductSumcheckProof {
         absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
         let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
         let (left, right) = rayon::join(
-            || fold_borrowed(left, challenge),
-            || fold_borrowed(right, challenge),
+            || fold_borrowed(left, challenge, backend),
+            || fold_borrowed(right, challenge, backend),
         );
         let mut left = left?;
         let mut right = right?;
@@ -95,8 +99,8 @@ impl ProductSumcheckProof {
             let message = product_round(&left, &right)?;
             absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
             let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
-            fold(&mut left, challenge)?;
-            fold(&mut right, challenge)?;
+            fold(&mut left, challenge, backend)?;
+            fold(&mut right, challenge, backend)?;
             rounds.push(message);
             point.push(challenge);
         }
@@ -107,6 +111,7 @@ impl ProductSumcheckProof {
         left_entries: Vec<(usize, NativeField)>,
         logical_length: usize,
         right: &[NativeField],
+        backend: &NativeProverBackend,
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
@@ -124,8 +129,10 @@ impl ProductSumcheckProof {
         let message = left.round(right)?;
         absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
         let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
-        let (left_result, folded_right) =
-            rayon::join(|| left.fold(challenge), || fold_borrowed(right, challenge));
+        let (left_result, folded_right) = rayon::join(
+            || left.fold(challenge),
+            || fold_borrowed(right, challenge, backend),
+        );
         left_result?;
         let mut right = folded_right?;
         rounds.push(message);
@@ -134,8 +141,10 @@ impl ProductSumcheckProof {
             let message = left.round(&right)?;
             absorb_round(transcript, b"product-sumcheck", rounds.len(), &message)?;
             let challenge = transcript.challenge_scalar(b"product-sumcheck-challenge");
-            let (left_result, right_result) =
-                rayon::join(|| left.fold(challenge), || fold(&mut right, challenge));
+            let (left_result, right_result) = rayon::join(
+                || left.fold(challenge),
+                || fold(&mut right, challenge, backend),
+            );
             left_result?;
             right_result?;
             rounds.push(message);
@@ -188,6 +197,7 @@ impl ProductSumcheckProof {
 impl SumOfProductsSumcheckProof {
     pub(crate) fn prove_shared_first(
         terms: Vec<Vec<SumcheckFactor<'_>>>,
+        backend: &NativeProverBackend,
         transcript: &mut AkitaTranscript<NativeField>,
     ) -> Result<(Self, NativeField, Vec<NativeField>), ProductSumcheckError> {
         let _phase = metrics::start(Phase::Sumcheck);
@@ -231,11 +241,11 @@ impl SumOfProductsSumcheckProof {
             )?;
             let challenge = transcript.challenge_scalar(b"sum-of-products-sumcheck-challenge");
             let (shared_result, terms_result) = rayon::join(
-                || shared.fold(challenge),
+                || shared.fold(challenge, backend),
                 || {
                     terms.par_iter_mut().try_for_each(|term| {
                         term.par_iter_mut()
-                            .try_for_each(|factor| factor.fold(challenge))
+                            .try_for_each(|factor| factor.fold(challenge, backend))
                     })
                 },
             );
@@ -393,9 +403,11 @@ fn finish_shared_sum_of_products<T: SumcheckTable>(
 fn fold_borrowed(
     values: &[NativeField],
     challenge: NativeField,
+    backend: &NativeProverBackend,
 ) -> Result<Vec<NativeField>, ProductSumcheckError> {
-    crate::field_fold::fold_binary_layer_from_slice(values, challenge)
-        .map_err(|_| ProductSumcheckError::FoldingShape)
+    backend
+        .fold_binary_layer_from_slice(values, challenge)
+        .map_err(Into::into)
 }
 
 fn fold_initial_factors(
@@ -472,12 +484,17 @@ fn terminal_term_sum(terms: &[Vec<NativeField>]) -> NativeField {
         .fold(NativeField::from_u64(0), |sum, term| sum + term)
 }
 
-fn fold(table: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), ProductSumcheckError> {
+fn fold(
+    table: &mut Vec<NativeField>,
+    challenge: NativeField,
+    backend: &NativeProverBackend,
+) -> Result<(), ProductSumcheckError> {
     if table.len() <= 1 || !table.len().is_power_of_two() {
         return Err(ProductSumcheckError::FoldingShape);
     }
-    crate::field_fold::fold_binary_layer(table, challenge)
-        .map_err(|_| ProductSumcheckError::FoldingShape)
+    backend
+        .fold_binary_layer(table, challenge)
+        .map_err(Into::into)
 }
 
 fn pair_values(pair: &[NativeField]) -> Result<(NativeField, NativeField), ProductSumcheckError> {
@@ -585,8 +602,24 @@ fn absorb_term_finals(
 #[cfg(test)]
 mod tests {
     use akita_pcs::{AkitaTranscript, Ring};
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use thiserror::Error;
 
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use super::ProductSumcheckError;
     use super::{NativeField, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor};
+    use crate::NativeProverBackend;
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use crate::{NativeProverBackendError, NativeProverBackendKind};
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[derive(Debug, Error)]
+    enum CudaProductSumcheckTestError {
+        #[error(transparent)]
+        Backend(#[from] NativeProverBackendError),
+        #[error(transparent)]
+        Sumcheck(#[from] ProductSumcheckError),
+    }
 
     fn transcript(side: bool) -> AkitaTranscript<NativeField> {
         let mut transcript = if side {
@@ -603,8 +636,12 @@ mod tests {
     {
         let left = [1_u64, 2, 3, 4].map(NativeField::from_u64);
         let right = [5_u64, 6, 7, 8].map(NativeField::from_u64);
-        let (proof, claim, prover_point) =
-            ProductSumcheckProof::prove(&left, &right, &mut transcript(true))?;
+        let (proof, claim, prover_point) = ProductSumcheckProof::prove(
+            &left,
+            &right,
+            &NativeProverBackend::cpu(),
+            &mut transcript(true),
+        )?;
         let verifier_point = proof.verify(claim, 2, &mut transcript(false))?;
         assert_eq!(prover_point, verifier_point);
 
@@ -640,8 +677,11 @@ mod tests {
                     .collect()
             })
             .collect();
-        let (proof, claim, prover_point) =
-            SumOfProductsSumcheckProof::prove_shared_first(compact, &mut transcript(true))?;
+        let (proof, claim, prover_point) = SumOfProductsSumcheckProof::prove_shared_first(
+            compact,
+            &NativeProverBackend::cpu(),
+            &mut transcript(true),
+        )?;
         let verifier_point = proof.verify(claim, 2, 2, 2, &mut transcript(false))?;
         assert_eq!(prover_point, verifier_point);
 
@@ -657,6 +697,28 @@ mod tests {
                 .verify(claim, 2, 2, 2, &mut transcript(false))
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires a Linux CUDA device and cuda-oxide"]
+    fn cuda_product_sumcheck_matches_cpu_proof() -> Result<(), CudaProductSumcheckTestError> {
+        let left = (0_u64..4_096)
+            .map(|value| NativeField::from_u64(value * 17 + 3))
+            .collect::<Vec<_>>();
+        let right = (0_u64..4_096)
+            .map(|value| NativeField::from_u64(value * 29 + 11))
+            .collect::<Vec<_>>();
+        let cpu_backend = NativeProverBackend::cpu();
+        let cuda_backend =
+            NativeProverBackend::initialize(NativeProverBackendKind::Cuda { device_ordinal: 0 })?;
+        let cpu_result =
+            ProductSumcheckProof::prove(&left, &right, &cpu_backend, &mut transcript(true))?;
+        let cuda_result =
+            ProductSumcheckProof::prove(&left, &right, &cuda_backend, &mut transcript(true))?;
+
+        assert_eq!(cuda_result, cpu_result);
         Ok(())
     }
 }

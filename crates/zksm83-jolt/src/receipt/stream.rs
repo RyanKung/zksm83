@@ -5,7 +5,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
 };
 
-use crate::{CommittedRom, MemoryCommitment, NativeProtocolVersion, NativeStateBoundary};
+use crate::{
+    CommittedRom, MemoryCommitment, NativeProtocolVersion, NativeProverBackend,
+    NativeProverBackendKind, NativeStateBoundary,
+};
 
 use super::{
     MAX_NATIVE_ROM_COMMITMENT_BYTES, MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT,
@@ -22,6 +25,7 @@ use super::{
 /// Incrementally proves segments into a seekable spool without retaining prior proofs.
 pub struct NativeReceiptStreamProver<'a, S> {
     rom: &'a CommittedRom,
+    backend: NativeProverBackend,
     spool: S,
     initial: Option<NativeBoundary>,
     boundary: Option<NativeBoundary>,
@@ -93,7 +97,16 @@ where
     S: Read + Write + Seek,
 {
     /// Starts a receipt whose segment frames will be written to an empty `spool`.
-    pub fn new(rom: &'a CommittedRom, mut spool: S) -> Result<Self, NativeReceiptError> {
+    pub fn new(rom: &'a CommittedRom, spool: S) -> Result<Self, NativeReceiptError> {
+        Self::new_with_backend(rom, spool, NativeProverBackend::cpu())
+    }
+
+    /// Starts a receipt with an explicitly initialized prover execution backend.
+    pub fn new_with_backend(
+        rom: &'a CommittedRom,
+        mut spool: S,
+        backend: NativeProverBackend,
+    ) -> Result<Self, NativeReceiptError> {
         if spool.seek(SeekFrom::End(0))? != 0 {
             return Err(NativeReceiptError::Wire(
                 "segment spool is not empty".to_owned(),
@@ -102,6 +115,7 @@ where
         spool.seek(SeekFrom::Start(0))?;
         Ok(Self {
             rom,
+            backend,
             spool,
             initial: None,
             boundary: None,
@@ -114,7 +128,19 @@ where
     }
 
     /// Restores progress by decoding and verifying every complete frame in a spool.
-    pub fn resume(rom: &'a CommittedRom, mut spool: S) -> Result<Self, NativeReceiptError> {
+    pub fn resume(rom: &'a CommittedRom, spool: S) -> Result<Self, NativeReceiptError> {
+        Self::resume_with_backend(rom, spool, NativeProverBackend::cpu())
+    }
+
+    /// Restores progress with an explicitly initialized prover execution backend.
+    ///
+    /// The selected backend need not match the one used for prior frames because
+    /// backend selection is not part of the proof or checkpoint identity.
+    pub fn resume_with_backend(
+        rom: &'a CommittedRom,
+        mut spool: S,
+        backend: NativeProverBackend,
+    ) -> Result<Self, NativeReceiptError> {
         let spool_bytes = spool.seek(SeekFrom::End(0))?;
         if spool_bytes == 0 || spool_bytes > MAX_NATIVE_STREAM_RECEIPT_BYTES {
             return Err(NativeReceiptError::Wire(
@@ -125,6 +151,7 @@ where
         spool.seek(SeekFrom::Start(spool_bytes))?;
         Ok(Self {
             rom,
+            backend,
             spool,
             initial: Some(progress.initial),
             boundary: Some(progress.final_boundary),
@@ -158,6 +185,12 @@ where
     #[must_use]
     pub const fn spooled_bytes(&self) -> u64 {
         self.spool_bytes
+    }
+
+    /// Returns the prover execution backend used for newly appended frames.
+    #[must_use]
+    pub const fn backend_kind(&self) -> NativeProverBackendKind {
+        self.backend.kind()
     }
 
     /// Returns the last verifier-checked public boundary, if any frame exists.
@@ -198,7 +231,7 @@ where
                 witness.initial_memory.commitment(),
             )?,
         };
-        let proved = prove_frame(index, boundary, witness, self.rom)?;
+        let proved = prove_frame(index, boundary, witness, self.rom, &self.backend)?;
         let frame_bytes = 8_u64
             .checked_add(
                 u64::try_from(proved.encoded.len()).map_err(|_| NativeReceiptError::Counter)?,
@@ -297,9 +330,10 @@ fn prove_frame(
     initial: NativeBoundary,
     witness: NativeSegmentWitness<'_>,
     rom: &CommittedRom,
+    backend: &NativeProverBackend,
 ) -> Result<ProvedFrame, NativeReceiptError> {
     crate::on_akita_worker(|| {
-        let (receipt, final_boundary) = prove_segment(index, initial, witness, rom)?;
+        let (receipt, final_boundary) = prove_segment(index, initial, witness, rom, backend)?;
         let encoded = {
             let _phase = crate::metrics::start(crate::metrics::Phase::Encode);
             encode_segment(&receipt)?

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use akita_pcs::Ring;
 
 use super::{NativeField, ProductSumcheckError};
+use crate::NativeProverBackend;
 
 #[derive(Clone)]
 pub(crate) enum FactorSource<'a> {
@@ -211,9 +212,13 @@ impl SumcheckTable for FoldedFactor {
 }
 
 impl FoldedFactor {
-    pub(super) fn fold(&mut self, challenge: NativeField) -> Result<(), ProductSumcheckError> {
+    pub(super) fn fold(
+        &mut self,
+        challenge: NativeField,
+        backend: &NativeProverBackend,
+    ) -> Result<(), ProductSumcheckError> {
         match self {
-            Self::Table(values) => super::fold(values, challenge),
+            Self::Table(values) => super::fold(values, challenge, backend),
             Self::Constant { len, .. } => {
                 if *len < 2 || !len.is_multiple_of(2) {
                     return Err(ProductSumcheckError::FoldingShape);
