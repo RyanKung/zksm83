@@ -214,6 +214,21 @@ The verifier decodes one bounded segment at a time and does not need the
 emulator, execution trace, cartridge image, memory image, or private log
 values.
 
+## Citation
+
+If you use ZKSM83 or its implementation paper, cite:
+
+```bibtex
+@misc{kung2026zksm83,
+  author = {Kung, Ryan},
+  title = {{ZKSM83}: Native Lookup Proofs for {SM83} Execution},
+  year = {2026},
+  month = sep,
+  url = {https://github.com/RyanKung/zksm83},
+  note = {Implementation snapshot 1062c35}
+}
+```
+
 ## License
 
 The workspace is licensed under [GPL-3.0-only](LICENSE).
