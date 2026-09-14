@@ -1,6 +1,6 @@
 use zksm83_core::{
     BusWitness, CpuState, DmgDeviceState, Flags, ImeState, MachineContext, MachineProfile,
-    Mbc3State, Registers, RunState, StepInput, VmState,
+    Mbc3State, Registers, RunState, StepInput, StepKind, VmState,
 };
 use zksm83_memory::{LogAccumulator, LogKind, MemoryImage, RomImage};
 use zksm83_trace::TraceRow;
@@ -8,7 +8,10 @@ use zksm83_trace::TraceRow;
 use super::{CpuStructuralRelation, test_fixtures::*};
 use crate::{
     NativeTraceWitness, TRACE_AFTER_STATE_START, UniformError,
-    trace::device::{TRACE_AFTER_INTERRUPT_REQUEST_BITS_START, TRACE_TIMER_STAGE_START},
+    trace::device::{
+        TRACE_AFTER_INTERRUPT_REQUEST_BITS_START, TRACE_TIMER_INTERRUPT_GAP_BITS_START,
+        TRACE_TIMER_STAGE_START,
+    },
 };
 
 #[test]
@@ -48,6 +51,26 @@ fn timer_overflow_reload_and_interrupt_are_exact() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[test]
+fn guarded_timer_halt_long_step_is_bound() -> Result<(), Box<dyn std::error::Error>> {
+    let row = halt_until_timer_row()?;
+    assert_eq!(row.effects().kind(), StepKind::HaltUntilTimer);
+    assert_eq!(row.after().cpu().m_cycles(), 6);
+    assert_eq!(row.after().dmg_devices().timer().counter(), 0x42);
+    assert_eq!(row.after().dmg_devices().timer().raw_div(), 24);
+    assert!(row.after().dmg_devices().timer().edge_latch());
+    let trace = NativeTraceWitness::from_rows(&[&row])?;
+    assert_row_satisfied(&CpuStructuralRelation, trace.columns(), 0)?;
+
+    let mut wrong_gap = native_row(&trace, 0)?;
+    set(&mut wrong_gap, TRACE_TIMER_INTERRUPT_GAP_BITS_START, 0)?;
+    assert_native_row_rejected(&CpuStructuralRelation, &wrong_gap)?;
+    let mut wrong_counter = native_row(&trace, 0)?;
+    set(&mut wrong_counter, TRACE_AFTER_STATE_START + 28, 0x43)?;
+    assert_native_row_rejected(&CpuStructuralRelation, &wrong_counter)?;
+    Ok(())
+}
+
 fn overflow_trace() -> Result<(Vec<TraceRow>, NativeTraceWitness), Box<dyn std::error::Error>> {
     let rom = RomImage::new(vec![0; 3])?;
     let memory = MemoryImage::zeroed()?;
@@ -71,6 +94,38 @@ fn overflow_trace() -> Result<(Vec<TraceRow>, NativeTraceWitness), Box<dyn std::
     let references = rows.iter().collect::<Vec<_>>();
     let trace = NativeTraceWitness::from_rows(&references)?;
     Ok((rows, trace))
+}
+
+fn halt_until_timer_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
+    let rom = RomImage::new(vec![0])?;
+    let memory = MemoryImage::zeroed()?;
+    let mut devices = DmgDeviceState::dmg_post_boot();
+    let _prior = devices.write_mmio(0xff0f, 0);
+    let _prior = devices.write_mmio(0xffff, 0x04);
+    let _prior = devices.write_mmio(0xff40, 0);
+    let _prior = devices.write_mmio(0xff04, 0);
+    let _prior = devices.write_mmio(0xff05, 0xff);
+    let _prior = devices.write_mmio(0xff06, 0x42);
+    let _prior = devices.write_mmio(0xff07, 0x05);
+    let cpu = CpuState::new(
+        Registers::default(),
+        Flags::default(),
+        0,
+        0xfffe,
+        ImeState::Enabled,
+        RunState::Halted,
+        0,
+    );
+    let before = VmState::from_profile_parts(
+        MachineContext::new(MachineProfile::DmgPostBootMbc3V1, devices),
+        cpu,
+        Mbc3State::profile_initial(),
+        rom.root(),
+        memory.root(),
+        LogAccumulator::empty(LogKind::Input),
+        LogAccumulator::empty(LogKind::Output),
+    )?;
+    TraceRow::execute(before, StepInput::new(Vec::new())).map_err(Into::into)
 }
 
 fn timer_state(

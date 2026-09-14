@@ -21,6 +21,4 @@ pub use state::{
     CpuState, Flags, ImeState, MachineContext, MachineProfile, Registers, RunState, VmState,
     VmStateError,
 };
-pub use transition::{
-    BLUE_SOUND_WAIT_ROM_ROOT, LookupStepRelation, StepError, StepRelation, blue_dma_wait_candidate,
-};
+pub use transition::{LookupStepRelation, StepError, StepRelation};

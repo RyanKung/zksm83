@@ -2,8 +2,8 @@ use akita_pcs::Ring;
 use jolt_field::Field;
 
 use crate::{
-    NativeExecutionClaim, NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES,
-    UNIFORM_ROW_COUNT, WitnessCommitments,
+    NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
+    WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
     uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
 };
@@ -11,11 +11,8 @@ use crate::{
 use super::{
     BUS_START, CommittedLogColumns, INPUT_START, ISA_START, LOG_COLUMN_COUNT, LOG_KIND_COUNT,
     LOG_LAYOUT, OUTPUT_START, PROTOCOL_LOG_NUM_VARIABLES, PROTOCOL_LOG_ROW_COUNT, ProtocolLogError,
-    TABLE_INVERSE_COLUMN_COUNT, TRACE_INVERSE_COLUMN_COUNT, TRACE_INVERSE_ENTRY_COUNT,
-    evaluate_field_column, expected_counts, join_limbs, push_bytes,
+    TABLE_INVERSE_COLUMN_COUNT, TraceLogLayout, evaluate_field_column, join_limbs, push_bytes,
 };
-
-const SUM_DOMAIN: &[u8] = b"zksm83-native-protocol-log-multiset-sum/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProtocolLogSumProof {
@@ -27,20 +24,37 @@ pub(crate) struct ProtocolLogSumProof {
     pub(crate) table_inverse_opening: OpeningProof,
 }
 
+pub(super) struct ProtocolLogSumInputs<'a> {
+    pub(super) trace_inverses: &'a WitnessCommitments,
+    pub(super) logs: &'a ColumnCommitments,
+    pub(super) table_inverses: &'a ColumnCommitments,
+    pub(super) full_descriptor: &'a [u8],
+}
+
 pub(super) fn prove(
+    layout: TraceLogLayout,
     trace_inverses: &CommittedWitness,
     logs: &CommittedColumns,
     table_inverses: &CommittedLogColumns,
-    claim: &NativeExecutionClaim,
+    counts: [u64; LOG_KIND_COUNT],
     full_descriptor: &[u8],
 ) -> Result<ProtocolLogSumProof, ProtocolLogError> {
-    let descriptor = descriptor(full_descriptor)?;
+    let descriptor = descriptor(layout, full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let log_point = half_point(PROTOCOL_LOG_NUM_VARIABLES)?;
-    let trace_values = evaluate_columns(trace_inverses.field_columns(), &trace_point)?;
-    let log_values = evaluate_columns(logs.field_columns(), &log_point)?;
-    let table_inverse_values = evaluate_columns(table_inverses.inner.field_columns(), &log_point)?;
-    check(&trace_values, &log_values, &table_inverse_values, claim)?;
+    let trace_columns = trace_inverses.field_columns()?;
+    let log_columns = logs.field_columns()?;
+    let table_inverse_columns = table_inverses.inner.field_columns()?;
+    let trace_values = evaluate_columns(trace_columns.as_slice(), &trace_point)?;
+    let log_values = evaluate_columns(log_columns.as_slice(), &log_point)?;
+    let table_inverse_values = evaluate_columns(table_inverse_columns.as_slice(), &log_point)?;
+    check(
+        layout,
+        &trace_values,
+        &log_values,
+        &table_inverse_values,
+        counts,
+    )?;
     let trace_opening =
         prove_witness_opening(trace_inverses, &trace_point, &trace_values, &descriptor)?;
     let log_opening = prove_opening(LOG_LAYOUT, logs, &log_point, &log_values, &descriptor)?;
@@ -62,20 +76,18 @@ pub(super) fn prove(
 }
 
 pub(super) fn verify(
+    layout: TraceLogLayout,
     protocol: NativeProtocolVersion,
     proof: &ProtocolLogSumProof,
-    trace_inverses: &WitnessCommitments,
-    logs: &ColumnCommitments,
-    table_inverses: &ColumnCommitments,
-    claim: &NativeExecutionClaim,
-    full_descriptor: &[u8],
+    counts: [u64; LOG_KIND_COUNT],
+    inputs: ProtocolLogSumInputs<'_>,
 ) -> Result<(), ProtocolLogError> {
-    let descriptor = descriptor(full_descriptor)?;
+    let descriptor = descriptor(layout, inputs.full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let log_point = half_point(PROTOCOL_LOG_NUM_VARIABLES)?;
     verify_witness_opening_for_protocol(
         protocol,
-        trace_inverses,
+        inputs.trace_inverses,
         &trace_point,
         &proof.trace_values,
         &descriptor,
@@ -83,7 +95,7 @@ pub(super) fn verify(
     )?;
     verify_opening(
         LOG_LAYOUT,
-        logs,
+        inputs.logs,
         &log_point,
         &proof.log_values,
         &descriptor,
@@ -91,27 +103,29 @@ pub(super) fn verify(
     )?;
     verify_opening(
         LOG_LAYOUT,
-        table_inverses,
+        inputs.table_inverses,
         &log_point,
         &proof.table_inverse_values,
         &descriptor,
         &proof.table_inverse_opening,
     )?;
     check(
+        layout,
         &proof.trace_values,
         &proof.log_values,
         &proof.table_inverse_values,
-        claim,
+        counts,
     )
 }
 
 fn check(
+    layout: TraceLogLayout,
     trace: &[NativeField],
     logs: &[NativeField],
     table_inverses: &[NativeField],
-    claim: &NativeExecutionClaim,
+    counts: [u64; LOG_KIND_COUNT],
 ) -> Result<(), ProtocolLogError> {
-    if trace.len() != TRACE_INVERSE_COLUMN_COUNT
+    if trace.len() != layout.inverse_column_count()
         || logs.len() != LOG_COLUMN_COUNT
         || table_inverses.len() != TABLE_INVERSE_COLUMN_COUNT
     {
@@ -123,9 +137,8 @@ fn check(
     let log_rows = NativeField::from_u64(
         u64::try_from(PROTOCOL_LOG_ROW_COUNT).map_err(|_| ProtocolLogError::Shape)?,
     );
-    let entry_ranges = [0..5, 5..10, 10..15, 15..16];
+    let entry_ranges = layout.entry_ranges();
     let selectors = [BUS_START, INPUT_START, OUTPUT_START, ISA_START];
-    let counts = expected_counts(claim)?;
     for kind in 0..LOG_KIND_COUNT {
         let mut range = entry_ranges
             .get(kind)
@@ -152,7 +165,11 @@ fn check(
 }
 
 fn joined_trace(values: &[NativeField], entry: usize) -> Result<NativeField, ProtocolLogError> {
-    if entry >= TRACE_INVERSE_ENTRY_COUNT {
+    let high = entry
+        .checked_mul(2)
+        .and_then(|index| index.checked_add(1))
+        .ok_or(ProtocolLogError::Shape)?;
+    if high >= values.len() {
         return Err(ProtocolLogError::Shape);
     }
     Ok(join_limbs(
@@ -162,12 +179,12 @@ fn joined_trace(values: &[NativeField], entry: usize) -> Result<NativeField, Pro
 }
 
 fn evaluate_columns(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     point: &[NativeField],
 ) -> Result<Vec<NativeField>, ProtocolLogError> {
     columns
         .iter()
-        .map(|column| evaluate_field_column(column, point))
+        .map(|column| evaluate_field_column(column.as_ref(), point))
         .collect()
 }
 
@@ -178,9 +195,9 @@ fn half_point(count: usize) -> Result<Vec<NativeField>, ProtocolLogError> {
     Ok(vec![half; count])
 }
 
-fn descriptor(full: &[u8]) -> Result<Vec<u8>, ProtocolLogError> {
+fn descriptor(layout: TraceLogLayout, full: &[u8]) -> Result<Vec<u8>, ProtocolLogError> {
     let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, SUM_DOMAIN)?;
+    push_bytes(&mut descriptor, layout.sum_domain())?;
     push_bytes(&mut descriptor, full)?;
     Ok(descriptor)
 }

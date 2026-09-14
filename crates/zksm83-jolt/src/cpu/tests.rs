@@ -13,9 +13,11 @@ use super::{
 };
 use crate::{
     NATIVE_TRACE_COLUMN_COUNT, NativeField, NativeTraceWitness, TRACE_ACTIVE,
-    TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_STATE_START, TRACE_BUS_PHYSICAL_BITS_START,
-    TRACE_BUS_SLOT_WIDTH, TRACE_BUS_START, TRACE_BUS_VALUE_BITS_START, UniformError,
-    UniformRelation,
+    TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_STATE_START,
+    TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START, TRACE_BEFORE_ROM_BANK_BITS_START,
+    TRACE_BUS_PHYSICAL_BITS_START, TRACE_BUS_SLOT_WIDTH, TRACE_BUS_START,
+    TRACE_BUS_VALUE_BITS_START, TRACE_ISA_ADDRESS_START, TRACE_MEMORY_START, TRACE_OPERAND_VALUE,
+    TRACE_ROM_SELECTOR_START, UniformError, UniformRelation,
 };
 
 #[test]
@@ -68,8 +70,16 @@ fn structural_relation_used_slot_count_is_stable() -> Result<(), Box<dyn std::er
         .into_iter()
         .map(NativeField::from_u64)
         .collect::<Vec<_>>();
-    let mut constraints = vec![NativeField::from_u64(0); CPU_STRUCTURAL_CONSTRAINT_COUNT];
-    assert_eq!(evaluate_constraints(&row, &mut constraints)?, 5355);
+    let mut constraints = vec![NativeField::from_u64(1); CPU_STRUCTURAL_CONSTRAINT_COUNT];
+    let used = evaluate_constraints(&row, &mut constraints)?;
+    assert_eq!(used, 5268);
+    assert!(
+        constraints
+            .get(used..)
+            .ok_or(UniformError::Shape)?
+            .iter()
+            .all(|constraint| *constraint == NativeField::from_u64(0))
+    );
     Ok(())
 }
 
@@ -91,6 +101,35 @@ fn structural_relation_reads_every_native_trace_column() -> Result<(), Box<dyn s
         .filter_map(|(index, value)| (!value.get()).then_some(index))
         .collect::<Vec<_>>();
     assert!(unread.is_empty(), "unread native trace columns: {unread:?}");
+    Ok(())
+}
+
+#[test]
+fn structural_relation_rejects_each_cpu_bound_column_family()
+-> Result<(), Box<dyn std::error::Error>> {
+    let trace = single_opcode_trace(0x00)?;
+    let row = native_row(&trace, 0)?;
+    let relation = CpuStructuralRelation;
+    let representatives = [
+        ("state", crate::TRACE_BEFORE_STATE_START),
+        ("control and ISA", TRACE_ISA_ADDRESS_START),
+        ("bus tuple", TRACE_BUS_START + BUS_VALUE_OFFSET),
+        ("CPU helper", TRACE_OPERAND_VALUE),
+        ("bus decomposition", TRACE_BUS_VALUE_BITS_START),
+        ("mapper", TRACE_BEFORE_ROM_BANK_BITS_START),
+        ("ROM lookup", TRACE_ROM_SELECTOR_START),
+        ("memory", TRACE_MEMORY_START),
+        ("device", TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START),
+    ];
+    for (family, column) in representatives {
+        let mut tampered = row.clone();
+        let value = tampered.get_mut(column).ok_or(UniformError::Shape)?;
+        *value ^= 1;
+        assert!(
+            assert_native_row_rejected(&relation, &tampered).is_ok(),
+            "representative mutation accepted for {family} family at column {column}"
+        );
+    }
     Ok(())
 }
 

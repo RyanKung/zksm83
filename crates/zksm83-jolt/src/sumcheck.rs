@@ -582,13 +582,8 @@ fn fold(table: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), Prod
     if table.len() <= 1 || !table.len().is_power_of_two() {
         return Err(ProductSumcheckError::FoldingShape);
     }
-    let mut folded = Vec::with_capacity(table.len() / 2);
-    for pair in table.chunks_exact(2) {
-        let (zero, one) = pair_values(pair)?;
-        folded.push(zero + challenge * (one - zero));
-    }
-    *table = folded;
-    Ok(())
+    crate::field_fold::fold_binary_layer(table, challenge)
+        .map_err(|_| ProductSumcheckError::FoldingShape)
 }
 
 fn pair_values(pair: &[NativeField]) -> Result<(NativeField, NativeField), ProductSumcheckError> {

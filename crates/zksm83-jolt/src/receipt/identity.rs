@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AKITA_LOG_SCHEDULE_SHA256, AKITA_MEMORY_SCHEDULE_SHA256, AKITA_ROM_SCHEDULE_SHA256,
-    MEMORY_IMAGE_BYTES, MemoryCommitment, NativeCpuStructuralError, NativeProtocolVersion,
-    NativeStateBoundary, ProtocolLogCommitments, ROM_IMAGE_BYTES, RomCommitment,
+    MEMORY_IMAGE_BYTES, MemoryCommitment, NativeProtocolVersion, NativeStateBoundary,
+    PackedBlockProofError, ProtocolLogCommitments, ROM_IMAGE_BYTES, RomCommitment,
     STATE_SCALAR_COUNT, backend_identity_for,
 };
 
@@ -19,28 +19,16 @@ const BUS_CURSOR_SCALAR: usize = 18;
 const ISA_CURSOR_SCALAR: usize = 19;
 const DMG_POST_BOOT_MBC3_V1: u64 = 1;
 
-const IDENTITY_DOMAIN: &[u8] = b"zksm83/native-commitment-identity/v1";
 const IDENTITY_DOMAIN_V2: &[u8] = b"zksm83/native-commitment-identity/v2";
-const LAYOUT_DOMAIN: &[u8] = b"zksm83/native-layout-identity/v1";
 const LAYOUT_DOMAIN_V2: &[u8] = b"zksm83/native-layout-identity/v2";
-const EMPTY_LOG_DOMAIN: &[u8] = b"zksm83/native-empty-log-chain/v1";
 const EMPTY_LOG_DOMAIN_V2: &[u8] = b"zksm83/native-empty-log-chain/v2";
-const LOG_SEGMENT_DOMAIN: &[u8] = b"zksm83/native-log-segment-identity/v1";
 const LOG_SEGMENT_DOMAIN_V2: &[u8] = b"zksm83/native-log-segment-identity/v2";
-const LOG_CHAIN_DOMAIN: &[u8] = b"zksm83/native-log-chain/v1";
 const LOG_CHAIN_DOMAIN_V2: &[u8] = b"zksm83/native-log-chain/v2";
-const BACKEND_DOMAIN: &[u8] = b"zksm83/native-backend-identity/v1";
 const BACKEND_DOMAIN_V2: &[u8] = b"zksm83/native-backend-identity/v2";
-const STATEMENT_DOMAIN: &[u8] = b"zksm83/native-statement/v1";
 const STATEMENT_DOMAIN_V2: &[u8] = b"zksm83/native-statement/v2";
 
-const fn versioned_domain(
-    protocol: NativeProtocolVersion,
-    legacy: &'static [u8],
-    current: &'static [u8],
-) -> &'static [u8] {
+const fn v2_domain(protocol: NativeProtocolVersion, current: &'static [u8]) -> &'static [u8] {
     match protocol {
-        NativeProtocolVersion::V1 => legacy,
         NativeProtocolVersion::V2 => current,
     }
 }
@@ -238,47 +226,42 @@ impl ProtocolLogIdentities {
     fn advance_for(
         &self,
         protocol: NativeProtocolVersion,
-        initial: NativeStateBoundary,
-        final_state: NativeStateBoundary,
         commitment: &ProtocolLogCommitments,
         segment_index: u64,
+        counts: ProtocolLogCounts,
     ) -> Result<Self, NativeReceiptError> {
         Ok(Self {
             bus: advance_log(
                 protocol,
                 &self.bus,
                 ProtocolLogKind::Bus,
-                initial,
-                final_state,
                 commitment,
                 segment_index,
+                counts.bus,
             )?,
             input: advance_log(
                 protocol,
                 &self.input,
                 ProtocolLogKind::Input,
-                initial,
-                final_state,
                 commitment,
                 segment_index,
+                counts.input,
             )?,
             output: advance_log(
                 protocol,
                 &self.output,
                 ProtocolLogKind::Output,
-                initial,
-                final_state,
                 commitment,
                 segment_index,
+                counts.output,
             )?,
             isa: advance_log(
                 protocol,
                 &self.isa,
                 ProtocolLogKind::Isa,
-                initial,
-                final_state,
                 commitment,
                 segment_index,
+                counts.isa,
             )?,
         })
     }
@@ -322,21 +305,41 @@ impl ProtocolLogCounts {
     ) -> Result<Self, NativeReceiptError> {
         Ok(Self {
             bus: checked_delta(
-                initial.log_cursor(ProtocolLogKind::Bus),
-                final_boundary.log_cursor(ProtocolLogKind::Bus),
+                initial.logs.bus.committed_length,
+                final_boundary.logs.bus.committed_length,
             )?,
             input: checked_delta(
-                initial.log_cursor(ProtocolLogKind::Input),
-                final_boundary.log_cursor(ProtocolLogKind::Input),
+                initial.logs.input.committed_length,
+                final_boundary.logs.input.committed_length,
             )?,
             output: checked_delta(
-                initial.log_cursor(ProtocolLogKind::Output),
-                final_boundary.log_cursor(ProtocolLogKind::Output),
+                initial.logs.output.committed_length,
+                final_boundary.logs.output.committed_length,
             )?,
             isa: checked_delta(
-                initial.log_cursor(ProtocolLogKind::Isa),
-                final_boundary.log_cursor(ProtocolLogKind::Isa),
+                initial.logs.isa.committed_length,
+                final_boundary.logs.isa.committed_length,
             )?,
+        })
+    }
+
+    pub(crate) fn packed(
+        initial: NativeStateBoundary,
+        final_state: NativeStateBoundary,
+        bus: u64,
+        isa: u64,
+    ) -> Result<Self, NativeReceiptError> {
+        Ok(Self {
+            bus,
+            input: checked_delta(
+                scalar(initial, INPUT_CURSOR_SCALAR)?,
+                scalar(final_state, INPUT_CURSOR_SCALAR)?,
+            )?,
+            output: checked_delta(
+                scalar(initial, OUTPUT_CURSOR_SCALAR)?,
+                scalar(final_state, OUTPUT_CURSOR_SCALAR)?,
+            )?,
+            isa,
         })
     }
 
@@ -407,6 +410,7 @@ impl NativeBoundary {
         memory: CommitmentIdentity,
         commitment: &ProtocolLogCommitments,
         segment_index: u64,
+        counts: ProtocolLogCounts,
     ) -> Result<Self, NativeReceiptError> {
         self.advance_for(
             NativeProtocolVersion::current(),
@@ -414,6 +418,7 @@ impl NativeBoundary {
             memory,
             commitment,
             segment_index,
+            counts,
         )
     }
 
@@ -424,10 +429,11 @@ impl NativeBoundary {
         memory: CommitmentIdentity,
         commitment: &ProtocolLogCommitments,
         segment_index: u64,
+        counts: ProtocolLogCounts,
     ) -> Result<Self, NativeReceiptError> {
         let logs = self
             .logs
-            .advance_for(protocol, self.state, state, commitment, segment_index)?;
+            .advance_for(protocol, commitment, segment_index, counts)?;
         let boundary = Self {
             state,
             memory,
@@ -454,11 +460,7 @@ impl NativeBoundary {
     }
 
     pub(crate) fn log_cursor(&self, kind: ProtocolLogKind) -> u64 {
-        self.state
-            .scalars()
-            .get(kind.cursor_index())
-            .copied()
-            .unwrap_or(0)
+        self.logs.get(kind).committed_length
     }
 
     pub(crate) fn validate_for(
@@ -477,14 +479,26 @@ impl NativeBoundary {
             ProtocolLogKind::Output,
             ProtocolLogKind::Isa,
         ] {
-            let cursor = self.log_cursor(kind);
+            let state_cursor = self.state_log_cursor(kind)?;
             let identity = self.logs.get(kind);
-            identity.validate_for(protocol, kind.commitment_kind(), cursor)?;
-            if cursor == 0 && identity != &empty_log_identity(protocol, kind) {
+            let identity_cursor = identity.committed_length;
+            let state_matches = match kind {
+                ProtocolLogKind::Bus | ProtocolLogKind::Isa => state_cursor == 0,
+                ProtocolLogKind::Input | ProtocolLogKind::Output => state_cursor == identity_cursor,
+            };
+            if !state_matches {
+                return Err(NativeReceiptError::InvalidStatement);
+            }
+            identity.validate_for(protocol, kind.commitment_kind(), identity_cursor)?;
+            if identity_cursor == 0 && identity != &empty_log_identity(protocol, kind) {
                 return Err(NativeReceiptError::InvalidStatement);
             }
         }
         Ok(())
+    }
+
+    fn state_log_cursor(&self, kind: ProtocolLogKind) -> Result<u64, NativeReceiptError> {
+        self.scalar(kind.cursor_index())
     }
 
     fn scalar(&self, index: usize) -> Result<u64, NativeReceiptError> {
@@ -551,11 +565,7 @@ pub(super) fn direct_identity(
     commitment: &[u8],
 ) -> Result<CommitmentIdentity, NativeReceiptError> {
     let layout_digest = layout_digest(protocol, kind);
-    let mut hash = CanonicalHash::new(versioned_domain(
-        protocol,
-        IDENTITY_DOMAIN,
-        IDENTITY_DOMAIN_V2,
-    ));
+    let mut hash = CanonicalHash::new(v2_domain(protocol, IDENTITY_DOMAIN_V2));
     hash.u64(kind.code());
     hash.fixed(&layout_digest);
     hash.u64(length);
@@ -574,11 +584,7 @@ fn empty_log_identity(
 ) -> CommitmentIdentity {
     let commitment_kind = kind.commitment_kind();
     let layout_digest = layout_digest(protocol, commitment_kind);
-    let mut hash = CanonicalHash::new(versioned_domain(
-        protocol,
-        EMPTY_LOG_DOMAIN,
-        EMPTY_LOG_DOMAIN_V2,
-    ));
+    let mut hash = CanonicalHash::new(v2_domain(protocol, EMPTY_LOG_DOMAIN_V2));
     hash.u64(kind.code());
     hash.fixed(&layout_digest);
     CommitmentIdentity {
@@ -593,32 +599,24 @@ fn advance_log(
     protocol: NativeProtocolVersion,
     previous: &CommitmentIdentity,
     kind: ProtocolLogKind,
-    initial: NativeStateBoundary,
-    final_state: NativeStateBoundary,
     commitment: &ProtocolLogCommitments,
     segment_index: u64,
+    count: u64,
 ) -> Result<CommitmentIdentity, NativeReceiptError> {
-    let start = scalar(initial, kind.cursor_index())?;
-    let end = scalar(final_state, kind.cursor_index())?;
-    let count = checked_delta(start, end)?;
+    let start = previous.committed_length;
+    let end = start
+        .checked_add(count)
+        .ok_or(NativeReceiptError::Counter)?;
     previous.validate_for(protocol, kind.commitment_kind(), start)?;
     if count == 0 {
         return Ok(previous.clone());
     }
     let commitment_bytes = commitment.canonical_bytes()?;
-    let mut segment = CanonicalHash::new(versioned_domain(
-        protocol,
-        LOG_SEGMENT_DOMAIN,
-        LOG_SEGMENT_DOMAIN_V2,
-    ));
+    let mut segment = CanonicalHash::new(v2_domain(protocol, LOG_SEGMENT_DOMAIN_V2));
     segment.u64(kind.code());
     segment.u64(count);
     segment.bytes(&commitment_bytes);
-    let mut chain = CanonicalHash::new(versioned_domain(
-        protocol,
-        LOG_CHAIN_DOMAIN,
-        LOG_CHAIN_DOMAIN_V2,
-    ));
+    let mut chain = CanonicalHash::new(v2_domain(protocol, LOG_CHAIN_DOMAIN_V2));
     previous.append(&mut chain);
     chain.u64(kind.code());
     chain.u64(segment_index);
@@ -641,11 +639,7 @@ pub(super) fn checked_delta(initial: u64, final_value: u64) -> Result<u64, Nativ
 
 pub(super) fn backend_digest(protocol: NativeProtocolVersion) -> [u8; 32] {
     let backend = backend_identity_for(protocol);
-    let mut hash = CanonicalHash::new(versioned_domain(
-        protocol,
-        BACKEND_DOMAIN,
-        BACKEND_DOMAIN_V2,
-    ));
+    let mut hash = CanonicalHash::new(v2_domain(protocol, BACKEND_DOMAIN_V2));
     for value in [
         backend.protocol,
         backend.jolt_reference_revision,
@@ -662,9 +656,8 @@ pub(super) fn backend_digest(protocol: NativeProtocolVersion) -> [u8; 32] {
     ] {
         hash.bytes(value.as_bytes());
     }
-    if protocol == NativeProtocolVersion::V2 {
-        hash.bytes(backend.auxiliary_schedule_sha256.as_bytes());
-    }
+    hash.bytes(backend.auxiliary_schedule_sha256.as_bytes());
+    hash.bytes(backend.proof_composition_revision.as_bytes());
     for value in [
         backend.relation_num_variables,
         backend.trace_column_count,
@@ -680,11 +673,7 @@ pub(super) fn backend_digest(protocol: NativeProtocolVersion) -> [u8; 32] {
 }
 
 pub(super) fn statement_digest(statement: &NativeStatement) -> [u8; 32] {
-    let mut hash = CanonicalHash::new(versioned_domain(
-        statement.protocol,
-        STATEMENT_DOMAIN,
-        STATEMENT_DOMAIN_V2,
-    ));
+    let mut hash = CanonicalHash::new(v2_domain(statement.protocol, STATEMENT_DOMAIN_V2));
     hash.fixed(&statement.backend_digest);
     hash.u64(statement.machine_profile);
     hash.u64(statement.rom_byte_length);
@@ -692,14 +681,15 @@ pub(super) fn statement_digest(statement: &NativeStatement) -> [u8; 32] {
     statement.initial.append(&mut hash);
     statement.final_boundary.append(&mut hash);
     hash.u64(statement.segment_count);
-    hash.u64(statement.relation_step_count);
+    hash.u64(statement.transition_count);
+    hash.u64(statement.relation_row_count);
     hash.u64(statement.m_cycle_count);
     statement.logs.append(&mut hash);
     hash.finish()
 }
 
 fn layout_digest(protocol: NativeProtocolVersion, kind: CommitmentKind) -> [u8; 32] {
-    let mut hash = CanonicalHash::new(versioned_domain(protocol, LAYOUT_DOMAIN, LAYOUT_DOMAIN_V2));
+    let mut hash = CanonicalHash::new(v2_domain(protocol, LAYOUT_DOMAIN_V2));
     hash.bytes(protocol.protocol_id().as_bytes());
     hash.u64(kind.code());
     match kind {
@@ -768,11 +758,11 @@ struct NativeCpuErrorMap;
 
 impl NativeCpuErrorMap {
     fn rom(error: crate::RomLookupError) -> NativeReceiptError {
-        NativeReceiptError::Proof(NativeCpuStructuralError::RomLookup(error))
+        NativeReceiptError::Proof(PackedBlockProofError::RomLookup(error))
     }
 
     fn memory(error: crate::MutableMemoryError) -> NativeReceiptError {
-        NativeReceiptError::Proof(NativeCpuStructuralError::MutableMemory(error))
+        NativeReceiptError::Proof(PackedBlockProofError::MutableMemory(error))
     }
 }
 

@@ -17,19 +17,26 @@ domain-separated SHA-256; verifier-visible ROM/RAM/log claims remain Akita
 commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
-New statements and receipts use native receipt v2. Its 26 ordered shared-trace
-commitment groups are opened as 13 schedule-bound adjacent pairs. The
-standalone verifier retains an explicit read-only v1 branch for existing
-receipts; the prover never emits v1.
+New statements and receipts use a hard-cut native receipt v2. Its 4,505-column
+packed CPU plane forms 36 ordered commitment groups opened as 18
+schedule-bound adjacent pairs. High-level encoders and decoders reject v1;
+there is no legacy receipt fallback.
 
-The complete 611-segment Pokémon Blue receipt is still unfinished. Synthetic
-single- and two-segment receipt gates have passed. A fresh native-only run from
-the frozen `2b342e7` revision produced and recovery-verified four adjacent real
-Blue segments before the operator deliberately stopped the long proof run.
-That prefix is bounded recovery evidence, not a complete-path receipt.
+The former one-transition CPU, continuity, mutable-memory, and protocol-log
+proof APIs and their wire layouts have been deleted. The one-transition trace
+and relation remain only as a semantic reference used to construct and audit
+the packed V2 instruction lanes; they cannot produce a receipt.
+
+Execution and proof construction contain no cartridge-identity, ROM-root,
+program-counter, bank, or instruction-byte-pattern fast path. Every cartridge
+uses the same transition modes and constraints. Historical prefix proofs made
+before this generic-relation cutover are incompatible with the current backend
+identity and are not current performance evidence.
 See [implementation status](docs/completion-report.md), the
 [validation map](docs/validation.md), and the
-[native milestone contract](docs/native-jolt-plan.md).
+[native milestone contract](docs/native-jolt-plan.md). The next optimization
+work is specified in the [generic optimization plan](docs/optimization-plan.md),
+with a reproducible [proof-free baseline](docs/proof-free-baseline.md).
 
 ## Workspace
 
@@ -75,16 +82,27 @@ cargo run --release -p zksm83-jolt --bin zksm83-native-prover -- \
 Replace `--preflight-only` with `--segment-limit 1` for a bounded first run.
 Use the same arguments plus `--resume` to verify the durable prefix and
 continue from its exact SM83 boundary. A partial spool is never published as
-the declared final receipt.
+the declared final receipt. Finalization durably publishes or byte-checks the
+statement first and publishes the receipt last as the completion marker, so a
+crash cannot leave a declared receipt without its matching statement.
 
 Use the same arguments plus `--inspect-progress-only` to verify an existing
 progress/spool pair without opening either file for writing. This mode requires
 the spool length to match the checkpoint exactly, verifies every persisted
 proof frame, checks the final state and memory commitment, and prints stable
-`zksm83-native-progress-evidence/v2` JSON. The v2 checkpoint binds the receipt
-version, protocol ID, and both trace schedule digests, so a v1 checkpoint
-cannot be resumed into a v2 proof. Inspection never truncates crash-tail bytes,
-continues execution, or creates a receipt or statement.
+`zksm83-native-progress-evidence/v5` JSON. The progress-v5 checkpoint records
+raw completed transitions separately from packed relation rows. Both counters
+must equal the values recovered by verifying every persisted proof frame: a
+fifth packed-continuity auxiliary column authenticates the number of source
+SM83 transitions represented by each row. The checkpoint also binds the
+receipt version, protocol ID, explicit proof-composition revision, complete
+compiled backend digest, and both trace schedule digests. A relation, layout,
+transcript, wire, or schedule change is therefore rejected before the spool is
+decoded. Unknown checkpoint fields and counters outside the fixed segment,
+row, transition-density, or spool-size bounds also fail before spool decoding.
+There is no fallback reader for earlier progress schemas. Inspection never
+truncates crash-tail bytes, continues execution, or creates a receipt or
+statement.
 
 Completed segment log lines separate process-local `setup`, `commit`,
 `sumcheck`, `opening`, and `encode` wall times. The standalone verifier reports

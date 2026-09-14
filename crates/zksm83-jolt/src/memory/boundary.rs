@@ -353,8 +353,9 @@ fn open_columns(
     point: &[NativeField],
     descriptor: &[u8],
 ) -> Result<ColumnOpening, MutableMemoryError> {
-    let values = columns
-        .field_columns()
+    let field_columns = columns.field_columns()?;
+    let values = field_columns
+        .as_slice()
         .iter()
         .map(|column| super::evaluate_field_column(column, point))
         .collect::<Result<Vec<_>, _>>()?;
@@ -380,28 +381,18 @@ fn verify_columns(
 }
 
 fn one_column(columns: &CommittedColumns) -> Result<&[NativeField], MutableMemoryError> {
-    if columns.field_columns().len() != 1 {
+    if columns.commitments().column_count() != 1 {
         return Err(MutableMemoryError::Shape);
     }
-    columns
-        .field_columns()
-        .first()
-        .map(Vec::as_slice)
-        .ok_or(MutableMemoryError::Shape)
+    columns.field_column(0).map_err(Into::into)
 }
 
 fn joined_columns(columns: &CommittedColumns) -> Result<Vec<NativeField>, MutableMemoryError> {
-    if columns.field_columns().len() != 2 {
+    if columns.commitments().column_count() != 2 {
         return Err(MutableMemoryError::Shape);
     }
-    let low = columns
-        .field_columns()
-        .first()
-        .ok_or(MutableMemoryError::Shape)?;
-    let high = columns
-        .field_columns()
-        .get(1)
-        .ok_or(MutableMemoryError::Shape)?;
+    let low = columns.field_column(0)?;
+    let high = columns.field_column(1)?;
     if low.len() != high.len() {
         return Err(MutableMemoryError::Shape);
     }

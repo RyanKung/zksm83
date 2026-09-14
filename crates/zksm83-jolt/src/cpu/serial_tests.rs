@@ -1,6 +1,6 @@
 use zksm83_core::{
-    BusWitness, CpuState, DmgDeviceState, Flags, ImeState, MachineContext, MachineProfile,
-    Mbc3State, Registers, RunState, StepInput, VmState,
+    BusWitness, CpuState, DmgDeviceState, DmgInterrupt, Flags, ImeState, MachineContext,
+    MachineProfile, Mbc3State, Registers, RunState, StepInput, StepKind, VmState,
 };
 use zksm83_memory::{LogAccumulator, LogKind, MemoryImage, RomImage};
 use zksm83_trace::{TraceBuilder, TraceRow};
@@ -9,8 +9,10 @@ use super::{CpuStructuralRelation, test_fixtures::*};
 use crate::{
     NativeTraceWitness, TRACE_AFTER_STATE_START, UniformError,
     trace::device::{
-        TRACE_AFTER_DMG_HIGH_BITS_START, TRACE_BEFORE_DMG_HIGH_BITS_START, TRACE_SERIAL_COMPLETED,
-        TRACE_SERIAL_COMPLETION_GAP_BITS_START, TRACE_SERIAL_POST_COUNTDOWN_BITS_START,
+        TRACE_AFTER_DMG_HIGH_BITS_START, TRACE_AFTER_INTERRUPT_ENABLE_BITS_START,
+        TRACE_BEFORE_DMG_HIGH_BITS_START, TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START,
+        TRACE_SERIAL_COMPLETED, TRACE_SERIAL_COMPLETION_GAP_BITS_START,
+        TRACE_SERIAL_POST_COUNTDOWN_BITS_START,
     },
 };
 
@@ -85,6 +87,53 @@ fn serial_completion_sets_data_control_and_interrupt() -> Result<(), Box<dyn std
     Ok(())
 }
 
+#[test]
+fn interrupt_dispatch_can_complete_active_serial_transfer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let row = interrupt_serial_completion_row()?;
+    assert_eq!(
+        row.effects().kind(),
+        StepKind::InterruptDispatch(DmgInterrupt::VBlank)
+    );
+    assert_eq!(row.after().dmg_devices().read_mmio(0xff01), Some(0xff));
+    assert_eq!(row.after().dmg_devices().read_mmio(0xff02), Some(0x01));
+    assert_eq!(row.after().dmg_devices().interrupt_request() & 0x08, 0x08);
+    let trace = NativeTraceWitness::from_rows(&[&row])?;
+    assert_row_satisfied(&CpuStructuralRelation, trace.columns(), 0)?;
+    Ok(())
+}
+
+#[test]
+fn guarded_serial_halt_long_step_is_bound() -> Result<(), Box<dyn std::error::Error>> {
+    let row = halt_until_serial_row()?;
+    assert_eq!(row.effects().kind(), StepKind::HaltUntilSerial);
+    assert_eq!(row.after().cpu().m_cycles(), 1024);
+    assert_eq!(row.after().dmg_devices().read_mmio(0xff01), Some(0xff));
+    assert_eq!(row.after().dmg_devices().read_mmio(0xff02), Some(0x01));
+    let trace = NativeTraceWitness::from_rows(&[&row])?;
+    assert_row_satisfied(&CpuStructuralRelation, trace.columns(), 0)?;
+
+    let mut overshoot = native_row(&trace, 0)?;
+    set(&mut overshoot, TRACE_SERIAL_COMPLETION_GAP_BITS_START, 1)?;
+    assert_native_row_rejected(&CpuStructuralRelation, &overshoot)?;
+
+    let mut missing_ie = native_row(&trace, 0)?;
+    set(&mut missing_ie, crate::TRACE_BEFORE_STATE_START + 22, 0)?;
+    set(&mut missing_ie, crate::TRACE_AFTER_STATE_START + 22, 0)?;
+    set(
+        &mut missing_ie,
+        TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START + 3,
+        0,
+    )?;
+    set(
+        &mut missing_ie,
+        TRACE_AFTER_INTERRUPT_ENABLE_BITS_START + 3,
+        0,
+    )?;
+    assert_native_row_rejected(&CpuStructuralRelation, &missing_ie)?;
+    Ok(())
+}
+
 fn serial_start_trace() -> Result<NativeTraceWitness, Box<dyn std::error::Error>> {
     let mut bytes = vec![0_u8; 0x10c];
     bytes
@@ -131,6 +180,79 @@ fn serial_completion_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
     )?;
     TraceRow::execute(before, StepInput::new(vec![BusWitness::Rom(rom.read(0)?)]))
         .map_err(Into::into)
+}
+
+fn interrupt_serial_completion_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
+    let rom = RomImage::new(vec![0])?;
+    let memory = MemoryImage::zeroed()?;
+    let mut devices = DmgDeviceState::dmg_post_boot();
+    let _prior = devices.write_mmio(0xff01, 0x42);
+    let _prior = devices.write_mmio(0xff02, 0x81);
+    for _ in 0..16 {
+        devices.advance_m_cycles(63);
+    }
+    devices.advance_m_cycles(11);
+    let _prior = devices.write_mmio(0xff0f, 0x01);
+    let _prior = devices.write_mmio(0xffff, 0x01);
+    let cpu = CpuState::new(
+        Registers::default(),
+        Flags::default(),
+        0,
+        0xfffe,
+        ImeState::Enabled,
+        RunState::Running,
+        0,
+    );
+    let before = VmState::from_profile_parts(
+        MachineContext::new(MachineProfile::DmgPostBootMbc3V1, devices),
+        cpu,
+        Mbc3State::profile_initial(),
+        rom.root(),
+        memory.root(),
+        LogAccumulator::empty(LogKind::Input),
+        LogAccumulator::empty(LogKind::Output),
+    )?;
+    let mut fork = memory.fork();
+    let high = fork.write_mapped(0xfffd, 0xfffd, 0)?;
+    let low = fork.write_mapped(0xfffc, 0xfffc, 0)?;
+    TraceRow::execute(
+        before,
+        StepInput::new(vec![
+            BusWitness::MemoryWrite(high),
+            BusWitness::MemoryWrite(low),
+        ]),
+    )
+    .map_err(Into::into)
+}
+
+fn halt_until_serial_row() -> Result<TraceRow, Box<dyn std::error::Error>> {
+    let rom = RomImage::new(vec![0])?;
+    let memory = MemoryImage::zeroed()?;
+    let mut devices = DmgDeviceState::dmg_post_boot();
+    let _prior = devices.write_mmio(0xff0f, 0);
+    let _prior = devices.write_mmio(0xffff, 0x08);
+    let _prior = devices.write_mmio(0xff40, 0);
+    let _prior = devices.write_mmio(0xff01, 0x42);
+    let _prior = devices.write_mmio(0xff02, 0x81);
+    let cpu = CpuState::new(
+        Registers::default(),
+        Flags::default(),
+        0,
+        0xfffe,
+        ImeState::Enabled,
+        RunState::Halted,
+        0,
+    );
+    let before = VmState::from_profile_parts(
+        MachineContext::new(MachineProfile::DmgPostBootMbc3V1, devices),
+        cpu,
+        Mbc3State::profile_initial(),
+        rom.root(),
+        memory.root(),
+        LogAccumulator::empty(LogKind::Input),
+        LogAccumulator::empty(LogKind::Output),
+    )?;
+    TraceRow::execute(before, StepInput::new(Vec::new())).map_err(Into::into)
 }
 
 fn set(row: &mut [u64], index: usize, value: u64) -> Result<(), UniformError> {

@@ -17,14 +17,13 @@ use crate::{
     },
 };
 
-/// Number of bytes in the frozen Pokémon Blue MBC3 cartridge profile.
+/// Number of bytes in the current one-MiB MBC3 cartridge profile.
 pub const ROM_IMAGE_BYTES: usize = 1 << ROM_ADDRESS_BIT_COUNT;
 /// Number of least-significant-bit-first physical ROM address columns.
 pub const ROM_ADDRESS_BIT_COUNT: usize = 20;
 
 const ROM_TABLE_NUM_VARIABLES: usize = ROM_ADDRESS_BIT_COUNT;
 const ROM_LOOKUP_FACTOR_COUNT: usize = ROM_ADDRESS_BIT_COUNT + 2;
-const ROM_LOOKUP_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-rom-shout/v1";
 const ROM_LOOKUP_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-rom-shout/v2";
 const ROM_COMMITMENT_DOMAIN: &[u8] = b"zksm83/native-rom-commitment/v1";
 const ROM_OPENING_DOMAIN: &[u8] = b"zksm83-native-rom-opening/v1";
@@ -275,19 +274,20 @@ fn prove_on_worker(
     let mut transcript = lookup_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let coefficients = slot_coefficients(&mut transcript)?;
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"rom-cycle-point");
-    let mixed_trace = mix_columns(witness.field_columns(), &layout.values, &coefficients)?;
+    let trace_columns = witness.field_columns()?;
+    let rom_columns = rom.inner.field_columns()?;
+    let mixed_trace = mix_columns(trace_columns.as_slice(), &layout.values, &coefficients)?;
     let claimed_output = evaluate_mle(&mixed_trace, &cycle_point)?;
     transcript.append_field(b"rom-claimed-output", &claimed_output);
     let cycle_weights = equality_evaluations(&cycle_point);
     let read_address = read_address_table(
-        witness.field_columns(),
+        trace_columns.as_slice(),
         layout,
         &coefficients,
         &cycle_weights,
     )?;
-    let table = rom
-        .inner
-        .field_columns()
+    let table = rom_columns
+        .as_slice()
         .first()
         .ok_or(RomLookupError::Shape)?;
     let (table_sumcheck, actual_claim, table_point) =
@@ -295,10 +295,10 @@ fn prove_on_worker(
     if actual_claim != claimed_output {
         return Err(RomLookupError::OutputClaimMismatch);
     }
-    let table_values = evaluate_columns(rom.inner.field_columns(), &table_point)?;
+    let table_values = evaluate_columns(rom_columns.as_slice(), &table_point)?;
     require_table_value(&table_values, table_sumcheck.final_right())?;
     let terms = address_binding_terms(
-        witness.field_columns(),
+        trace_columns.as_slice(),
         layout,
         &coefficients,
         &cycle_weights,
@@ -309,14 +309,14 @@ fn prove_on_worker(
     if address_claim != table_sumcheck.final_left() {
         return Err(RomLookupError::AddressBindingMismatch);
     }
-    let trace_cycle_values = evaluate_columns(witness.field_columns(), &cycle_point)?;
+    let trace_cycle_values = evaluate_columns(trace_columns.as_slice(), &cycle_point)?;
     require_mixed_value(
         &trace_cycle_values,
         &layout.values,
         &coefficients,
         claimed_output,
     )?;
-    let trace_address_values = evaluate_columns(witness.field_columns(), &address_point)?;
+    let trace_address_values = evaluate_columns(trace_columns.as_slice(), &address_point)?;
     verify_address_terminal(
         &address_sumcheck,
         layout,
@@ -419,7 +419,7 @@ fn verify_on_worker(
 }
 
 fn read_address_table(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     layout: RomLookupColumns,
     coefficients: &[NativeField; TRACE_BUS_SLOTS],
     cycle_weights: &[NativeField],
@@ -444,7 +444,7 @@ fn read_address_table(
 }
 
 fn trace_addresses(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     bits: &[usize; ROM_ADDRESS_BIT_COUNT],
     row_count: usize,
 ) -> Result<Vec<usize>, RomLookupError> {
@@ -462,7 +462,7 @@ fn trace_addresses(
 }
 
 fn address_binding_terms(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     layout: RomLookupColumns,
     coefficients: &[NativeField; TRACE_BUS_SLOTS],
     cycle_weights: &[NativeField],
@@ -581,7 +581,6 @@ fn lookup_transcript(
     side: TranscriptSide,
 ) -> AkitaTranscript<NativeField> {
     let domain = match protocol {
-        NativeProtocolVersion::V1 => ROM_LOOKUP_TRANSCRIPT_DOMAIN,
         NativeProtocolVersion::V2 => ROM_LOOKUP_TRANSCRIPT_DOMAIN_V2,
     };
     let mut transcript = match side {
@@ -603,14 +602,17 @@ fn sample_point(
 }
 
 fn mix_columns(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     indices: &[usize],
     coefficients: &[NativeField],
 ) -> Result<Vec<NativeField>, RomLookupError> {
     if indices.is_empty() || indices.len() != coefficients.len() {
         return Err(RomLookupError::Shape);
     }
-    let row_count = columns.first().map(Vec::len).ok_or(RomLookupError::Shape)?;
+    let row_count = columns
+        .first()
+        .map(|column| column.as_ref().len())
+        .ok_or(RomLookupError::Shape)?;
     let mut mixed = vec![NativeField::from_u64(0); row_count];
     for (index, coefficient) in indices.iter().copied().zip(coefficients) {
         for (target, value) in mixed.iter_mut().zip(column(columns, index, row_count)?) {
@@ -652,12 +654,12 @@ fn require_table_value(
 }
 
 fn evaluate_columns(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     point: &[NativeField],
 ) -> Result<Vec<NativeField>, RomLookupError> {
     columns
         .iter()
-        .map(|column| evaluate_mle(column, point))
+        .map(|column| evaluate_mle(column.as_ref(), point))
         .collect()
 }
 
@@ -681,14 +683,7 @@ fn fold(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), Rom
     if values.len() <= 1 || !values.len().is_power_of_two() {
         return Err(RomLookupError::Shape);
     }
-    let mut folded = Vec::with_capacity(values.len() / 2);
-    for pair in values.chunks_exact(2) {
-        let low = pair.first().copied().ok_or(RomLookupError::Shape)?;
-        let high = pair.get(1).copied().ok_or(RomLookupError::Shape)?;
-        folded.push(low + challenge * (high - low));
-    }
-    *values = folded;
-    Ok(())
+    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| RomLookupError::Shape)
 }
 
 fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {
@@ -717,11 +712,14 @@ fn equality_evaluation(
 }
 
 fn column(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     index: usize,
     row_count: usize,
 ) -> Result<&[NativeField], RomLookupError> {
-    let column = columns.get(index).ok_or(RomLookupError::Shape)?;
+    let column = columns
+        .get(index)
+        .map(AsRef::as_ref)
+        .ok_or(RomLookupError::Shape)?;
     if column.len() != row_count {
         return Err(RomLookupError::Shape);
     }

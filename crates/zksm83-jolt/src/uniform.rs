@@ -2,6 +2,11 @@
 
 mod commitment;
 mod composite;
+mod encoding;
+mod geometry;
+mod relation;
+#[cfg(test)]
+mod scratch_tests;
 
 use akita_config::proof_optimized::fp128;
 use akita_pcs::{AkitaError, AkitaTranscript, Ring, Transcript};
@@ -15,20 +20,20 @@ use commitment::{OpeningProof, commit_columns, prove_opening, verify_opening_for
 pub(crate) use composite::{
     CompositeUniformRelationProof, prove_uniform_composite, verify_uniform_composite_for_protocol,
 };
+pub use relation::ConstraintOutput;
+use relation::{initialize_constraint_output, trim_zero_suffix};
 
 /// Scalar field used by the native transparent relation and Akita PCS.
 pub type NativeField = fp128::Field;
 
-const OUTER_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-uniform/v1";
 const OUTER_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-uniform/v2";
-/// Number of rows in every native relation segment, including inactive padding.
-pub const UNIFORM_ROW_COUNT: usize = 1 << UNIFORM_NUM_VARIABLES;
-
-/// Number of row-address variables in every native relation segment.
-pub const UNIFORM_NUM_VARIABLES: usize = 14;
-
-/// Number of polynomials in each independently opened Akita commitment group.
-pub const COMMITMENT_GROUP_COLUMNS: usize = 128;
+pub(crate) use encoding::{push_bytes, push_usize};
+pub use geometry::{
+    BLOCK_CPU_COMMITMENT_GROUP_COUNT, BLOCK_CPU_OPENING_COUNT, BLOCK_CPU_PADDED_COLUMN_COUNT,
+    BLOCK_CPU_PADDING_COLUMN_COUNT, COMMITMENT_GROUP_COLUMNS, NATIVE_TRACE_COMMITMENT_GROUP_COUNT,
+    NATIVE_TRACE_OPENING_COUNT, NATIVE_TRACE_PADDED_COLUMN_COUNT,
+    NATIVE_TRACE_PADDING_COLUMN_COUNT, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
+};
 
 /// A fixed low-degree identity evaluated independently on every active row.
 ///
@@ -50,6 +55,14 @@ pub trait UniformRelation: Sync {
     /// Maximum total degree of any returned identity.
     fn max_constraint_degree(&self) -> usize;
 
+    /// Declares whether [`Self::evaluate`] needs a zero-initialized output.
+    ///
+    /// Implementations should select [`ConstraintOutput::Overwritten`] only
+    /// when every declared slot is assigned on every successful call.
+    fn constraint_output(&self) -> ConstraintOutput {
+        ConstraintOutput::ZeroInitialized
+    }
+
     /// Evaluates every identity at one possibly non-Boolean row point.
     fn evaluate(
         &self,
@@ -58,10 +71,10 @@ pub trait UniformRelation: Sync {
     ) -> Result<(), UniformError>;
 }
 
-/// In-memory M2 proof of one committed uniform relation.
+/// In-memory proof of one committed uniform relation.
 ///
-/// The type is intentionally not a public receipt encoding. M6 introduces a
-/// versioned canonical byte format after all SM83 claims are integrated.
+/// This low-level object is not a receipt; the canonical v2 receipt encodes the
+/// composed packed relation and its lookup, memory, continuity, and log proofs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UniformProof {
     commitments: WitnessCommitments,
@@ -162,6 +175,18 @@ pub enum UniformError {
     WorkerPanicked,
 }
 
+/// Checks a fixed-row witness against a uniform relation without committing or proving it.
+///
+/// This is the bounded proof-free validation boundary used by trace encoders and profilers before
+/// any PCS work is considered.
+pub fn validate_uniform_witness(
+    relation: &impl UniformRelation,
+    columns: &[Vec<u64>],
+) -> Result<(), UniformError> {
+    let row_count = validate_witness_shape(relation, columns)?;
+    ensure_u64_relation_holds(relation, columns, row_count)
+}
+
 /// Commits `u64` witness columns and proves one uniform low-degree relation.
 ///
 /// The call executes Akita on an explicitly sized worker stack. It returns no
@@ -171,11 +196,9 @@ pub fn prove_uniform(
     columns: &[Vec<u64>],
 ) -> Result<UniformProof, UniformError> {
     on_worker(|| {
-        let row_count = validate_witness_shape(relation, columns)?;
-        let field_columns = encode_u64_columns(columns);
-        ensure_relation_holds(relation, &field_columns, row_count)?;
+        validate_uniform_witness(relation, columns)?;
         let witness = commit_columns(columns)?;
-        let relation_proof = prove_uniform_committed_on_worker(relation, &witness)?;
+        let relation_proof = prove_satisfied_uniform_on_worker(relation, &witness)?;
         Ok(UniformProof {
             commitments: witness.into_commitments(),
             relation: relation_proof,
@@ -253,7 +276,18 @@ fn prove_uniform_committed_on_worker(
 ) -> Result<UniformRelationProof, UniformError> {
     let protocol = NativeProtocolVersion::current();
     validate_committed_relation(protocol, relation, witness.commitments())?;
-    ensure_relation_holds(relation, witness.field_columns(), UNIFORM_ROW_COUNT)?;
+    let field_columns = witness.field_columns()?;
+    ensure_relation_holds(relation, field_columns.as_slice(), UNIFORM_ROW_COUNT)?;
+    prove_satisfied_uniform_on_worker(relation, witness)
+}
+
+fn prove_satisfied_uniform_on_worker(
+    relation: &impl UniformRelation,
+    witness: &CommittedWitness,
+) -> Result<UniformRelationProof, UniformError> {
+    let protocol = NativeProtocolVersion::current();
+    validate_committed_relation(protocol, relation, witness.commitments())?;
+    let field_columns = witness.field_columns()?;
     let descriptor = relation_instance_descriptor(protocol, relation, witness.commitments())?;
     let mut transcript = outer_transcript(protocol, &descriptor, TranscriptSide::Prover);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
@@ -264,7 +298,7 @@ fn prove_uniform_committed_on_worker(
     let weights = equality_evaluations(&row_point);
     let (sumcheck_rounds, opening_point, opened_values) = prove_sumcheck(
         relation,
-        witness.field_columns().to_vec(),
+        field_columns.into_owned_columns(),
         weights,
         constraint_mix,
         &mut transcript,
@@ -360,16 +394,9 @@ fn validate_committed_relation(
     Ok(())
 }
 
-fn encode_u64_columns(columns: &[Vec<u64>]) -> Vec<Vec<NativeField>> {
-    columns
-        .iter()
-        .map(|column| column.iter().copied().map(NativeField::from_u64).collect())
-        .collect()
-}
-
 fn ensure_relation_holds(
     relation: &impl UniformRelation,
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     row_count: usize,
 ) -> Result<(), UniformError> {
     let zero = NativeField::from_u64(0);
@@ -378,9 +405,42 @@ fn ensure_relation_holds(
     for row_index in 0..row_count {
         row.clear();
         for column in columns {
-            row.push(column.get(row_index).copied().ok_or(UniformError::Shape)?);
+            row.push(
+                column
+                    .as_ref()
+                    .get(row_index)
+                    .copied()
+                    .ok_or(UniformError::Shape)?,
+            );
         }
-        constraints.fill(zero);
+        initialize_constraint_output(relation, &mut constraints);
+        relation.evaluate(&row, &mut constraints)?;
+        if let Some(constraint) = constraints.iter().position(|value| *value != zero) {
+            return Err(UniformError::WitnessUnsatisfied {
+                row: row_index,
+                constraint,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_u64_relation_holds(
+    relation: &impl UniformRelation,
+    columns: &[Vec<u64>],
+    row_count: usize,
+) -> Result<(), UniformError> {
+    let zero = NativeField::from_u64(0);
+    let mut row = Vec::with_capacity(columns.len());
+    let mut constraints = vec![zero; relation.constraint_count()];
+    for row_index in 0..row_count {
+        row.clear();
+        for column in columns {
+            row.push(NativeField::from_u64(
+                column.get(row_index).copied().ok_or(UniformError::Shape)?,
+            ));
+        }
+        initialize_constraint_output(relation, &mut constraints);
         relation.evaluate(&row, &mut constraints)?;
         if let Some(constraint) = constraints.iter().position(|value| *value != zero) {
             return Err(UniformError::WitnessUnsatisfied {
@@ -403,7 +463,6 @@ fn outer_transcript(
     side: TranscriptSide,
 ) -> AkitaTranscript<NativeField> {
     let domain = match protocol {
-        NativeProtocolVersion::V1 => OUTER_TRANSCRIPT_DOMAIN,
         NativeProtocolVersion::V2 => OUTER_TRANSCRIPT_DOMAIN_V2,
     };
     let mut transcript = match side {
@@ -474,6 +533,9 @@ fn prove_sumcheck(
     let mut rounds = Vec::with_capacity(weights.len().ilog2() as usize);
     let mut opening_point = Vec::with_capacity(rounds.capacity());
     let mut claim = NativeField::from_u64(0);
+    let zero = NativeField::from_u64(0);
+    let mut row_scratch = vec![zero; relation.column_count()];
+    let mut constraint_scratch = vec![zero; relation.constraint_count()];
     while weights.len() > 1 {
         let message = sumcheck_round(
             relation,
@@ -481,6 +543,8 @@ fn prove_sumcheck(
             &weights,
             constraint_mix,
             round_evaluations,
+            &mut row_scratch,
+            &mut constraint_scratch,
         )?;
         let at_zero = message.first().copied().ok_or(UniformError::Sumcheck)?;
         let at_one = message.get(1).copied().ok_or(UniformError::Sumcheck)?;
@@ -500,7 +564,12 @@ fn prove_sumcheck(
         .map(|column| column.first().copied().ok_or(UniformError::Shape))
         .collect::<Result<Vec<_>, _>>()?;
     let terminal_weight = weights.first().copied().ok_or(UniformError::Shape)?;
-    let terminal_relation = combined_relation(relation, &opened_values, constraint_mix)?;
+    let terminal_relation = combined_relation_with_scratch(
+        relation,
+        &opened_values,
+        constraint_mix,
+        &mut constraint_scratch,
+    )?;
     if claim != terminal_weight * terminal_relation {
         return Err(UniformError::TerminalMismatch);
     }
@@ -552,10 +621,14 @@ fn sumcheck_round(
     weights: &[NativeField],
     constraint_mix: NativeField,
     evaluation_count: usize,
+    row_scratch: &mut [NativeField],
+    constraint_scratch: &mut [NativeField],
 ) -> Result<Vec<NativeField>, UniformError> {
     if columns.iter().any(|column| column.len() != weights.len())
         || weights.len() < 2
         || !weights.len().is_multiple_of(2)
+        || row_scratch.len() != columns.len()
+        || constraint_scratch.len() != relation.constraint_count()
     {
         return Err(UniformError::Shape);
     }
@@ -565,23 +638,33 @@ fn sumcheck_round(
         let point =
             NativeField::from_u64(u64::try_from(point_index).map_err(|_| UniformError::Shape)?);
         for pair_index in 0..(weights.len() / 2) {
-            let row = interpolate_row(columns, pair_index, point)?;
+            interpolate_row_into(columns, pair_index, point, row_scratch)?;
             let weight = interpolate_pair(weights, pair_index, point)?;
-            *evaluation += weight * combined_relation(relation, &row, constraint_mix)?;
+            *evaluation += weight
+                * combined_relation_with_scratch(
+                    relation,
+                    row_scratch,
+                    constraint_mix,
+                    constraint_scratch,
+                )?;
         }
     }
     Ok(message)
 }
 
-fn interpolate_row(
+fn interpolate_row_into(
     columns: &[Vec<NativeField>],
     pair_index: usize,
     point: NativeField,
-) -> Result<Vec<NativeField>, UniformError> {
-    columns
-        .iter()
-        .map(|column| interpolate_pair(column, pair_index, point))
-        .collect()
+    output: &mut [NativeField],
+) -> Result<(), UniformError> {
+    if columns.len() != output.len() {
+        return Err(UniformError::Shape);
+    }
+    for (value, column) in output.iter_mut().zip(columns) {
+        *value = interpolate_pair(column, pair_index, point)?;
+    }
+    Ok(())
 }
 
 fn interpolate_pair(
@@ -603,15 +686,29 @@ fn combined_relation(
     row: &[NativeField],
     constraint_mix: NativeField,
 ) -> Result<NativeField, UniformError> {
+    let mut constraints = vec![NativeField::from_u64(0); relation.constraint_count()];
+    combined_relation_with_scratch(relation, row, constraint_mix, &mut constraints)
+}
+
+fn combined_relation_with_scratch(
+    relation: &impl UniformRelation,
+    row: &[NativeField],
+    constraint_mix: NativeField,
+    constraints: &mut [NativeField],
+) -> Result<NativeField, UniformError> {
     if row.len() != relation.column_count() {
         return Err(UniformError::Shape);
     }
     let zero = NativeField::from_u64(0);
-    let mut constraints = vec![zero; relation.constraint_count()];
-    relation.evaluate(row, &mut constraints)?;
+    if constraints.len() != relation.constraint_count() {
+        return Err(UniformError::Shape);
+    }
+    initialize_constraint_output(relation, constraints);
+    relation.evaluate(row, constraints)?;
     let mut power = NativeField::from_u64(1);
     let mut combined = zero;
-    for constraint in constraints {
+    let mixed_constraints = trim_zero_suffix(constraints);
+    for constraint in mixed_constraints.iter().copied() {
         combined += power * constraint;
         power *= constraint_mix;
     }
@@ -629,18 +726,7 @@ fn fold_columns(
 }
 
 fn fold_column(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), UniformError> {
-    if values.len() < 2 || !values.len().is_multiple_of(2) {
-        return Err(UniformError::Shape);
-    }
-    let mut folded = Vec::with_capacity(values.len() / 2);
-    for pair in values.chunks_exact(2) {
-        let [low, high] = pair else {
-            return Err(UniformError::Shape);
-        };
-        folded.push(*low + challenge * (*high - *low));
-    }
-    *values = folded;
-    Ok(())
+    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| UniformError::Shape)
 }
 
 fn evaluate_lagrange(
@@ -703,18 +789,6 @@ fn absorb_round(
     Ok(())
 }
 
-fn push_usize(bytes: &mut Vec<u8>, value: usize) -> Result<(), UniformError> {
-    let value = u64::try_from(value).map_err(|_| UniformError::Shape)?;
-    bytes.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn push_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), UniformError> {
-    push_usize(bytes, value.len())?;
-    bytes.extend_from_slice(value);
-    Ok(())
-}
-
 fn on_worker<T: Send>(
     operation: impl FnOnce() -> Result<T, UniformError> + Send,
 ) -> Result<T, UniformError> {
@@ -730,7 +804,7 @@ mod tests {
     use super::{
         COMMITMENT_GROUP_COLUMNS, NativeField, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
         UniformError, UniformProof, UniformRelation, commit_witness,
-        commitment::{LEGACY_SCHEDULE_ARTIFACT, SCHEDULE_ARTIFACT, scheme},
+        commitment::{AUXILIARY_SCHEDULE_ARTIFACT, SCHEDULE_ARTIFACT, scheme},
         prove_uniform, prove_uniform_committed, verify_uniform, verify_uniform_committed,
     };
     use akita_pcs::Ring;
@@ -777,10 +851,10 @@ mod tests {
     }
 
     #[test]
-    fn pinned_v1_schedule_digest_remains_available_for_verification() {
+    fn pinned_auxiliary_schedule_digest_matches_backend_identity() {
         assert_eq!(
-            format!("{:x}", Sha256::digest(LEGACY_SCHEDULE_ARTIFACT)),
-            crate::AKITA_SCHEDULE_SHA256_V1
+            format!("{:x}", Sha256::digest(AUXILIARY_SCHEDULE_ARTIFACT)),
+            crate::AKITA_AUXILIARY_SCHEDULE_SHA256
         );
     }
 
@@ -852,24 +926,6 @@ mod tests {
             *constraint = first - last;
             Ok(())
         }
-    }
-
-    #[test]
-    fn malformed_or_unsatisfied_witness_fails_before_commitment() -> Result<(), UniformError> {
-        assert!(matches!(
-            prove_uniform(&BooleanColumn, &[vec![0, 1, 0]]),
-            Err(UniformError::Shape)
-        ));
-        let mut unsatisfied = vec![0; UNIFORM_ROW_COUNT];
-        *unsatisfied.get_mut(2).ok_or(UniformError::Shape)? = 2;
-        assert!(matches!(
-            prove_uniform(&BooleanColumn, &[unsatisfied]),
-            Err(UniformError::WitnessUnsatisfied {
-                row: 2,
-                constraint: 0
-            })
-        ));
-        Ok(())
     }
 
     #[test]

@@ -27,7 +27,8 @@ pub struct NativeReceiptStreamProver<'a, S> {
     boundary: Option<NativeBoundary>,
     previous_memory: Option<MemoryCommitment>,
     segment_count: u64,
-    relation_step_count: u64,
+    transition_count: u64,
+    relation_row_count: u64,
     spool_bytes: u64,
 }
 
@@ -38,7 +39,8 @@ pub struct VerifiedNativeSpool {
     final_boundary: NativeBoundary,
     final_memory: MemoryCommitment,
     segment_count: u64,
-    relation_step_count: u64,
+    transition_count: u64,
+    relation_row_count: u64,
     spool_bytes: u64,
 }
 
@@ -67,10 +69,16 @@ impl VerifiedNativeSpool {
         self.segment_count
     }
 
+    /// Returns the number of authenticated source machine transitions.
+    #[must_use]
+    pub const fn transition_count(&self) -> u64 {
+        self.transition_count
+    }
+
     /// Returns the number of authenticated relation rows.
     #[must_use]
-    pub const fn relation_step_count(&self) -> u64 {
-        self.relation_step_count
+    pub const fn relation_row_count(&self) -> u64 {
+        self.relation_row_count
     }
 
     /// Returns the exact verified spool byte length.
@@ -99,7 +107,8 @@ where
             boundary: None,
             previous_memory: None,
             segment_count: 0,
-            relation_step_count: 0,
+            transition_count: 0,
+            relation_row_count: 0,
             spool_bytes: 0,
         })
     }
@@ -121,7 +130,8 @@ where
             boundary: Some(progress.final_boundary),
             previous_memory: Some(progress.final_memory),
             segment_count: progress.segment_count,
-            relation_step_count: progress.relation_step_count,
+            transition_count: progress.transition_count,
+            relation_row_count: progress.relation_row_count,
             spool_bytes,
         })
     }
@@ -132,10 +142,16 @@ where
         self.segment_count
     }
 
+    /// Returns the number of authenticated source machine transitions already spooled.
+    #[must_use]
+    pub const fn transition_count(&self) -> u64 {
+        self.transition_count
+    }
+
     /// Returns the number of authenticated relation rows already spooled.
     #[must_use]
-    pub const fn relation_step_count(&self) -> u64 {
-        self.relation_step_count
+    pub const fn relation_row_count(&self) -> u64 {
+        self.relation_row_count
     }
 
     /// Returns the exact encoded byte length of all spooled segment frames.
@@ -197,16 +213,23 @@ where
                 "stream receipt length limit".to_owned(),
             ));
         }
-        self.spool.seek(SeekFrom::Start(self.spool_bytes))?;
-        write_blob(&mut self.spool, &proved.encoded)?;
-        self.relation_step_count = self
-            .relation_step_count
+        let next_transition_count = self
+            .transition_count
+            .checked_add(proved.transition_count)
+            .ok_or(NativeReceiptError::Counter)?;
+        let next_relation_row_count = self
+            .relation_row_count
             .checked_add(proved.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
-        self.segment_count = self
+        let next_segment_count = self
             .segment_count
             .checked_add(1)
             .ok_or(NativeReceiptError::Counter)?;
+        self.spool.seek(SeekFrom::Start(self.spool_bytes))?;
+        write_blob(&mut self.spool, &proved.encoded)?;
+        self.transition_count = next_transition_count;
+        self.relation_row_count = next_relation_row_count;
+        self.segment_count = next_segment_count;
         self.spool_bytes = next_spool_bytes;
         self.previous_memory = Some(proved.final_memory);
         self.initial.get_or_insert(proved.initial);
@@ -226,7 +249,8 @@ where
             initial,
             final_boundary,
             self.segment_count,
-            self.relation_step_count,
+            self.transition_count,
+            self.relation_row_count,
         )?;
         let statement_bytes = encode_statement(&statement)?;
         let rom_bytes = encode_rom(self.rom.commitment())?;
@@ -264,6 +288,7 @@ struct ProvedFrame {
     initial: NativeBoundary,
     final_boundary: NativeBoundary,
     final_memory: MemoryCommitment,
+    transition_count: u64,
     active_row_count: u64,
 }
 
@@ -284,6 +309,7 @@ fn prove_frame(
             initial: receipt.initial,
             final_boundary,
             final_memory: receipt.final_memory,
+            transition_count: receipt.transition_count,
             active_row_count: receipt.active_row_count,
         })
     })
@@ -369,22 +395,29 @@ fn verify_frames<R: Read>(
 ) -> Result<(), NativeReceiptError> {
     let mut boundary = statement.initial.clone();
     let mut previous_memory: Option<MemoryCommitment> = None;
-    let mut steps = 0_u64;
+    let mut transitions = 0_u64;
+    let mut rows = 0_u64;
     for index in 0..count {
         let segment = decode_segment(&reader.blob(MAX_NATIVE_SEGMENT_BYTES)?)?;
         if let Some(memory) = previous_memory.as_ref() {
             ensure_same_memory(memory, &segment.initial_memory, protocol)?;
         }
         verify_segment(index, &segment, &boundary, rom, protocol)?;
-        steps = steps
+        transitions = transitions
+            .checked_add(segment.transition_count)
+            .ok_or(NativeReceiptError::Counter)?;
+        rows = rows
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
         boundary = segment.final_boundary;
         previous_memory = Some(segment.final_memory);
     }
-    if boundary != statement.final_boundary || steps != statement.relation_step_count {
+    if boundary != statement.final_boundary
+        || transitions != statement.transition_count
+        || rows != statement.relation_row_count
+    {
         return Err(NativeReceiptError::SegmentChain(
-            "final boundary or relation-step count differs from the statement",
+            "final boundary, transition count, or relation-row count differs from the statement",
         ));
     }
     Ok(())
@@ -399,7 +432,8 @@ fn verify_spool<S: Read + Seek>(
     let mut boundary: Option<NativeBoundary> = None;
     let mut previous_memory: Option<MemoryCommitment> = None;
     let mut segment_count = 0_u64;
-    let mut relation_step_count = 0_u64;
+    let mut transition_count = 0_u64;
+    let mut relation_row_count = 0_u64;
     while spool.stream_position()? < spool_bytes {
         let index = usize::try_from(segment_count).map_err(|_| NativeReceiptError::Counter)?;
         if index >= MAX_NATIVE_SEGMENT_COUNT {
@@ -424,7 +458,10 @@ fn verify_spool<S: Read + Seek>(
             rom,
             NativeProtocolVersion::current(),
         )?;
-        relation_step_count = relation_step_count
+        transition_count = transition_count
+            .checked_add(segment.transition_count)
+            .ok_or(NativeReceiptError::Counter)?;
+        relation_row_count = relation_row_count
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
         segment_count = segment_count
@@ -439,7 +476,8 @@ fn verify_spool<S: Read + Seek>(
         final_boundary: boundary.ok_or(NativeReceiptError::InvalidStatement)?,
         final_memory: previous_memory.ok_or(NativeReceiptError::InvalidStatement)?,
         segment_count,
-        relation_step_count,
+        transition_count,
+        relation_row_count,
         spool_bytes,
     })
 }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::{
-    AkitaScheduleLookupKey, PcsLayout, PolynomialGroupLayout, context_slot,
-    root_commit_requirements, scheme, validate_schedule,
+    AkitaScheduleLookupKey, DensePoly, NativeField, PcsError, PcsLayout, PolynomialGroupLayout,
+    Ring, context_slot, field_column_view, root_commit_requirements, scheme, validate_schedule,
 };
 
 const DOMAIN: &[u8] = b"zksm83/pcs-prewarm-test/v1";
@@ -65,6 +65,65 @@ fn paired_layout_maps_twenty_six_groups_to_thirteen_openings() {
     assert!(matches!(layout.opening_count(2), Ok(1)));
     assert!(layout.opening_count(25).is_err());
     assert!(layout.opening_count(0).is_err());
+}
+
+#[test]
+fn field_column_view_preserves_logical_order_and_hides_padding() -> Result<(), PcsError> {
+    let layout = PcsLayout::new(2, 2, b"unused", DOMAIN, DOMAIN);
+    let polynomials = [
+        dense_column(2, &[10, 11, 12, 13])?,
+        dense_column(2, &[20, 21, 22, 23])?,
+        dense_column(2, &[30, 31, 32, 33])?,
+        dense_column(2, &[0, 0, 0, 0])?,
+    ];
+    let view = field_column_view(layout, 3, &polynomials)?;
+    let values = view
+        .as_slice()
+        .iter()
+        .map(|column| column.to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            vec![10, 11, 12, 13]
+                .into_iter()
+                .map(NativeField::from_u64)
+                .collect::<Vec<_>>(),
+            vec![20, 21, 22, 23]
+                .into_iter()
+                .map(NativeField::from_u64)
+                .collect::<Vec<_>>(),
+            vec![30, 31, 32, 33]
+                .into_iter()
+                .map(NativeField::from_u64)
+                .collect::<Vec<_>>(),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn field_column_view_rejects_missing_physical_padding() -> Result<(), PcsError> {
+    let layout = PcsLayout::new(2, 2, b"unused", DOMAIN, DOMAIN);
+    let polynomials = [
+        dense_column(2, &[10, 11, 12, 13])?,
+        dense_column(2, &[20, 21, 22, 23])?,
+        dense_column(2, &[30, 31, 32, 33])?,
+    ];
+    assert!(field_column_view(layout, 3, &polynomials).is_err());
+    Ok(())
+}
+
+fn dense_column(num_variables: usize, values: &[u64]) -> Result<DensePoly<NativeField>, PcsError> {
+    DensePoly::from_field_evals(
+        num_variables,
+        values
+            .iter()
+            .copied()
+            .map(NativeField::from_u64)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(Into::into)
 }
 
 fn layouts() -> [PcsLayout; 6] {

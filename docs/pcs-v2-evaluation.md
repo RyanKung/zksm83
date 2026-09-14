@@ -1,14 +1,15 @@
 # PCS v2 batching evaluation
 
-This document records the bounded decision gate used to replace version 1's
-independent Akita openings with native receipt v2 pair openings. Version 1 is
-retained only for verification of existing canonical receipts.
+This document records the historical bounded decision gate that selected
+two-group Akita pair openings. The current receipt is a later hard-cut v2
+format; it rejects v1 wire data and applies the selected pair schedule to the
+4,505-column packed CPU plane.
 
-## Confirmed version 1 boundary
+## Historical version 1 boundary
 
 Each pinned version 1 schedule catalog admits exactly one final group and no
-precommitted groups. The 3,292-column native trace is committed as 26 groups of
-128 polynomials, and `prove_opening` currently creates one independently
+precommitted groups. The former 3,292-column native trace was committed as 26 groups of
+128 polynomials, and `prove_opening` created one independently
 transcript-bound Akita proof per group. Passing all 26 groups to one existing
 call would fail schedule resolution; it is not a compatible wire optimization.
 
@@ -19,10 +20,11 @@ must be committed with the exact precommitted profile prefix, so the change
 affects commitments, transcripts, proof shape, schedule identity, and wire
 encoding.
 
-## Isolation rules
+## Isolation rules used by the gate
 
-- Keep `zksm83-native-jolt-akita-v1`, receipt version 1, and all v1
-  schedules byte-for-byte verifiable.
+- Keep the historical v1 identities and schedules byte-separated while
+  evaluating a new protocol; the later hard cut no longer exposes a v1 receipt
+  decoder.
 - Generate candidate schedules only from pinned Akita revision
   `69438de6cd8ce8ed7c9ebb21bdf60b813e8fcabc` into a fresh ignored directory.
 - Give an accepted candidate a new schedule digest, protocol identifier,
@@ -40,7 +42,7 @@ The harness must reject swapped groups, a changed commitment, a changed opened
 value, a changed point, and a changed schedule selection.
 
 Stop the process if setup plus either proof path reaches 30 seconds. Do not run
-the 16,384-row native relation, any ignored repository proof gate, or a Blue
+the 16,384-row native relation, any ignored repository proof gate, or a full
 segment for this decision. Record warm and cold setup separately from commit,
 opening, encoding, verification, proof bytes, and peak resident memory.
 
@@ -86,7 +88,7 @@ JSON sets `accepted_for_larger_candidate` only when every gate above passes.
 
 The command performs a real PCS micro-opening but never executes or proves an
 SM83 transition. It is not part of default tests, fast CI, receipt version 1,
-or any claim about the complete Blue path.
+or any claim about a complete cartridge execution.
 
 ## Accepted two-group micro-gate
 
@@ -134,6 +136,7 @@ to 334,544,896 bytes, or 28.58 percent, so it also failed the memory gate.
 The accepted two-group geometry was regenerated for the real `nv14/p128`
 trace layout. The checked-in 13,502-byte schedule has SHA-256
 `1cd339f09114c2a941abbfb434ab795868866cb15485f83300d81cee7bf46e71`.
-Native receipt v2 therefore batches the 26 trace groups as 13 adjacent pairs.
-No 16,384-row SM83 proof or Pokémon Blue proof was run during this migration;
-the measurements above remain PCS micro-gates only.
+The current packed v2 layout reuses that two-group schedule for 36 groups and
+18 adjacent pairs. No 16,384-row packed SM83 proof or cartridge-scale proof has
+been run for this 4,505-column geometry; the measurements above remain
+historical PCS micro-gates only.

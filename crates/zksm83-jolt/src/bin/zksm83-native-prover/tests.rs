@@ -1,8 +1,11 @@
 use super::{
-    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, CliError, EXPECTED_CHECKPOINT_SCHEMA,
-    ExpectedCheckpoint, ExpectedState, InputIdentities, NATIVE_RECEIPT_VERSION, PROGRESS_SCHEMA,
-    PROTOCOL_ID, ProverProgress, ROM_BYTE_LENGTH, SpoolRecovery, UNIFORM_ROW_COUNT, spool_recovery,
-    validate_endpoint, validate_expected_artifact, validate_progress,
+    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BASIC_BLOCK_INSTRUCTION_BOUND,
+    CliError, EXPECTED_CHECKPOINT_SCHEMA, ExpectedCheckpoint, ExpectedState, InputIdentities,
+    MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
+    PROGRESS_SCHEMA, PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, ProverProgress, ROM_BYTE_LENGTH,
+    SpoolRecovery, UNIFORM_ROW_COUNT, fill_packed_segment_with_capacity, native_backend_digest,
+    spool_recovery, validate_endpoint, validate_expected_artifact, validate_progress,
+    validate_verified_counters,
 };
 use zksm83_core::{CpuState, DmgDeviceState, MachineContext, MachineProfile, Mbc3State, VmState};
 use zksm83_memory::{CommitmentRoot, LogAccumulator, LogKind, MemoryImage, RomImage};
@@ -60,19 +63,27 @@ fn progress_schema_capacity_and_input_identities_are_exact()
         schema: PROGRESS_SCHEMA.to_owned(),
         receipt_version: NATIVE_RECEIPT_VERSION,
         protocol_id: PROTOCOL_ID.to_owned(),
+        proof_composition_revision: PROOF_COMPOSITION_REVISION_V2.to_owned(),
+        backend_digest_sha256: hex::encode(native_backend_digest()),
         trace_schedule_sha256: AKITA_SCHEDULE_SHA256.to_owned(),
         auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256.to_owned(),
         rom_sha256: hex::encode(identities.rom),
         input_sha256: hex::encode(identities.input),
         expected_checkpoint_sha256: hex::encode(identities.expected),
-        segment_capacity: UNIFORM_ROW_COUNT,
+        relation_row_capacity: UNIFORM_ROW_COUNT,
         segment_count: 1,
-        relation_step_count: 1,
+        completed_steps: 1,
+        relation_row_count: 1,
         spool_bytes: 1,
         state,
         memory_hex: hex::encode(memory),
     };
     validate_progress(&progress, identities)?;
+    validate_verified_counters(&progress, 1, 1, 1, 1)?;
+
+    progress.completed_steps = 2;
+    assert!(validate_verified_counters(&progress, 1, 1, 1, 1).is_err());
+    progress.completed_steps = 1;
 
     progress.schema = "unsupported".to_owned();
     assert!(validate_progress(&progress, identities).is_err());
@@ -84,6 +95,12 @@ fn progress_schema_capacity_and_input_identities_are_exact()
     progress.protocol_id = "unsupported".to_owned();
     assert!(validate_progress(&progress, identities).is_err());
     progress.protocol_id = PROTOCOL_ID.to_owned();
+    progress.proof_composition_revision = "unsupported".to_owned();
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.proof_composition_revision = PROOF_COMPOSITION_REVISION_V2.to_owned();
+    progress.backend_digest_sha256 = hex::encode([7; 32]);
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.backend_digest_sha256 = hex::encode(native_backend_digest());
     progress.trace_schedule_sha256 = "unsupported".to_owned();
     assert!(validate_progress(&progress, identities).is_err());
     progress.trace_schedule_sha256 = AKITA_SCHEDULE_SHA256.to_owned();
@@ -91,11 +108,56 @@ fn progress_schema_capacity_and_input_identities_are_exact()
     assert!(validate_progress(&progress, identities).is_err());
     progress.auxiliary_schedule_sha256 = AKITA_AUXILIARY_SCHEDULE_SHA256.to_owned();
 
-    progress.segment_capacity = UNIFORM_ROW_COUNT + 1;
+    progress.segment_count =
+        u64::try_from(MAX_NATIVE_SEGMENT_COUNT).map_err(std::io::Error::other)? + 1;
     assert!(validate_progress(&progress, identities).is_err());
-    progress.segment_capacity = UNIFORM_ROW_COUNT;
+    progress.segment_count = 1;
+    progress.relation_row_count =
+        u64::try_from(UNIFORM_ROW_COUNT).map_err(std::io::Error::other)? + 1;
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.relation_row_count = 1;
+    progress.completed_steps =
+        u64::try_from(BASIC_BLOCK_INSTRUCTION_BOUND).map_err(std::io::Error::other)? + 1;
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.completed_steps = 1;
+    progress.spool_bytes = MAX_NATIVE_STREAM_RECEIPT_BYTES + 1;
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.spool_bytes = 1;
+
+    progress.relation_row_capacity = UNIFORM_ROW_COUNT + 1;
+    assert!(validate_progress(&progress, identities).is_err());
+    progress.relation_row_capacity = UNIFORM_ROW_COUNT;
     progress.input_sha256 = hex::encode([9; 32]);
     assert!(validate_progress(&progress, identities).is_err());
+    Ok(())
+}
+
+#[test]
+fn packed_segment_fills_rows_without_exceeding_raw_step_bound()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rom = RomImage::new(vec![0_u8; 64])?;
+    let memory = MemoryImage::zeroed()?;
+    let mut builder = super::TraceBuilder::new(rom, memory, Vec::new());
+    let packed = fill_packed_segment_with_capacity(&mut builder, 32, 8)?;
+    let retained_steps = packed
+        .blocks
+        .iter()
+        .map(zksm83_trace::BasicBlock::row_count)
+        .sum::<usize>();
+    assert_eq!(packed.blocks.len(), 8);
+    assert_eq!(u64::try_from(retained_steps)?, packed.completed_steps);
+    assert!(packed.completed_steps > 8);
+    assert!(packed.completed_steps <= 32);
+    for (expected, block) in packed.blocks.iter().enumerate() {
+        let prior_rows = packed
+            .blocks
+            .get(..expected)
+            .ok_or("packed block prefix")?
+            .iter()
+            .map(zksm83_trace::BasicBlock::row_count)
+            .sum::<usize>();
+        assert_eq!(block.source_row_start(), prior_rows);
+    }
     Ok(())
 }
 

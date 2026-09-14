@@ -1,6 +1,6 @@
 //! Canonical bounded encoding for statements and receipts.
 
-use crate::{NativeMemoryCpuProof, NativeStateBoundary};
+use crate::{NativeStateBoundary, PackedBlockProof};
 
 use super::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
@@ -17,6 +17,7 @@ const STATEMENT_MAGIC_V1: &[u8; 8] = b"ZKSM83S1";
 const STATEMENT_MAGIC_V2: &[u8; 8] = b"ZKSM83S2";
 
 pub(super) fn encode_statement(statement: &NativeStatement) -> Result<Vec<u8>, NativeReceiptError> {
+    ensure_current_protocol(statement.protocol)?;
     let mut writer = WireWriter::new();
     writer.raw(statement_magic(statement.protocol));
     encode_statement_fields(statement, &mut writer).map_err(map_wire)?;
@@ -38,6 +39,7 @@ pub(super) fn decode_statement(bytes: &[u8]) -> Result<NativeStatement, NativeRe
 }
 
 pub(super) fn encode_receipt(receipt: &NativeReceipt) -> Result<Vec<u8>, NativeReceiptError> {
+    ensure_current_protocol(receipt.version)?;
     if receipt.statement.protocol != receipt.version {
         return Err(NativeReceiptError::UnsupportedBackend);
     }
@@ -94,14 +96,12 @@ pub(super) fn decode_receipt(bytes: &[u8]) -> Result<NativeReceipt, NativeReceip
 
 pub(super) const fn receipt_magic(protocol: NativeProtocolVersion) -> &'static [u8; 8] {
     match protocol {
-        NativeProtocolVersion::V1 => RECEIPT_MAGIC_V1,
         NativeProtocolVersion::V2 => RECEIPT_MAGIC_V2,
     }
 }
 
 const fn statement_magic(protocol: NativeProtocolVersion) -> &'static [u8; 8] {
     match protocol {
-        NativeProtocolVersion::V1 => STATEMENT_MAGIC_V1,
         NativeProtocolVersion::V2 => STATEMENT_MAGIC_V2,
     }
 }
@@ -110,7 +110,7 @@ pub(super) fn protocol_from_receipt_magic(
     magic: [u8; 8],
 ) -> Result<NativeProtocolVersion, NativeReceiptError> {
     match &magic {
-        value if value == RECEIPT_MAGIC_V1 => Ok(NativeProtocolVersion::V1),
+        value if value == RECEIPT_MAGIC_V1 => Err(NativeReceiptError::UnsupportedBackend),
         value if value == RECEIPT_MAGIC_V2 => Ok(NativeProtocolVersion::V2),
         _ => Err(NativeReceiptError::Wire("receipt magic".to_owned())),
     }
@@ -120,10 +120,17 @@ fn protocol_from_statement_magic(
     magic: [u8; 8],
 ) -> Result<NativeProtocolVersion, NativeReceiptError> {
     match &magic {
-        value if value == STATEMENT_MAGIC_V1 => Ok(NativeProtocolVersion::V1),
+        value if value == STATEMENT_MAGIC_V1 => Err(NativeReceiptError::UnsupportedBackend),
         value if value == STATEMENT_MAGIC_V2 => Ok(NativeProtocolVersion::V2),
         _ => Err(NativeReceiptError::Wire("statement magic".to_owned())),
     }
+}
+
+fn ensure_current_protocol(protocol: NativeProtocolVersion) -> Result<(), NativeReceiptError> {
+    if protocol != NativeProtocolVersion::current() {
+        return Err(NativeReceiptError::UnsupportedBackend);
+    }
+    Ok(())
 }
 
 pub(super) fn encode_rom(commitment: &crate::RomCommitment) -> Result<Vec<u8>, NativeReceiptError> {
@@ -285,7 +292,8 @@ fn encode_statement_fields(
     statement.initial.encode(writer)?;
     statement.final_boundary.encode(writer)?;
     writer.u64(statement.segment_count);
-    writer.u64(statement.relation_step_count);
+    writer.u64(statement.transition_count);
+    writer.u64(statement.relation_row_count);
     writer.u64(statement.m_cycle_count);
     statement.logs.encode(writer)?;
     writer.raw(&statement.statement_id);
@@ -305,7 +313,8 @@ fn decode_statement_fields(
         initial: NativeBoundary::decode(reader)?,
         final_boundary: NativeBoundary::decode(reader)?,
         segment_count: reader.u64()?,
-        relation_step_count: reader.u64()?,
+        transition_count: reader.u64()?,
+        relation_row_count: reader.u64()?,
         m_cycle_count: reader.u64()?,
         logs: ProtocolLogCounts::decode(reader)?,
         statement_id: reader.fixed()?,
@@ -315,6 +324,7 @@ fn decode_statement_fields(
 impl Wire for NativeSegmentReceipt {
     fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
         writer.u64(self.segment_index);
+        writer.u64(self.transition_count);
         writer.u64(self.active_row_count);
         writer.u64(self.padded_row_count);
         self.initial.encode(writer)?;
@@ -330,6 +340,7 @@ impl Wire for NativeSegmentReceipt {
     fn decode(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         Ok(Self {
             segment_index: reader.u64()?,
+            transition_count: reader.u64()?,
             active_row_count: reader.u64()?,
             padded_row_count: reader.u64()?,
             initial: NativeBoundary::decode(reader)?,
@@ -339,7 +350,7 @@ impl Wire for NativeSegmentReceipt {
             logs: crate::ProtocolLogCommitments::decode(reader)?,
             m_cycle_count: reader.u64()?,
             log_counts: ProtocolLogCounts::decode(reader)?,
-            proof: NativeMemoryCpuProof::decode(reader)?,
+            proof: PackedBlockProof::decode(reader)?,
         })
     }
 }

@@ -9,11 +9,13 @@ use thiserror::Error;
 
 use crate::{
     NativeField,
-    continuity::{ContinuityProof, ContinuitySumProof},
-    cpu::NativeMemoryCpuProof,
+    block_proof::PackedBlockProof,
+    continuity::{ContinuitySumProof, PackedContinuityProof},
     isa_lookup::{FixedIsaCommitments, IsaLookupProof},
-    logs::{ProtocolLogCommitments, ProtocolLogProof, sum::ProtocolLogSumProof},
-    memory::{MemoryCommitment, MutableMemoryProof, clock::ClockProof, sum::MultisetSumProof},
+    logs::{PackedProtocolLogProof, ProtocolLogCommitments, sum::ProtocolLogSumProof},
+    memory::{
+        MemoryCommitment, PackedMutableMemoryProof, clock::ClockProof, sum::MultisetSumProof,
+    },
     pcs::{ColumnCommitments, GroupOpeningProof, OpeningProof},
     rom_lookup::{RomCommitment, RomLookupProof},
     sumcheck::{MultiProductSumcheckProof, ProductSumcheckProof, SumOfProductsSumcheckProof},
@@ -187,6 +189,22 @@ impl Wire for [NativeField; 3] {
     }
 }
 
+impl Wire for [IsaLookupProof; crate::PACKED_BLOCK_ISA_LOOKUP_COUNT] {
+    fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
+        for proof in self {
+            proof.encode(writer)?;
+        }
+        Ok(())
+    }
+
+    fn decode(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        let proofs = (0..crate::PACKED_BLOCK_ISA_LOOKUP_COUNT)
+            .map(|_| IsaLookupProof::decode(reader))
+            .collect::<Result<Vec<_>, _>>()?;
+        proofs.try_into().map_err(|_| WireError::Shape)
+    }
+}
+
 impl Wire for CommittedGroup<NativeField> {
     fn encode(&self, writer: &mut WireWriter) -> Result<(), WireError> {
         encode_akita(self, writer)
@@ -340,7 +358,7 @@ wire_struct!(MultisetSumProof {
     initial_opening,
     final_opening,
 });
-wire_struct!(MutableMemoryProof {
+wire_struct!(PackedMutableMemoryProof {
     final_timestamps,
     trace_inverses,
     initial_inverses,
@@ -351,7 +369,7 @@ wire_struct!(MutableMemoryProof {
     multiset_sum,
 });
 wire_struct!(ContinuitySumProof { values, opening });
-wire_struct!(ContinuityProof {
+wire_struct!(PackedContinuityProof {
     inverse_commitments,
     relation,
     sum,
@@ -371,17 +389,17 @@ wire_struct!(ProtocolLogSumProof {
     log_opening,
     table_inverse_opening,
 });
-wire_struct!(ProtocolLogProof {
+wire_struct!(PackedProtocolLogProof {
     trace_inverses,
     table_inverses,
     trace_relation,
     table_relation,
     sum,
 });
-wire_struct!(NativeMemoryCpuProof {
+wire_struct!(PackedBlockProof {
     commitments,
     relation,
-    isa_lookup,
+    isa_lookups,
     rom_lookup,
     memory,
     continuity,

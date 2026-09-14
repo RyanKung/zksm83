@@ -3,7 +3,7 @@
 use thiserror::Error;
 use zksm83_core::{
     BusEvent, BusWitness, LookupStepRelation, MachineProfile, RunState, StepError, StepInput,
-    VmState, WitnessRequest, blue_dma_wait_candidate,
+    VmState, WitnessRequest,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogError, LogKind, MemoryRead, MemoryWrite, MerklePath, RomRead,
@@ -134,7 +134,7 @@ impl LookupTraceBuilder {
     /// Constructs and applies one lookup-backed relation row.
     pub fn step(&mut self) -> Result<TraceRow, LookupTraceBuilderError> {
         let before = self.state;
-        let mut plan = self.suggested_summary_plan()?;
+        let mut plan = Vec::with_capacity(MAX_WITNESSES_PER_STEP);
         loop {
             let input = self.materialize(&plan)?;
             match LookupStepRelation::apply(before, input) {
@@ -291,25 +291,12 @@ impl LookupTraceBuilder {
         })
     }
 
-    fn suggested_summary_plan(&self) -> Result<Vec<PlannedWitness>, LookupTraceBuilderError> {
-        if !blue_dma_wait_candidate(self.state) {
-            return Ok(Vec::new());
-        }
-        let mut plan = Vec::with_capacity(3);
-        for (address, expected) in [(0xff86, 0x3d), (0xff87, 0x20), (0xff88, 0xfd)] {
-            let actual = self.memory_byte(u32::from(address))?;
-            if actual != expected {
-                return Ok(Vec::new());
-            }
-            plan.push(PlannedWitness::MemoryRead(address, u32::from(address)));
-        }
-        Ok(plan)
-    }
-
     fn materialize(&self, plan: &[PlannedWitness]) -> Result<StepInput, LookupTraceBuilderError> {
-        let mut fork = requires_memory_fork(plan).then(|| self.memory.clone());
         let mut witnesses = Vec::with_capacity(plan.len());
-        for planned in plan {
+        for (index, planned) in plan.iter().enumerate() {
+            let preceding = plan
+                .get(..index)
+                .ok_or(LookupTraceBuilderError::WitnessPlanInvariant)?;
             let witness = match *planned {
                 PlannedWitness::Rom(address, physical_address) => BusWitness::Rom(RomRead {
                     address,
@@ -318,10 +305,7 @@ impl LookupTraceBuilder {
                     path: MerklePath::lookup_placeholder(),
                 }),
                 PlannedWitness::MemoryRead(address, physical_address) => {
-                    let value = match fork.as_ref() {
-                        Some(memory) => byte(memory, physical_address)?,
-                        None => self.memory_byte(physical_address)?,
-                    };
+                    let value = self.planned_memory_byte(preceding, physical_address)?;
                     BusWitness::MemoryRead(MemoryRead {
                         address,
                         physical_address,
@@ -330,14 +314,7 @@ impl LookupTraceBuilder {
                     })
                 }
                 PlannedWitness::MemoryWrite(address, physical_address, value) => {
-                    let before = match fork.as_mut() {
-                        Some(memory) => {
-                            let before = byte(memory, physical_address)?;
-                            set_byte(memory, physical_address, value)?;
-                            before
-                        }
-                        None => self.memory_byte(physical_address)?,
-                    };
+                    let before = self.planned_memory_byte(preceding, physical_address)?;
                     BusWitness::MemoryWrite(MemoryWrite {
                         address,
                         physical_address,
@@ -351,6 +328,26 @@ impl LookupTraceBuilder {
             witnesses.push(witness);
         }
         Ok(StepInput::new(witnesses))
+    }
+
+    fn planned_memory_byte(
+        &self,
+        preceding: &[PlannedWitness],
+        physical_address: u32,
+    ) -> Result<u8, LookupTraceBuilderError> {
+        preceding
+            .iter()
+            .rev()
+            .find_map(|planned| match *planned {
+                PlannedWitness::MemoryWrite(_, address, value) if address == physical_address => {
+                    Some(value)
+                }
+                PlannedWitness::Rom(..)
+                | PlannedWitness::MemoryRead(..)
+                | PlannedWitness::MemoryWrite(..)
+                | PlannedWitness::InputByte(_) => None,
+            })
+            .map_or_else(|| self.memory_byte(physical_address), Ok)
     }
 
     fn plan(
@@ -465,21 +462,6 @@ fn set_byte(bytes: &mut [u8], address: u32, value: u8) -> Result<(), LookupTrace
     Ok(())
 }
 
-fn requires_memory_fork(plan: &[PlannedWitness]) -> bool {
-    let mut write_seen = false;
-    for planned in plan {
-        match planned {
-            PlannedWitness::MemoryWrite(..) if write_seen => return true,
-            PlannedWitness::MemoryWrite(..) => write_seen = true,
-            PlannedWitness::MemoryRead(..) if write_seen => return true,
-            PlannedWitness::Rom(..)
-            | PlannedWitness::MemoryRead(..)
-            | PlannedWitness::InputByte(_) => {}
-        }
-    }
-    false
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlannedWitness {
     Rom(u16, u32),
@@ -534,6 +516,9 @@ pub enum LookupTraceBuilderError {
         /// Fixed per-row witness maximum.
         maximum: usize,
     },
+    /// An internal witness-plan prefix was not representable.
+    #[error("lookup witness plan violated its bounded prefix invariant")]
+    WitnessPlanInvariant,
     /// The pure transition relation rejected the byte-array witness.
     #[error(transparent)]
     Step(#[from] StepError),

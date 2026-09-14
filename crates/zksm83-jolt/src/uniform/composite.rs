@@ -43,8 +43,10 @@ fn prove_on_worker(
     right: &CommittedWitness,
 ) -> Result<CompositeUniformRelationProof, UniformError> {
     validate_shapes(protocol, relation, left.commitments(), right.commitments())?;
-    let mut columns = left.field_columns().to_vec();
-    columns.extend_from_slice(right.field_columns());
+    let left_columns = left.field_columns()?;
+    let right_columns = right.field_columns()?;
+    let mut columns = left_columns.into_owned_columns();
+    columns.extend(right_columns.into_owned_columns());
     ensure_relation_holds(relation, &columns, UNIFORM_ROW_COUNT)?;
     let descriptor = descriptor(protocol, relation, left.commitments(), right.commitments())?;
     let mut transcript = outer_transcript(protocol, &descriptor, super::TranscriptSide::Prover);
@@ -154,7 +156,6 @@ fn descriptor(
     push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
     push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
     let domain = match protocol {
-        NativeProtocolVersion::V1 => b"zksm83/native-uniform-composite/v1".as_slice(),
         NativeProtocolVersion::V2 => b"zksm83/native-uniform-composite/v2".as_slice(),
     };
     push_bytes(&mut descriptor, domain)?;

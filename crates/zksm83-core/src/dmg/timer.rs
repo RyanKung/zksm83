@@ -115,6 +115,33 @@ impl DmgTimerState {
         requested
     }
 
+    /// Returns exact T-cycles until the next reload interrupt for a stable enabled timer.
+    ///
+    /// A recent DIV/TAC write can leave the stored edge latch intentionally different from
+    /// the current detector input. That transient case returns `None` and must advance through
+    /// the ordinary bounded path before this shortcut is considered.
+    #[must_use]
+    pub fn t_cycles_until_interrupt(self) -> Option<u32> {
+        if self.control & 0x04 == 0
+            || self.reload_phase != 0
+            || self.edge_latch != self.detector_input()
+        {
+            return None;
+        }
+        let period = match self.control & 0x03 {
+            0 => 1024_u32,
+            1 => 16,
+            2 => 64,
+            _ => 256,
+        };
+        let remainder = u32::from(self.raw_div) & (period - 1);
+        let first_falling_edge = period - remainder;
+        let later_falling_edges = u32::from(u8::MAX - self.counter) * period;
+        first_falling_edge
+            .checked_add(later_falling_edges)?
+            .checked_add(5)
+    }
+
     fn tick(&mut self) -> u8 {
         let requested = self.advance_reload_pipeline();
         self.raw_div = self.raw_div.wrapping_add(1);
@@ -184,7 +211,7 @@ impl Default for DmgTimerState {
 
 #[cfg(test)]
 mod tests {
-    use super::DmgTimerState;
+    use super::{DmgTimerState, TIMER_INTERRUPT};
 
     #[test]
     fn post_boot_divider_has_the_dmg_phase() {
@@ -231,6 +258,28 @@ mod tests {
         assert_eq!(timer.advance_t_cycles(1), 0x04);
         assert_eq!(timer.reload_phase(), 0);
         assert_eq!(timer.counter(), 0x42);
+    }
+
+    #[test]
+    fn exact_interrupt_distance_matches_tick_simulation() -> Result<(), &'static str> {
+        for (control, counter) in [(4_u8, 0), (5, 0xff), (6, 0x80), (7, 0xfe)] {
+            let mut timer = DmgTimerState::empty();
+            let _prior = timer.write(0xff05, counter);
+            let _prior = timer.write(0xff07, control);
+            let expected = timer
+                .t_cycles_until_interrupt()
+                .ok_or("fresh enabled timer has an unstable edge latch")?;
+            let mut projected = timer;
+            let mut elapsed = 0_u32;
+            loop {
+                elapsed += 1;
+                if projected.advance_t_cycles(1) & TIMER_INTERRUPT != 0 {
+                    break;
+                }
+            }
+            assert_eq!(elapsed, expected, "control={control}, counter={counter}");
+        }
+        Ok(())
     }
 
     #[test]

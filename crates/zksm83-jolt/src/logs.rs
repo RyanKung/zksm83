@@ -1,24 +1,20 @@
 //! Native commitments and ordered membership arguments for protocol logs.
 
+mod packed;
+mod packed_trace_relation;
 pub(crate) mod sum;
 pub(crate) mod table_relation;
 #[cfg(test)]
 mod tests;
-mod trace_relation;
 
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
 
 use crate::{
-    AKITA_LOG_SCHEDULE_SHA256, AkitaWorkerError, ISA_PACKED_HIGH, ISA_PACKED_LOW,
-    NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField, NativeProtocolVersion,
-    NativeTraceWitness, STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_BEFORE_STATE_START,
-    TRACE_BUS_KIND_BITS, TRACE_BUS_SLOT_WIDTH, TRACE_BUS_SLOTS, TRACE_BUS_START,
-    TRACE_ISA_OUTPUT_START, UNIFORM_ROW_COUNT, UniformError, WitnessCommitments,
+    AkitaWorkerError, NativeField, NativeProtocolVersion, UniformError, WitnessCommitments,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
-    uniform::CommittedWitness,
 };
 
 /// Number of address variables in every fixed-capacity segment log table.
@@ -29,8 +25,8 @@ pub const PROTOCOL_LOG_ROW_COUNT: usize = 1 << PROTOCOL_LOG_NUM_VARIABLES;
 const LOG_GROUP_COLUMNS: usize = 128;
 const LOG_COLUMN_COUNT: usize = 19;
 const TABLE_INVERSE_COLUMN_COUNT: usize = LOG_KIND_COUNT * 2;
-const TRACE_INVERSE_ENTRY_COUNT: usize = TRACE_BUS_SLOTS * 3 + 1;
-const TRACE_INVERSE_COLUMN_COUNT: usize = TRACE_INVERSE_ENTRY_COUNT * 2;
+const PACKED_TRACE_INVERSE_ENTRY_COUNT: usize = crate::TRACE_BUS_SLOTS * 3 + 4;
+const PACKED_TRACE_INVERSE_COLUMN_COUNT: usize = PACKED_TRACE_INVERSE_ENTRY_COUNT * 2;
 const LOG_KIND_COUNT: usize = 4;
 const LOG_SCHEDULE_FILE: &[u8] =
     include_bytes!("../protocol/akita/fp128_dense_bounded_nv17_p128.aks");
@@ -42,8 +38,6 @@ const LOG_LAYOUT: PcsLayout = PcsLayout::new(
     b"zksm83/native-protocol-logs/v1",
     b"zksm83-native-protocol-log-opening/v1",
 );
-const CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-protocol-log-challenges/v1";
-const CHALLENGE_DOMAIN_V2: &[u8] = b"zksm83-native-protocol-log-challenges/v2";
 
 const BUS_START: usize = 0;
 const BUS_WIDTH: usize = 9;
@@ -58,13 +52,6 @@ const STATE_OUTPUT_INDEX: usize = 17;
 const STATE_BUS_INDEX: usize = 18;
 const STATE_ISA_INDEX: usize = 19;
 
-const BUS_ADDRESS_OFFSET: usize = 1 + TRACE_BUS_KIND_BITS;
-const BUS_PHYSICAL_OFFSET: usize = BUS_ADDRESS_OFFSET + 1;
-const BUS_BEFORE_OFFSET: usize = BUS_ADDRESS_OFFSET + 2;
-const BUS_AUXILIARY_OFFSET: usize = BUS_ADDRESS_OFFSET + 3;
-const BUS_VALUE_OFFSET: usize = BUS_ADDRESS_OFFSET + 4;
-const BUS_EVENT_INDEX_OFFSET: usize = BUS_ADDRESS_OFFSET + 5;
-
 /// Prover-owned canonical segment log tables and their public commitment.
 pub struct CommittedProtocolLogs {
     inner: CommittedColumns,
@@ -77,15 +64,18 @@ pub struct ProtocolLogCommitments {
     pub(crate) inner: ColumnCommitments,
 }
 
-/// Proof that the committed tables equal the ordered events in one trace segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProtocolLogProof {
-    pub(crate) trace_inverses: WitnessCommitments,
-    pub(crate) table_inverses: ColumnCommitments,
-    pub(crate) trace_relation: crate::uniform::CompositeUniformRelationProof,
-    pub(crate) table_relation: table_relation::TableRelationProof,
-    pub(crate) sum: sum::ProtocolLogSumProof,
+struct LogEntries {
+    bus: Vec<[u64; BUS_WIDTH - 1]>,
+    input: Vec<[u64; BYTE_LOG_WIDTH - 1]>,
+    output: Vec<[u64; BYTE_LOG_WIDTH - 1]>,
+    isa: Vec<[u64; ISA_WIDTH - 1]>,
 }
+
+pub(crate) use packed::verify_packed_protocol_logs_for_protocol;
+pub use packed::{
+    PackedProtocolLogClaim, PackedProtocolLogProof, commit_packed_protocol_logs,
+    prove_packed_protocol_logs, verify_packed_protocol_logs,
+};
 
 /// Invalid log table, cursor claim, proof shape, or backend operation.
 #[derive(Debug, Error)]
@@ -134,6 +124,25 @@ enum LogKind {
 struct LogChallenges {
     tuple_mix: [NativeField; LOG_KIND_COUNT],
     inverse_point: [NativeField; LOG_KIND_COUNT],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TraceLogLayout {
+    Packed,
+}
+
+impl TraceLogLayout {
+    const fn inverse_column_count(self) -> usize {
+        PACKED_TRACE_INVERSE_COLUMN_COUNT
+    }
+
+    fn entry_ranges(self) -> [std::ops::Range<usize>; LOG_KIND_COUNT] {
+        [0..5, 5..10, 10..15, 15..19]
+    }
+
+    const fn sum_domain(self) -> &'static [u8] {
+        b"zksm83-native-block-protocol-log-multiset-sum/v2"
+    }
 }
 
 impl LogChallenges {
@@ -194,230 +203,6 @@ impl ProtocolLogCommitments {
     }
 }
 
-/// Commits deterministic fixed-capacity tables extracted from one native trace.
-pub fn commit_protocol_logs(
-    trace: &NativeTraceWitness,
-) -> Result<CommittedProtocolLogs, ProtocolLogError> {
-    let columns = log_columns(trace)?;
-    on_worker(|| {
-        let inner = commit_columns(LOG_LAYOUT, &columns)?;
-        let commitment = ProtocolLogCommitments {
-            inner: inner.commitments().clone(),
-        };
-        Ok(CommittedProtocolLogs { inner, commitment })
-    })
-}
-
-/// Proves that committed tables contain exactly the trace's ordered log events.
-pub fn prove_protocol_logs(
-    trace: &NativeTraceWitness,
-    trace_witness: &CommittedWitness,
-    logs: &CommittedProtocolLogs,
-    claim: &NativeExecutionClaim,
-) -> Result<ProtocolLogProof, ProtocolLogError> {
-    let protocol = NativeProtocolVersion::current();
-    claim.validate().map_err(|_| ProtocolLogError::Shape)?;
-    logs.commitment.validate()?;
-    let phase_one = phase_one_descriptor(
-        protocol,
-        trace_witness.commitments(),
-        &logs.commitment,
-        claim,
-    )?;
-    let challenges = challenges(protocol, &phase_one)?;
-    let trace_inverse_values = trace_relation::inverse_columns(trace.columns(), challenges)?;
-    let trace_inverses = crate::commit_witness(&trace_inverse_values)?;
-    let table_inverse_values = table_relation::inverse_columns(&logs.inner, challenges)?;
-    let table_inverses = commit_log_columns(&table_inverse_values)?;
-    let trace_relation = trace_relation::prove(trace_witness, &trace_inverses, challenges)?;
-    let full = full_descriptor(
-        protocol,
-        &phase_one,
-        trace_inverses.commitments(),
-        table_inverses.commitments(),
-    )?;
-    let table_relation = table_relation::prove(&logs.inner, &table_inverses, challenges, &full)?;
-    let sum =
-        on_worker(|| sum::prove(&trace_inverses, &logs.inner, &table_inverses, claim, &full))?;
-    Ok(ProtocolLogProof {
-        trace_inverses: trace_inverses.into_commitments(),
-        table_inverses: table_inverses.into_commitments(),
-        trace_relation,
-        table_relation,
-        sum,
-    })
-}
-
-/// Verifies all four logs without receiving trace rows or emulator state.
-pub fn verify_protocol_logs(
-    proof: &ProtocolLogProof,
-    trace: &WitnessCommitments,
-    logs: &ProtocolLogCommitments,
-    claim: &NativeExecutionClaim,
-) -> Result<(), ProtocolLogError> {
-    verify_protocol_logs_for_protocol(NativeProtocolVersion::current(), proof, trace, logs, claim)
-}
-
-pub(crate) fn verify_protocol_logs_for_protocol(
-    protocol: NativeProtocolVersion,
-    proof: &ProtocolLogProof,
-    trace: &WitnessCommitments,
-    logs: &ProtocolLogCommitments,
-    claim: &NativeExecutionClaim,
-) -> Result<(), ProtocolLogError> {
-    claim.validate().map_err(|_| ProtocolLogError::Shape)?;
-    logs.validate()?;
-    proof.table_inverses.validate(LOG_LAYOUT)?;
-    let phase_one = phase_one_descriptor(protocol, trace, logs, claim)?;
-    let challenges = challenges(protocol, &phase_one)?;
-    trace_relation::verify(
-        protocol,
-        trace,
-        &proof.trace_inverses,
-        challenges,
-        &proof.trace_relation,
-    )?;
-    let full = full_descriptor(
-        protocol,
-        &phase_one,
-        &proof.trace_inverses,
-        &proof.table_inverses,
-    )?;
-    table_relation::verify(
-        &logs.inner,
-        &proof.table_inverses,
-        challenges,
-        &full,
-        &proof.table_relation,
-    )?;
-    on_worker(|| {
-        sum::verify(
-            protocol,
-            &proof.sum,
-            &proof.trace_inverses,
-            &logs.inner,
-            &proof.table_inverses,
-            claim,
-            &full,
-        )
-    })
-}
-
-struct LogEntries {
-    bus: Vec<[u64; BUS_WIDTH - 1]>,
-    input: Vec<[u64; BYTE_LOG_WIDTH - 1]>,
-    output: Vec<[u64; BYTE_LOG_WIDTH - 1]>,
-    isa: Vec<[u64; ISA_WIDTH - 1]>,
-}
-
-fn log_columns(trace: &NativeTraceWitness) -> Result<Vec<Vec<u64>>, ProtocolLogError> {
-    let entries = extract_entries(trace.columns())?;
-    let mut columns = (0..LOG_COLUMN_COUNT)
-        .map(|_| Vec::with_capacity(PROTOCOL_LOG_ROW_COUNT))
-        .collect::<Vec<_>>();
-    append_table(&mut columns, BUS_START, &entries.bus)?;
-    append_table(&mut columns, INPUT_START, &entries.input)?;
-    append_table(&mut columns, OUTPUT_START, &entries.output)?;
-    append_table(&mut columns, ISA_START, &entries.isa)?;
-    if columns
-        .iter()
-        .any(|column| column.len() != PROTOCOL_LOG_ROW_COUNT)
-    {
-        return Err(ProtocolLogError::Shape);
-    }
-    Ok(columns)
-}
-
-fn extract_entries(trace: &[Vec<u64>]) -> Result<LogEntries, ProtocolLogError> {
-    if trace.len() != NATIVE_TRACE_COLUMN_COUNT {
-        return Err(ProtocolLogError::Shape);
-    }
-    let mut entries = LogEntries {
-        bus: Vec::new(),
-        input: Vec::new(),
-        output: Vec::new(),
-        isa: Vec::new(),
-    };
-    for row in 0..UNIFORM_ROW_COUNT {
-        if trace_value(trace, TRACE_ACTIVE, row)? == 0 {
-            continue;
-        }
-        append_row_entries(trace, row, &mut entries)?;
-    }
-    Ok(entries)
-}
-
-fn append_row_entries(
-    trace: &[Vec<u64>],
-    row: usize,
-    entries: &mut LogEntries,
-) -> Result<(), ProtocolLogError> {
-    let before_bus = state_value(trace, row, STATE_BUS_INDEX)?;
-    let mut ordinal = 0_u64;
-    for slot in 0..TRACE_BUS_SLOTS {
-        let start = bus_start(slot)?;
-        if trace_value(trace, start, row)? == 0 {
-            continue;
-        }
-        let kind = packed_trace(trace, start + 1, TRACE_BUS_KIND_BITS, row)?;
-        let tuple = bus_tuple(trace, start, row, before_bus + ordinal, kind)?;
-        entries.bus.push(tuple);
-        append_byte_entry(trace, start, row, kind, entries)?;
-        ordinal = ordinal.checked_add(1).ok_or(ProtocolLogError::Shape)?;
-    }
-    entries.isa.push([
-        state_value(trace, row, STATE_ISA_INDEX)?,
-        trace_value(trace, TRACE_ISA_OUTPUT_START + ISA_PACKED_LOW, row)?,
-        trace_value(trace, TRACE_ISA_OUTPUT_START + ISA_PACKED_HIGH, row)?,
-    ]);
-    Ok(())
-}
-
-fn bus_tuple(
-    trace: &[Vec<u64>],
-    start: usize,
-    row: usize,
-    global_index: u64,
-    kind: u64,
-) -> Result<[u64; BUS_WIDTH - 1], ProtocolLogError> {
-    Ok([
-        global_index,
-        kind,
-        trace_value(trace, start + BUS_ADDRESS_OFFSET, row)?,
-        trace_value(trace, start + BUS_PHYSICAL_OFFSET, row)?,
-        trace_value(trace, start + BUS_BEFORE_OFFSET, row)?,
-        trace_value(trace, start + BUS_AUXILIARY_OFFSET, row)?,
-        trace_value(trace, start + BUS_VALUE_OFFSET, row)?,
-        trace_value(trace, start + BUS_EVENT_INDEX_OFFSET, row)?,
-    ])
-}
-
-fn append_byte_entry(
-    trace: &[Vec<u64>],
-    start: usize,
-    row: usize,
-    kind: u64,
-    entries: &mut LogEntries,
-) -> Result<(), ProtocolLogError> {
-    let index = trace_value(trace, start + BUS_EVENT_INDEX_OFFSET, row)?;
-    if kind == 6 || kind == 13 {
-        let offset = if kind == 13 {
-            BUS_AUXILIARY_OFFSET
-        } else {
-            BUS_VALUE_OFFSET
-        };
-        entries
-            .input
-            .push([index, trace_value(trace, start + offset, row)?]);
-    }
-    if kind == 7 {
-        entries
-            .output
-            .push([index, trace_value(trace, start + BUS_VALUE_OFFSET, row)?]);
-    }
-    Ok(())
-}
-
 fn append_table<const WIDTH: usize>(
     columns: &mut [Vec<u64>],
     start: usize,
@@ -443,22 +228,6 @@ fn append_table<const WIDTH: usize>(
     Ok(())
 }
 
-fn phase_one_descriptor(
-    protocol: NativeProtocolVersion,
-    trace: &WitnessCommitments,
-    logs: &ProtocolLogCommitments,
-    claim: &NativeExecutionClaim,
-) -> Result<Vec<u8>, ProtocolLogError> {
-    let mut descriptor = Vec::new();
-    push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
-    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
-    push_bytes(&mut descriptor, AKITA_LOG_SCHEDULE_SHA256.as_bytes())?;
-    push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
-    push_bytes(&mut descriptor, &logs.canonical_bytes()?)?;
-    push_bytes(&mut descriptor, &claim.canonical_bytes_for(protocol))?;
-    Ok(descriptor)
-}
-
 fn full_descriptor(
     protocol: NativeProtocolVersion,
     phase_one: &[u8],
@@ -478,24 +247,6 @@ fn full_descriptor(
     Ok(descriptor)
 }
 
-fn challenges(
-    protocol: NativeProtocolVersion,
-    descriptor: &[u8],
-) -> Result<LogChallenges, ProtocolLogError> {
-    let domain = match protocol {
-        NativeProtocolVersion::V1 => CHALLENGE_DOMAIN,
-        NativeProtocolVersion::V2 => CHALLENGE_DOMAIN_V2,
-    };
-    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(domain);
-    transcript.bind_instance_bytes(descriptor);
-    let tuple_mix = challenge_array(&mut transcript, b"tuple-mix")?;
-    let inverse_point = challenge_array(&mut transcript, b"inverse-point")?;
-    Ok(LogChallenges {
-        tuple_mix,
-        inverse_point,
-    })
-}
-
 fn challenge_array(
     transcript: &mut AkitaTranscript<NativeField>,
     label: &'static [u8],
@@ -508,19 +259,6 @@ fn challenge_array(
         }
     }
     Ok(values)
-}
-
-fn expected_counts(
-    claim: &NativeExecutionClaim,
-) -> Result<[u64; LOG_KIND_COUNT], ProtocolLogError> {
-    let before = claim.initial_state();
-    let after = claim.final_state();
-    Ok([
-        scalar_delta(before, after, STATE_BUS_INDEX)?,
-        scalar_delta(before, after, STATE_INPUT_INDEX)?,
-        scalar_delta(before, after, STATE_OUTPUT_INDEX)?,
-        scalar_delta(before, after, STATE_ISA_INDEX)?,
-    ])
 }
 
 fn scalar_delta(
@@ -623,13 +361,6 @@ fn trace_value(trace: &[Vec<u64>], column: usize, row: usize) -> Result<u64, Pro
         .ok_or(ProtocolLogError::Shape)
 }
 
-fn state_value(trace: &[Vec<u64>], row: usize, scalar: usize) -> Result<u64, ProtocolLogError> {
-    if scalar >= STATE_SCALAR_COUNT {
-        return Err(ProtocolLogError::Shape);
-    }
-    trace_value(trace, TRACE_BEFORE_STATE_START + scalar, row)
-}
-
 fn packed_trace(
     trace: &[Vec<u64>],
     start: usize,
@@ -641,15 +372,6 @@ fn packed_trace(
         packed |= trace_value(trace, start + bit, row)? << bit;
     }
     Ok(packed)
-}
-
-fn bus_start(slot: usize) -> Result<usize, ProtocolLogError> {
-    TRACE_BUS_START
-        .checked_add(
-            slot.checked_mul(TRACE_BUS_SLOT_WIDTH)
-                .ok_or(ProtocolLogError::Shape)?,
-        )
-        .ok_or(ProtocolLogError::Shape)
 }
 
 fn push_column(
@@ -678,11 +400,7 @@ fn field_column(
     columns: &CommittedColumns,
     index: usize,
 ) -> Result<&[NativeField], ProtocolLogError> {
-    columns
-        .field_columns()
-        .get(index)
-        .map(Vec::as_slice)
-        .ok_or(ProtocolLogError::Shape)
+    columns.field_column(index).map_err(Into::into)
 }
 
 fn evaluate_field_column(
@@ -694,13 +412,8 @@ fn evaluate_field_column(
     }
     let mut folded = values.to_vec();
     for coordinate in point {
-        let mut next = Vec::with_capacity(folded.len() / 2);
-        for pair in folded.chunks_exact(2) {
-            let zero = pair.first().copied().ok_or(ProtocolLogError::Shape)?;
-            let one = pair.get(1).copied().ok_or(ProtocolLogError::Shape)?;
-            next.push(zero + *coordinate * (one - zero));
-        }
-        folded = next;
+        crate::field_fold::fold_binary_layer(&mut folded, *coordinate)
+            .map_err(|_| ProtocolLogError::Shape)?;
     }
     folded.first().copied().ok_or(ProtocolLogError::Shape)
 }

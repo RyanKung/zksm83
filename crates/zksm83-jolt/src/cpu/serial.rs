@@ -3,8 +3,9 @@
 use akita_pcs::Ring;
 
 use super::{
-    BUS_VALUE_OFFSET, ConstraintSink, RowView, bit_selector, boolean, bus_field, bus_kind_bits,
-    packed_bits, zero_from_bits,
+    BUS_VALUE_OFFSET, ConstraintSink, HALT_IDLE_MODE, HALT_UNTIL_SERIAL_MODE,
+    HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, INSTRUCTION_MODE, INTERRUPT_MODE, RowView,
+    bit_selector, boolean, bus_field, bus_kind_bits, packed_bits, zero_from_bits,
 };
 use crate::{
     NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START,
@@ -12,10 +13,11 @@ use crate::{
     trace::device::{
         TRACE_AFTER_DMG_HIGH_BITS_START, TRACE_AFTER_DMG_LOW_BITS_START,
         TRACE_AFTER_INTERRUPT_REQUEST_BITS_START, TRACE_BEFORE_DMG_HIGH_BITS_START,
-        TRACE_BEFORE_DMG_LOW_BITS_START, TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START,
-        TRACE_SERIAL_AFTER_ZERO, TRACE_SERIAL_COMPLETED, TRACE_SERIAL_COMPLETION_GAP_BITS_START,
-        TRACE_SERIAL_POST_ACTIVE, TRACE_SERIAL_POST_CONTROL_BITS_START,
-        TRACE_SERIAL_POST_COUNTDOWN_BITS_START, TRACE_SERIAL_POST_DATA_BITS_START,
+        TRACE_BEFORE_DMG_LOW_BITS_START, TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START,
+        TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START, TRACE_SERIAL_AFTER_ZERO, TRACE_SERIAL_COMPLETED,
+        TRACE_SERIAL_COMPLETION_GAP_BITS_START, TRACE_SERIAL_POST_ACTIVE,
+        TRACE_SERIAL_POST_CONTROL_BITS_START, TRACE_SERIAL_POST_COUNTDOWN_BITS_START,
+        TRACE_SERIAL_POST_DATA_BITS_START,
     },
 };
 
@@ -26,6 +28,7 @@ pub(super) fn constrain_serial(
     constrain_witness_ranges(view, sink)?;
     constrain_post_write_state(view, sink)?;
     constrain_countdown(view, sink)?;
+    constrain_halt_serial_guard(view, sink)?;
     constrain_completion_outputs(view, sink)?;
     constrain_interrupt(view, sink)
 }
@@ -145,13 +148,30 @@ fn constrain_completion_boundary(
     ticks: NativeField,
 ) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
-    let regular = view.mode(0)? + view.mode(1)? + view.mode(8)?;
-    let long = view.mode(2)? + view.mode(3)? + view.mode(4)? + view.mode(5)?;
+    let advancing = view.mode(INSTRUCTION_MODE)?
+        + view.mode(HALT_IDLE_MODE)?
+        + view.mode(INTERRUPT_MODE)?
+        + view.mode(HALT_UNTIL_SERIAL_MODE)?;
+    let quiet_long = view.mode(HALT_UNTIL_VBLANK_MODE)? + view.mode(HALT_UNTIL_TIMER_MODE)?;
     let gap = packed_bits(view, TRACE_SERIAL_COMPLETION_GAP_BITS_START, 5)?;
     sink.push((one - completed) * gap)?;
-    sink.push(regular * completed * (gap - ticks + post))?;
-    sink.push(long * active)?;
-    sink.push(long * view.value(TRACE_SERIAL_POST_CONTROL_BITS_START + 7)?)
+    sink.push(advancing * completed * (gap - ticks + post))?;
+    sink.push(quiet_long * active)?;
+    sink.push(quiet_long * view.value(TRACE_SERIAL_POST_CONTROL_BITS_START + 7)?)
+}
+
+fn constrain_halt_serial_guard(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+) -> Result<(), UniformError> {
+    let one = NativeField::from_u64(1);
+    let selected = view.mode(HALT_UNTIL_SERIAL_MODE)?;
+    sink.push(selected * (view.value(TRACE_SERIAL_COMPLETED)? - one))?;
+    sink.push(selected * packed_bits(view, TRACE_SERIAL_COMPLETION_GAP_BITS_START, 5)?)?;
+    sink.push(selected * (view.value(TRACE_SERIAL_POST_CONTROL_BITS_START)? - one))?;
+    sink.push(selected * (view.value(TRACE_SERIAL_POST_CONTROL_BITS_START + 7)? - one))?;
+    sink.push(selected * (view.value(TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START + 3)? - one))?;
+    sink.push(selected * view.value(TRACE_BEFORE_DMG_LOW_BITS_START + 39)?)
 }
 
 fn constrain_completion_outputs(

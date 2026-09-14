@@ -456,52 +456,64 @@ impl DmgDeviceState {
         u16::try_from(remaining / 4).ok()
     }
 
+    /// Returns an exact long HALT skip to internal-clock serial completion when every other
+    /// modeled device is quiet for the interval.
+    #[must_use]
+    pub fn halt_until_serial_m_cycles(self) -> Option<u16> {
+        if self.pending_interrupt().is_some()
+            || self.interrupt_enable & 0x08 == 0
+            || self.lcd_enabled()
+            || self.timer.control() & 0x04 != 0
+            || self.timer.reload_phase() != 0
+            || self.timer.edge_latch()
+            || self.serial_control & 0x81 != 0x81
+            || self.serial_cycles_remaining == 0
+            || self.serial_cycles_remaining > 4096
+            || !self.serial_cycles_remaining.is_multiple_of(4)
+            || self.dma_active
+            || self.dma_owed != 0
+        {
+            return None;
+        }
+        Some(self.serial_cycles_remaining / 4)
+    }
+
+    /// Returns an exact long HALT skip to the M-cycle containing the next timer interrupt when
+    /// every other modeled device is quiet for the interval.
+    #[must_use]
+    pub fn halt_until_timer_m_cycles(self) -> Option<u32> {
+        if self.pending_interrupt().is_some()
+            || self.interrupt_enable & 0x04 == 0
+            || self.lcd_enabled()
+            || self.serial_cycles_remaining != 0
+            || self.serial_control & 0x80 != 0
+            || self.dma_active
+            || self.dma_owed != 0
+        {
+            return None;
+        }
+        let t_cycles = self.timer.t_cycles_until_interrupt()?;
+        t_cycles.checked_add(3).map(|rounded| rounded / 4)
+    }
+
     pub(crate) fn advance_halt_until_vblank(&mut self, m_cycles: u16) {
         self.advance_quiet_long(u32::from(m_cycles));
     }
 
-    /// Returns whether long CPU-only timing can be advanced without hidden device effects.
-    pub(crate) const fn can_advance_quiet_long(self) -> bool {
-        self.can_advance_quiet_except_dma() && !self.dma_active && self.dma_owed == 0
+    pub(crate) fn advance_halt_until_serial(&mut self, m_cycles: u16) {
+        self.advance_quiet_long(u32::from(m_cycles));
     }
 
-    pub(crate) const fn can_advance_quiet_dma_wait(self) -> bool {
-        self.can_advance_quiet_except_dma() && self.dma_active && self.dma_owed == 0
+    pub(crate) fn advance_halt_until_timer(&mut self, m_cycles: u32) {
+        self.advance_quiet_long(m_cycles);
     }
 
-    /// Returns whether timer, serial, and STAT have no hidden transition source.
-    ///
-    /// DMA is deliberately excluded because it is modeled by its own explicit
-    /// relation rows in the Pokémon Blue specialized proof circuit.
-    #[must_use]
-    pub const fn blue_quiet_proof_compatible(self) -> bool {
-        self.lcd_status_control == 0
-            && self.timer.control() & 0x04 == 0
-            && self.timer.reload_phase() == 0
-            && !self.timer.edge_latch()
-            && self.serial_cycles_remaining == 0
-            && self.serial_control & 0x80 == 0
-    }
-
-    const fn can_advance_quiet_except_dma(self) -> bool {
-        (!self.lcd_enabled() || self.lcd_status_control == 0)
-            && self.timer.control() & 0x04 == 0
-            && self.timer.reload_phase() == 0
-            && !self.timer.edge_latch()
-            && self.serial_cycles_remaining == 0
-            && self.serial_control & 0x80 == 0
-    }
-
-    pub(crate) fn advance_quiet_long(&mut self, mut m_cycles: u32) {
+    fn advance_quiet_long(&mut self, mut m_cycles: u32) {
         while m_cycles != 0 {
             let chunk = u8::try_from(m_cycles.min(63)).unwrap_or(63);
             self.advance_m_cycles(chunk);
             m_cycles -= u32::from(chunk);
         }
-    }
-
-    pub(crate) fn schedule_dma_wait_remaining(&mut self) {
-        self.dma_owed = 160_u8.saturating_sub(self.dma_index);
     }
 
     fn advance_serial_t_cycles(&mut self, t_cycles: u8) {
@@ -688,9 +700,83 @@ mod tests {
         assert_eq!(state.write_mmio(0xffff, 1), Some(0));
         let elapsed = 16_416;
         assert_eq!(state.halt_until_vblank_m_cycles(), Some(elapsed));
+        let mut reference = state;
+        for _ in 0..elapsed {
+            reference.advance_m_cycles(1);
+        }
         state.advance_halt_until_vblank(elapsed);
+        assert_eq!(state, reference);
         assert_eq!((state.ppu_line(), state.ppu_dot()), (144, 0));
         assert_eq!(state.pending_interrupt(), Some(DmgInterrupt::VBlank));
+    }
+
+    #[test]
+    fn quiet_halt_can_advance_exactly_to_serial_completion() {
+        let mut state = DmgDeviceState::dmg_post_boot();
+        assert_eq!(state.write_mmio(0xff0f, 0), Some(0xe1));
+        assert_eq!(state.write_mmio(0xffff, 0x08), Some(0));
+        assert_eq!(state.write_mmio(0xff40, 0), Some(0x91));
+        assert_eq!(state.write_mmio(0xff01, 0x12), Some(0));
+        assert_eq!(state.write_mmio(0xff02, 0x81), Some(0x7e));
+        assert_eq!(state.halt_until_serial_m_cycles(), Some(1024));
+        let mut reference = state;
+        for _ in 0..1024 {
+            reference.advance_m_cycles(1);
+        }
+        state.advance_halt_until_serial(1024);
+        assert_eq!(state, reference);
+        assert_eq!(state.read_mmio(0xff01), Some(0xff));
+        assert_eq!(state.read_mmio(0xff02), Some(0x01));
+        assert_eq!(state.pending_interrupt(), Some(DmgInterrupt::Serial));
+    }
+
+    #[test]
+    fn serial_long_halt_guard_fails_closed_on_competing_device_state() {
+        let mut base = DmgDeviceState::dmg_post_boot();
+        assert_eq!(base.write_mmio(0xff0f, 0), Some(0xe1));
+        assert_eq!(base.write_mmio(0xffff, 0x08), Some(0));
+        assert_eq!(base.write_mmio(0xff40, 0), Some(0x91));
+        assert_eq!(base.write_mmio(0xff02, 0x81), Some(0x7e));
+        assert_eq!(base.halt_until_serial_m_cycles(), Some(1024));
+
+        let mut pending = base;
+        assert_eq!(pending.write_mmio(0xff0f, 0x08), Some(0xe0));
+        assert_eq!(pending.halt_until_serial_m_cycles(), None);
+        let mut lcd = base;
+        assert_eq!(lcd.write_mmio(0xff40, 0x80), Some(0));
+        assert_eq!(lcd.halt_until_serial_m_cycles(), None);
+        let mut timer = base;
+        assert_eq!(timer.write_mmio(0xff07, 0x04), Some(0xf8));
+        assert_eq!(timer.halt_until_serial_m_cycles(), None);
+        let mut dma = base;
+        assert_eq!(dma.write_mmio(0xff46, 0x12), Some(0));
+        assert_eq!(dma.halt_until_serial_m_cycles(), None);
+        let mut external = base;
+        assert_eq!(external.write_mmio(0xff02, 0x80), Some(0x81));
+        assert_eq!(external.halt_until_serial_m_cycles(), None);
+    }
+
+    #[test]
+    fn quiet_halt_can_advance_to_the_m_cycle_containing_timer_interrupt() {
+        let mut state = DmgDeviceState::dmg_post_boot();
+        assert_eq!(state.write_mmio(0xff0f, 0), Some(0xe1));
+        assert_eq!(state.write_mmio(0xffff, 0x04), Some(0));
+        assert_eq!(state.write_mmio(0xff40, 0), Some(0x91));
+        assert_eq!(state.write_mmio(0xff04, 0), Some(0xab));
+        assert_eq!(state.write_mmio(0xff05, 0xff), Some(0));
+        assert_eq!(state.write_mmio(0xff06, 0x42), Some(0));
+        assert_eq!(state.write_mmio(0xff07, 0x05), Some(0xf8));
+        assert_eq!(state.timer().t_cycles_until_interrupt(), Some(21));
+        assert_eq!(state.halt_until_timer_m_cycles(), Some(6));
+        let mut reference = state;
+        for _ in 0..6 {
+            reference.advance_m_cycles(1);
+        }
+        state.advance_halt_until_timer(6);
+        assert_eq!(state, reference);
+        assert_eq!(state.timer().counter(), 0x42);
+        assert_eq!(state.timer().reload_phase(), 0);
+        assert_eq!(state.pending_interrupt(), Some(DmgInterrupt::Timer));
     }
 
     #[test]

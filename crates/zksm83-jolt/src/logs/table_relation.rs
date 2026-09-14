@@ -10,7 +10,7 @@ use super::{
     BUS_START, BUS_WIDTH, BYTE_LOG_WIDTH, CommittedLogColumns, INPUT_START, ISA_START, ISA_WIDTH,
     LOG_COLUMN_COUNT, LOG_KIND_COUNT, LOG_LAYOUT, LogChallenges, LogKind, OUTPUT_START,
     PROTOCOL_LOG_NUM_VARIABLES, PROTOCOL_LOG_ROW_COUNT, ProtocolLogError,
-    TABLE_INVERSE_COLUMN_COUNT, compress, equality_evaluation, equality_evaluations, field_column,
+    TABLE_INVERSE_COLUMN_COUNT, equality_evaluation, equality_evaluations, field_column,
     join_limbs, push_bytes, push_inverse, transcript,
 };
 
@@ -106,7 +106,7 @@ pub(super) fn inverse_columns(
     logs: &CommittedColumns,
     challenges: LogChallenges,
 ) -> Result<Vec<Vec<u64>>, ProtocolLogError> {
-    if logs.field_columns().len() != LOG_COLUMN_COUNT {
+    if logs.commitments().column_count() != LOG_COLUMN_COUNT {
         return Err(ProtocolLogError::Shape);
     }
     let mut columns = (0..TABLE_INVERSE_COLUMN_COUNT)
@@ -134,8 +134,8 @@ fn relation_terms(
     row_point: &[NativeField],
     mix: NativeField,
 ) -> Result<Vec<Vec<Vec<NativeField>>>, ProtocolLogError> {
-    if logs.field_columns().len() != LOG_COLUMN_COUNT
-        || inverses.field_columns().len() != TABLE_INVERSE_COLUMN_COUNT
+    if logs.commitments().column_count() != LOG_COLUMN_COUNT
+        || inverses.commitments().column_count() != TABLE_INVERSE_COLUMN_COUNT
     {
         return Err(ProtocolLogError::Shape);
     }
@@ -315,10 +315,15 @@ fn compress_table(
     row: usize,
     mix: NativeField,
 ) -> Result<NativeField, ProtocolLogError> {
-    let values = (start + 1..start + width)
-        .map(|column| field_value(logs, column, row))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(compress(&values, mix))
+    let first = start.checked_add(1).ok_or(ProtocolLogError::Shape)?;
+    let end = start.checked_add(width).ok_or(ProtocolLogError::Shape)?;
+    let mut sum = NativeField::from_u64(0);
+    let mut power = NativeField::from_u64(1);
+    for column in first..end {
+        sum += power * field_value(logs, column, row)?;
+        power *= mix;
+    }
+    Ok(sum)
 }
 
 fn table_data(
@@ -347,8 +352,9 @@ fn open_columns(
     point: &[NativeField],
     descriptor: &[u8],
 ) -> Result<ColumnOpening, ProtocolLogError> {
-    let values = columns
-        .field_columns()
+    let field_columns = columns.field_columns()?;
+    let values = field_columns
+        .as_slice()
         .iter()
         .map(|column| super::evaluate_field_column(column, point))
         .collect::<Result<Vec<_>, _>>()?;

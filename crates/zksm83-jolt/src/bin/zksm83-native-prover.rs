@@ -5,8 +5,8 @@
 
 use std::{
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
-    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+    fs::{self, File},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     time::Instant,
@@ -14,24 +14,35 @@ use std::{
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zksm83_core::{CpuState, DmgDeviceState, MachineProfile, Mbc3State, VmState};
 use zksm83_jolt::{
-    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, CommittedMemory,
-    MAX_NATIVE_SEGMENT_COUNT, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
-    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness, NativeTraceError,
-    NativeTraceWitness, PROTOCOL_ID, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
-    native_proof_phase_metrics, verify_native_spool_reader,
+    AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_SCHEDULE_SHA256, BlockCpuError, BlockCpuWitness,
+    CommittedMemory, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
+    MAX_NATIVE_STREAM_RECEIPT_BYTES, MemoryCommitment, NATIVE_RECEIPT_VERSION, NativeBoundary,
+    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentWitness,
+    PROOF_COMPOSITION_REVISION_V2, PROTOCOL_ID, UNIFORM_ROW_COUNT, commit_memory, commit_rom,
+    native_backend_digest, native_proof_phase_metrics, verify_native_spool_reader,
 };
 use zksm83_memory::{
     CommitmentRoot, LogAccumulator, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
 };
-use zksm83_trace::{TraceBuilder, TraceBuilderError};
+use zksm83_trace::{
+    BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlock, BasicBlockPlanError, TraceBuilder,
+    TraceBuilderError, pack_witness_basic_blocks_at,
+};
+
+#[path = "zksm83-native-prover/support.rs"]
+mod support;
+
+use support::{
+    atomic_replace, io_error, load_file_bounded as read_bounded, open_existing, open_new,
+    partial_path, require_absent, sha256, sha256_reader, sync_parent_directory, write_new,
+};
 
 const EXPECTED_CHECKPOINT_SCHEMA: &str = "zksm83-trace-checkpoint/v7";
-const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v2";
-const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v2";
+const PROGRESS_SCHEMA: &str = "zksm83-native-prover-progress/v5";
+const PROGRESS_EVIDENCE_SCHEMA: &str = "zksm83-native-progress-evidence/v5";
 const INPUT_SCHEDULE_SCHEMA: &str = "zksm83-input-schedule/v1";
 const ROM_BYTE_LENGTH: usize = 1 << 20;
 const MAX_ROM_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -117,18 +128,22 @@ struct InputSegment {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProverProgress {
     schema: String,
     receipt_version: u64,
     protocol_id: String,
+    proof_composition_revision: String,
+    backend_digest_sha256: String,
     trace_schedule_sha256: String,
     auxiliary_schedule_sha256: String,
     rom_sha256: String,
     input_sha256: String,
     expected_checkpoint_sha256: String,
-    segment_capacity: usize,
+    relation_row_capacity: usize,
     segment_count: u64,
-    relation_step_count: u64,
+    completed_steps: u64,
+    relation_row_count: u64,
     spool_bytes: u64,
     state: VmState,
     memory_hex: String,
@@ -138,8 +153,11 @@ struct ProverProgress {
 struct ProgressEvidence {
     schema: &'static str,
     verified: bool,
+    endpoint_complete: bool,
     receipt_version: u64,
     protocol_id: &'static str,
+    proof_composition_revision: &'static str,
+    backend_digest_sha256: String,
     trace_schedule_sha256: &'static str,
     auxiliary_schedule_sha256: &'static str,
     rom_sha256: String,
@@ -147,9 +165,10 @@ struct ProgressEvidence {
     expected_checkpoint_sha256: String,
     progress_checkpoint_sha256: String,
     spool_sha256: String,
-    segment_capacity: usize,
+    relation_row_capacity: usize,
     segment_count: u64,
-    relation_step_count: u64,
+    completed_steps: u64,
+    relation_row_count: u64,
     spool_bytes: u64,
     initial_state_scalars: Vec<u64>,
     final_state_scalars: Vec<u64>,
@@ -173,6 +192,8 @@ enum CliError {
     },
     #[error("output path already exists: {0}")]
     OutputExists(String),
+    #[error("existing final artifact differs from the recovered proof: {0}")]
+    FinalArtifactMismatch(&'static str),
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("checkpoint memory is invalid hexadecimal: {0}")]
@@ -191,12 +212,14 @@ enum CliError {
         "native prover checkpoint memory commitment differs from verified spool: spooled={spooled}, checkpoint={checkpoint}"
     )]
     ProgressMemoryCommitment { spooled: String, checkpoint: String },
-    #[error("expected Blue endpoint mismatch: {0}")]
+    #[error("expected execution endpoint mismatch: {0}")]
     EndpointMismatch(&'static str),
     #[error(transparent)]
     Receipt(#[from] NativeReceiptError),
     #[error(transparent)]
-    NativeTrace(#[from] NativeTraceError),
+    BlockCpu(#[from] BlockCpuError),
+    #[error(transparent)]
+    BlockPlan(#[from] BasicBlockPlanError),
     #[error(transparent)]
     Trace(#[from] TraceBuilderError),
     #[error(transparent)]
@@ -239,16 +262,25 @@ fn run(args: Args) -> Result<(), CliError> {
     }
     let committed_rom = commit_rom(&rom_bytes)?;
     if args.inspect_progress_only {
-        return inspect_progress(&args, identities, &committed_rom);
+        return inspect_progress(
+            &args,
+            identities,
+            &committed_rom,
+            &expected,
+            &rom_bytes,
+            &input,
+        );
     }
     require_absent(&args.receipt)?;
-    require_absent(&args.statement)?;
+    if !args.resume {
+        require_absent(&args.statement)?;
+    }
     let (mut builder, mut initial_memory, completed, mut prover) = if args.resume {
         resume(&args, &rom_bytes, &input, identities, &committed_rom)?
     } else {
         start(&args, &rom_bytes, &input, &committed_rom)?
     };
-    prove_segments(
+    let completed_steps = prove_segments(
         &args,
         &expected,
         identities,
@@ -257,11 +289,12 @@ fn run(args: Args) -> Result<(), CliError> {
         completed,
         &mut prover,
     )?;
-    if prover.relation_step_count() != expected.completed_steps {
+    if completed_steps != expected.completed_steps {
         println!(
-            "paused segments={} steps={} spool_bytes={}",
+            "paused segments={} completed_steps={} relation_rows={} spool_bytes={}",
             prover.segment_count(),
-            prover.relation_step_count(),
+            completed_steps,
+            prover.relation_row_count(),
             prover.spooled_bytes()
         );
         return Ok(());
@@ -282,6 +315,9 @@ fn inspect_progress(
     args: &Args,
     identities: InputIdentities,
     committed_rom: &zksm83_jolt::CommittedRom,
+    expected: &ExpectedCheckpoint,
+    rom_bytes: &[u8],
+    input: &[u8],
 ) -> Result<(), CliError> {
     let progress_bytes = read_bounded(
         &args.progress_checkpoint,
@@ -290,6 +326,11 @@ fn inspect_progress(
     )?;
     let progress: ProverProgress = serde_json::from_slice(&progress_bytes)?;
     validate_progress(&progress, identities)?;
+    if progress.completed_steps > expected.completed_steps {
+        return Err(CliError::ProgressMismatch(
+            "completed steps exceed expected endpoint",
+        ));
+    }
     let mut spool = File::open(&args.spool)
         .map_err(|source| io_error("open read-only", &args.spool, source))?;
     let verified =
@@ -297,17 +338,26 @@ fn inspect_progress(
     let spool_sha256 = sha256_reader(&mut spool, progress.spool_bytes, &args.spool)?;
     let view = VerifiedProgress {
         segment_count: verified.segment_count(),
-        relation_step_count: verified.relation_step_count(),
+        transition_count: verified.transition_count(),
+        relation_row_count: verified.relation_row_count(),
         spool_bytes: verified.spool_bytes(),
         final_boundary: verified.final_boundary(),
         final_memory: verified.final_memory(),
     };
     let _checkpoint_memory = validate_verified_progress(&progress, view)?;
+    let endpoint_complete = verified.transition_count() == expected.completed_steps;
+    if endpoint_complete {
+        let memory = hex::decode(&progress.memory_hex)?;
+        validate_endpoint(progress.state, &memory, rom_bytes, input, expected)?;
+    }
     let evidence = ProgressEvidence {
         schema: PROGRESS_EVIDENCE_SCHEMA,
         verified: true,
+        endpoint_complete,
         receipt_version: NATIVE_RECEIPT_VERSION,
         protocol_id: PROTOCOL_ID,
+        proof_composition_revision: PROOF_COMPOSITION_REVISION_V2,
+        backend_digest_sha256: hex::encode(native_backend_digest()),
         trace_schedule_sha256: AKITA_SCHEDULE_SHA256,
         auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256,
         rom_sha256: hex::encode(identities.rom),
@@ -315,9 +365,10 @@ fn inspect_progress(
         expected_checkpoint_sha256: hex::encode(identities.expected),
         progress_checkpoint_sha256: hex::encode(sha256(&progress_bytes)),
         spool_sha256: hex::encode(spool_sha256),
-        segment_capacity: progress.segment_capacity,
+        relation_row_capacity: progress.relation_row_capacity,
         segment_count: verified.segment_count(),
-        relation_step_count: verified.relation_step_count(),
+        completed_steps: verified.transition_count(),
+        relation_row_count: verified.relation_row_count(),
         spool_bytes: verified.spool_bytes(),
         initial_state_scalars: verified.initial().state().scalars().to_vec(),
         final_state_scalars: verified.final_boundary().state().scalars().to_vec(),
@@ -335,10 +386,10 @@ fn preflight(
 ) -> Result<(), CliError> {
     let capacity = u64::try_from(UNIFORM_ROW_COUNT)
         .map_err(|_| CliError::ProgressMismatch("segment capacity overflow"))?;
-    let segment_count = expected.completed_steps.div_ceil(capacity);
+    let worst_case_segment_count = expected.completed_steps.div_ceil(capacity);
     let maximum = u64::try_from(MAX_NATIVE_SEGMENT_COUNT)
         .map_err(|_| CliError::ProgressMismatch("segment limit overflow"))?;
-    if segment_count > maximum {
+    if worst_case_segment_count > maximum {
         return Err(CliError::EndpointMismatch(
             "segment count exceeds protocol bound",
         ));
@@ -354,14 +405,16 @@ fn preflight(
     let memory_bytes = hex::decode(&expected.memory_hex)?;
     let memory_witness_root = MemoryImage::from_checkpoint_bytes(memory_bytes)?.root();
     println!(
-        "preflight=true receipt_version={} protocol_id={} trace_schedule_sha256={} auxiliary_schedule_sha256={} steps={} segment_capacity={} segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
+        "preflight=true receipt_version={} protocol_id={} proof_composition_revision={} backend_digest_sha256={} trace_schedule_sha256={} auxiliary_schedule_sha256={} steps={} relation_row_capacity={} worst_case_segments={} input_bytes={} input_consumed={} rom_sha256={} input_sha256={} expected_checkpoint_sha256={} rom_witness_auth_root_sha256={} endpoint_memory_witness_auth_root_sha256={}",
         NATIVE_RECEIPT_VERSION,
         PROTOCOL_ID,
+        PROOF_COMPOSITION_REVISION_V2,
+        hex::encode(native_backend_digest()),
         AKITA_SCHEDULE_SHA256,
         AKITA_AUXILIARY_SCHEDULE_SHA256,
         expected.completed_steps,
         capacity,
-        segment_count,
+        worst_case_segment_count,
         input.len(),
         expected.state.input_log.next_index(),
         hex::encode(identities.rom),
@@ -391,10 +444,16 @@ enum SpoolRecovery {
 #[derive(Clone, Copy)]
 struct VerifiedProgress<'a> {
     segment_count: u64,
-    relation_step_count: u64,
+    transition_count: u64,
+    relation_row_count: u64,
     spool_bytes: u64,
     final_boundary: &'a NativeBoundary,
     final_memory: &'a MemoryCommitment,
+}
+
+struct PackedSegment {
+    blocks: Vec<BasicBlock>,
+    completed_steps: u64,
 }
 
 fn spool_recovery(actual: u64, checkpointed: u64) -> Result<SpoolRecovery, CliError> {
@@ -457,7 +516,7 @@ fn resume<'a>(
             .set_len(progress.spool_bytes)
             .map_err(|source| io_error("truncate uncheckpointed tail of", &args.spool, source))?;
         spool
-            .sync_data()
+            .sync_all()
             .map_err(|source| io_error("sync", &args.spool, source))?;
     }
     let prover = NativeReceiptStreamProver::resume(committed_rom, spool)?;
@@ -471,7 +530,8 @@ fn resume<'a>(
         &progress,
         VerifiedProgress {
             segment_count: prover.segment_count(),
-            relation_step_count: prover.relation_step_count(),
+            transition_count: prover.transition_count(),
+            relation_row_count: prover.relation_row_count(),
             spool_bytes: prover.spooled_bytes(),
             final_boundary,
             final_memory,
@@ -485,24 +545,20 @@ fn resume<'a>(
         input.to_vec(),
         progress.state,
     )?;
-    Ok((
-        builder,
-        initial_memory,
-        progress.relation_step_count,
-        prover,
-    ))
+    Ok((builder, initial_memory, progress.completed_steps, prover))
 }
 
 fn validate_verified_progress(
     progress: &ProverProgress,
     verified: VerifiedProgress<'_>,
 ) -> Result<CommittedMemory, CliError> {
-    if verified.segment_count != progress.segment_count
-        || verified.relation_step_count != progress.relation_step_count
-        || verified.spool_bytes != progress.spool_bytes
-    {
-        return Err(CliError::ProgressMismatch("verified spool counters differ"));
-    }
+    validate_verified_counters(
+        progress,
+        verified.segment_count,
+        verified.transition_count,
+        verified.relation_row_count,
+        verified.spool_bytes,
+    )?;
     let checkpoint_state = zksm83_jolt::NativeStateBoundary::from_vm_state(progress.state);
     if verified.final_boundary.state() != checkpoint_state {
         return Err(CliError::ProgressMismatch(
@@ -522,6 +578,23 @@ fn validate_verified_progress(
     Ok(checkpoint_memory)
 }
 
+fn validate_verified_counters(
+    progress: &ProverProgress,
+    segment_count: u64,
+    transition_count: u64,
+    relation_row_count: u64,
+    spool_bytes: u64,
+) -> Result<(), CliError> {
+    if segment_count != progress.segment_count
+        || transition_count != progress.completed_steps
+        || relation_row_count != progress.relation_row_count
+        || spool_bytes != progress.spool_bytes
+    {
+        return Err(CliError::ProgressMismatch("verified spool counters differ"));
+    }
+    Ok(())
+}
+
 fn prove_segments(
     args: &Args,
     expected: &ExpectedCheckpoint,
@@ -530,47 +603,72 @@ fn prove_segments(
     initial_memory: &mut CommittedMemory,
     completed: u64,
     prover: &mut FileProver<'_>,
-) -> Result<(), CliError> {
-    if completed != prover.relation_step_count() || completed > expected.completed_steps {
+) -> Result<u64, CliError> {
+    if completed != prover.transition_count() {
         return Err(CliError::ProgressMismatch(
-            "relation-step cursor is invalid",
+            "completed-step cursor differs from verified spool",
         ));
     }
-    let capacity = u64::try_from(UNIFORM_ROW_COUNT)
-        .map_err(|_| CliError::ProgressMismatch("segment capacity overflow"))?;
+    if completed > expected.completed_steps {
+        return Err(CliError::ProgressMismatch(
+            "completed-step cursor is invalid",
+        ));
+    }
     let mut new_segments = 0_u64;
-    while prover.relation_step_count() < expected.completed_steps {
+    let mut completed_steps = completed;
+    while completed_steps < expected.completed_steps {
         if args
             .segment_limit
             .is_some_and(|limit| new_segments >= limit)
         {
             break;
         }
-        let remaining = expected.completed_steps - prover.relation_step_count();
-        let segment_steps = remaining.min(capacity);
+        let remaining = expected.completed_steps - completed_steps;
         let started = Instant::now();
         let phases_before = native_proof_phase_metrics();
-        let witness = builder.run_exact_steps(segment_steps)?;
-        let native_trace = NativeTraceWitness::from_witness(&witness)?;
+        let planned = fill_packed_segment(builder, remaining)?;
+        let segment_steps = planned.completed_steps;
+        let packed_trace = BlockCpuWitness::from_blocks(&planned.blocks)?;
+        if u64::try_from(packed_trace.transition_count())
+            .map_err(|_| CliError::ProgressMismatch("packed transition count overflow"))?
+            != segment_steps
+        {
+            return Err(CliError::ProgressMismatch(
+                "packed transition count differs from emulator cursor",
+            ));
+        }
+        let segment_relation_rows = packed_trace.active_block_count();
         let final_bytes = builder.checkpoint_memory();
         let final_memory = commit_memory(&final_bytes)?;
         prover.append(NativeSegmentWitness::new(
-            &native_trace,
+            &packed_trace,
             initial_memory,
             &final_memory,
         ))?;
+        let authenticated_steps = prover.transition_count();
+        let expected_steps = completed_steps
+            .checked_add(segment_steps)
+            .ok_or(CliError::ProgressMismatch("completed-step cursor overflow"))?;
+        if authenticated_steps != expected_steps {
+            return Err(CliError::ProgressMismatch(
+                "proved transition count differs from emulator cursor",
+            ));
+        }
         prover.sync_spool()?;
         *initial_memory = final_memory;
+        completed_steps = authenticated_steps;
         new_segments = new_segments
             .checked_add(1)
             .ok_or(CliError::ProgressMismatch("segment counter overflow"))?;
         write_progress(args, identities, builder, prover)?;
         let phases = native_proof_phase_metrics().since(phases_before);
         println!(
-            "segment={} steps={} total_steps={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} commit_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
+            "segment={} steps={} segment_relation_rows={} completed_steps={} relation_rows={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} commit_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
             prover.segment_count() - 1,
             segment_steps,
-            prover.relation_step_count(),
+            segment_relation_rows,
+            completed_steps,
+            prover.relation_row_count(),
             prover.spooled_bytes(),
             started.elapsed().as_secs_f64(),
             phases.setup().as_secs_f64(),
@@ -580,7 +678,53 @@ fn prove_segments(
             phases.encode().as_secs_f64()
         );
     }
-    Ok(())
+    Ok(completed_steps)
+}
+
+fn fill_packed_segment(
+    builder: &mut TraceBuilder,
+    maximum_steps: u64,
+) -> Result<PackedSegment, CliError> {
+    fill_packed_segment_with_capacity(builder, maximum_steps, UNIFORM_ROW_COUNT)
+}
+
+fn fill_packed_segment_with_capacity(
+    builder: &mut TraceBuilder,
+    maximum_steps: u64,
+    relation_row_capacity: usize,
+) -> Result<PackedSegment, CliError> {
+    if maximum_steps == 0 || relation_row_capacity == 0 {
+        return Err(CliError::ProgressMismatch("zero packed-segment bound"));
+    }
+    let mut blocks = Vec::with_capacity(relation_row_capacity);
+    let mut completed_steps = 0_u64;
+    while completed_steps < maximum_steps && blocks.len() < relation_row_capacity {
+        let remaining_rows = relation_row_capacity - blocks.len();
+        let chunk_bound = u64::try_from(remaining_rows)
+            .map_err(|_| CliError::ProgressMismatch("relation-row capacity overflow"))?;
+        let remaining_steps = maximum_steps - completed_steps;
+        let chunk_steps = remaining_steps.min(chunk_bound);
+        let source_row_offset = usize::try_from(completed_steps)
+            .map_err(|_| CliError::ProgressMismatch("segment source-row offset overflow"))?;
+        let witness = builder.run_exact_steps(chunk_steps)?;
+        let mut chunk = pack_witness_basic_blocks_at(witness, source_row_offset)?;
+        if chunk.is_empty() || chunk.len() > remaining_rows {
+            return Err(CliError::ProgressMismatch(
+                "packed chunk exceeded relation-row capacity",
+            ));
+        }
+        completed_steps = completed_steps
+            .checked_add(chunk_steps)
+            .ok_or(CliError::ProgressMismatch("completed-step cursor overflow"))?;
+        blocks.append(&mut chunk);
+    }
+    if blocks.is_empty() || completed_steps == 0 {
+        return Err(CliError::ProgressMismatch("packed segment is empty"));
+    }
+    Ok(PackedSegment {
+        blocks,
+        completed_steps,
+    })
 }
 
 fn write_progress(
@@ -593,14 +737,17 @@ fn write_progress(
         schema: PROGRESS_SCHEMA.to_owned(),
         receipt_version: NATIVE_RECEIPT_VERSION,
         protocol_id: PROTOCOL_ID.to_owned(),
+        proof_composition_revision: PROOF_COMPOSITION_REVISION_V2.to_owned(),
+        backend_digest_sha256: hex::encode(native_backend_digest()),
         trace_schedule_sha256: AKITA_SCHEDULE_SHA256.to_owned(),
         auxiliary_schedule_sha256: AKITA_AUXILIARY_SCHEDULE_SHA256.to_owned(),
         rom_sha256: hex::encode(identities.rom),
         input_sha256: hex::encode(identities.input),
         expected_checkpoint_sha256: hex::encode(identities.expected),
-        segment_capacity: UNIFORM_ROW_COUNT,
+        relation_row_capacity: UNIFORM_ROW_COUNT,
         segment_count: prover.segment_count(),
-        relation_step_count: prover.relation_step_count(),
+        completed_steps: prover.transition_count(),
+        relation_row_count: prover.relation_row_count(),
         spool_bytes: prover.spooled_bytes(),
         state: builder.state(),
         memory_hex: hex::encode(builder.checkpoint_memory()),
@@ -624,16 +771,33 @@ fn finalize(args: &Args, prover: FileProver<'_>) -> Result<(), CliError> {
     receipt
         .sync_all()
         .map_err(|source| io_error("sync", &receipt_partial, source))?;
+    let statement_bytes = statement.to_bytes()?;
+    if args.statement.exists() {
+        let existing = read_bounded(
+            &args.statement,
+            "existing statement",
+            u64::try_from(MAX_NATIVE_STATEMENT_BYTES)
+                .map_err(|_| CliError::FinalArtifactMismatch("statement size bound"))?,
+        )?;
+        if existing != statement_bytes {
+            return Err(CliError::FinalArtifactMismatch("statement"));
+        }
+    } else {
+        write_new(&args.statement, &statement_bytes)?;
+    }
+    require_absent(&args.receipt)?;
     fs::rename(&receipt_partial, &args.receipt)
         .map_err(|source| io_error("publish", &args.receipt, source))?;
-    write_new(&args.statement, &statement.to_bytes()?)?;
+    sync_parent_directory(&args.receipt)?;
     println!(
-        "complete receipt_version={} protocol_id={} statement_id={} segments={} steps={}",
+        "complete receipt_version={} protocol_id={} proof_composition_revision={} statement_id={} segments={} transitions={} relation_rows={}",
         statement.protocol().code(),
         PROTOCOL_ID,
+        PROOF_COMPOSITION_REVISION_V2,
         hex::encode(statement.statement_id()),
         statement.segment_count(),
-        statement.relation_step_count()
+        statement.transition_count(),
+        statement.relation_row_count()
     );
     Ok(())
 }
@@ -708,13 +872,43 @@ fn validate_progress(
     }
     if progress.receipt_version != NATIVE_RECEIPT_VERSION
         || progress.protocol_id != PROTOCOL_ID
+        || progress.proof_composition_revision != PROOF_COMPOSITION_REVISION_V2
+        || progress.backend_digest_sha256 != hex::encode(native_backend_digest())
         || progress.trace_schedule_sha256 != AKITA_SCHEDULE_SHA256
         || progress.auxiliary_schedule_sha256 != AKITA_AUXILIARY_SCHEDULE_SHA256
     {
         return Err(CliError::ProgressMismatch("protocol identity"));
     }
-    if progress.segment_capacity != UNIFORM_ROW_COUNT {
-        return Err(CliError::ProgressMismatch("segment capacity"));
+    if progress.relation_row_capacity != UNIFORM_ROW_COUNT {
+        return Err(CliError::ProgressMismatch("relation-row capacity"));
+    }
+    let maximum_segments = u64::try_from(MAX_NATIVE_SEGMENT_COUNT)
+        .map_err(|_| CliError::ProgressMismatch("segment limit overflow"))?;
+    let row_capacity = u64::try_from(UNIFORM_ROW_COUNT)
+        .map_err(|_| CliError::ProgressMismatch("relation-row capacity overflow"))?;
+    let maximum_rows = progress
+        .segment_count
+        .checked_mul(row_capacity)
+        .ok_or(CliError::ProgressMismatch("relation-row count overflow"))?;
+    let maximum_transitions = progress
+        .relation_row_count
+        .checked_mul(
+            u64::try_from(BASIC_BLOCK_INSTRUCTION_BOUND)
+                .map_err(|_| CliError::ProgressMismatch("transition bound overflow"))?,
+        )
+        .ok_or(CliError::ProgressMismatch("transition count overflow"))?;
+    if progress.segment_count == 0
+        || progress.segment_count > maximum_segments
+        || progress.relation_row_count == 0
+        || progress.completed_steps == 0
+        || progress.segment_count > progress.relation_row_count
+        || progress.relation_row_count > maximum_rows
+        || progress.relation_row_count > progress.completed_steps
+        || progress.completed_steps > maximum_transitions
+        || progress.spool_bytes == 0
+        || progress.spool_bytes > MAX_NATIVE_STREAM_RECEIPT_BYTES
+    {
+        return Err(CliError::ProgressMismatch("progress counters"));
     }
     if progress.rom_sha256 != hex::encode(identities.rom)
         || progress.input_sha256 != hex::encode(identities.input)
@@ -761,121 +955,6 @@ fn expand_schedule(schedule: InputSchedule) -> Result<Vec<u8>, CliError> {
             .fill(segment.value);
     }
     Ok(bytes)
-}
-
-fn read_bounded(path: &Path, kind: &'static str, maximum: u64) -> Result<Vec<u8>, CliError> {
-    let metadata = fs::metadata(path).map_err(|source| io_error("inspect", path, source))?;
-    if metadata.len() > maximum {
-        return Err(CliError::FileTooLarge {
-            kind,
-            path: path.display().to_string(),
-            maximum,
-        });
-    }
-    fs::read(path).map_err(|source| io_error("read", path, source))
-}
-
-fn open_new(path: &Path) -> Result<File, CliError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| io_error("create", path, source))
-}
-
-fn open_existing(path: &Path) -> Result<File, CliError> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|source| io_error("open", path, source))
-}
-
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let mut file = open_new(path)?;
-    file.write_all(bytes)
-        .map_err(|source| io_error("write", path, source))?;
-    file.sync_all()
-        .map_err(|source| io_error("sync", path, source))
-}
-
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let temporary = partial_path(path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)
-        .map_err(|source| io_error("create", &temporary, source))?;
-    file.write_all(bytes)
-        .map_err(|source| io_error("write", &temporary, source))?;
-    file.sync_all()
-        .map_err(|source| io_error("sync", &temporary, source))?;
-    fs::rename(&temporary, path).map_err(|source| io_error("publish", path, source))
-}
-
-fn require_absent(path: &Path) -> Result<(), CliError> {
-    if path.exists() {
-        Err(CliError::OutputExists(path.display().to_string()))
-    } else {
-        Ok(())
-    }
-}
-
-fn partial_path(path: &Path) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(".partial");
-    PathBuf::from(value)
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-fn sha256_reader(
-    reader: &mut (impl Read + Seek),
-    expected_length: u64,
-    path: &Path,
-) -> Result<[u8; 32], CliError> {
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("seek", path, source))?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut total = 0_u64;
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|source| io_error("read", path, source))?;
-        if read == 0 {
-            break;
-        }
-        total = total
-            .checked_add(
-                u64::try_from(read)
-                    .map_err(|_| CliError::ProgressMismatch("file hash length overflow"))?,
-            )
-            .ok_or(CliError::ProgressMismatch("file hash length overflow"))?;
-        let chunk = buffer
-            .get(..read)
-            .ok_or(CliError::ProgressMismatch("file hash buffer range"))?;
-        hash.update(chunk);
-    }
-    if total != expected_length {
-        return Err(CliError::ProgressMismatch(
-            "spool length changed while hashing",
-        ));
-    }
-    Ok(hash.finalize().into())
-}
-
-fn io_error(operation: &'static str, path: &Path, source: io::Error) -> CliError {
-    CliError::Io {
-        operation,
-        path: path.display().to_string(),
-        source,
-    }
 }
 
 #[cfg(test)]

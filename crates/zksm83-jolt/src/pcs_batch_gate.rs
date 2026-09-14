@@ -181,7 +181,7 @@ struct GateProof {
 /// This function performs real PCS work but never proves an SM83 relation. The
 /// CLI invokes it only in a child process that the parent kills at its deadline.
 /// The candidate bytes are local experimental input and are not admitted into
-/// the version-one receipt protocol.
+/// the current version-two receipt protocol.
 pub fn run_pcs_batch_gate_worker(
     mode: PcsBatchGateMode,
     candidate_schedule: &[u8],
@@ -411,13 +411,8 @@ fn evaluate_mle(
     }
     let mut folded = evaluations.to_vec();
     for challenge in point {
-        let mut next = Vec::with_capacity(folded.len() / 2);
-        for pair in folded.chunks_exact(2) {
-            let low = pair.first().copied().ok_or(PcsBatchGateError::Shape)?;
-            let high = pair.get(1).copied().ok_or(PcsBatchGateError::Shape)?;
-            next.push(low + *challenge * (high - low));
-        }
-        folded = next;
+        crate::field_fold::fold_binary_layer(&mut folded, *challenge)
+            .map_err(|_| PcsBatchGateError::Shape)?;
     }
     folded.first().copied().ok_or(PcsBatchGateError::Shape)
 }

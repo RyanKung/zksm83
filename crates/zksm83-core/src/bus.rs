@@ -492,6 +492,12 @@ impl StepEffects {
     pub fn bus_events(&self) -> impl ExactSizeIterator<Item = &BusEvent> {
         self.bus_events.iter()
     }
+
+    /// Borrows the complete ordered bus-effect sequence without allocation.
+    #[must_use]
+    pub fn ordered_bus_events(&self) -> &[BusEvent] {
+        &self.bus_events
+    }
 }
 
 /// Public discriminator for an opcode step or a DMG machine transition.
@@ -503,12 +509,10 @@ pub enum StepKind {
     HaltIdle,
     /// HALT advances exactly to the next VBlank under the constrained quiet-device preconditions.
     HaltUntilVBlank,
-    /// Pokémon Blue's authenticated sound wait loop advances without crossing VBlank.
-    BlueSoundWait,
-    /// Pokémon Blue's ROM-bound pure DE delay loop executes to completion with IME disabled.
-    BlueDelayLoop,
-    /// The authenticated HRAM OAM-DMA wait loop schedules every remaining copy at once.
-    BlueDmaWait,
+    /// HALT advances exactly to completion of a guarded internal-clock serial transfer.
+    HaltUntilSerial,
+    /// HALT advances to the M-cycle containing a guarded timer reload interrupt.
+    HaltUntilTimer,
     /// HALT exits without dispatch because IME is disabled.
     HaltWake,
     /// The CPU acknowledges and dispatches the selected interrupt.

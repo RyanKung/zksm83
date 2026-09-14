@@ -1,8 +1,8 @@
 //! Ordered mutable-memory proof over the fixed 128-KiB checkpoint table.
 
+mod block_event;
 pub(crate) mod boundary;
 pub(crate) mod clock;
-mod event;
 pub(crate) mod sum;
 #[cfg(test)]
 mod tests;
@@ -12,8 +12,10 @@ use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
 
 use crate::{
-    AKITA_MEMORY_SCHEDULE_SHA256, AkitaWorkerError, NativeField, NativeProtocolVersion,
-    NativeTraceWitness, TRACE_MEMORY_TIMESTAMP_BITS, UniformError, WitnessCommitments,
+    AKITA_MEMORY_SCHEDULE_SHA256, AkitaWorkerError, BLOCK_CPU_COLUMN_COUNT, BlockCpuWitness,
+    NativeField, NativeProtocolVersion, TRACE_MEMORY_TIMESTAMP_BITS, UniformError,
+    WitnessCommitments,
+    block_memory::BLOCK_MEMORY_ROW_BITS_START,
     pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
     sumcheck::ProductSumcheckError,
     uniform::{
@@ -40,6 +42,7 @@ const MEMORY_LAYOUT: PcsLayout = PcsLayout::new(
     b"zksm83-native-memory-opening/v1",
 );
 const CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-memory-challenges/v1";
+const PACKED_TRACE_DOMAIN: &[u8] = b"zksm83/native-packed-memory-trace/v2";
 
 /// Prover-owned mutable-memory image and its verifier-visible commitment.
 pub struct CommittedMemory {
@@ -57,9 +60,9 @@ struct CommittedMemoryColumns {
     inner: CommittedColumns,
 }
 
-/// Transparent proof that trace memory events transform one committed image into another.
+/// Transparent packed-block proof of the same mutable-memory boundary law.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MutableMemoryProof {
+pub struct PackedMutableMemoryProof {
     pub(crate) final_timestamps: ColumnCommitments,
     pub(crate) trace_inverses: WitnessCommitments,
     pub(crate) initial_inverses: ColumnCommitments,
@@ -172,17 +175,20 @@ pub fn commit_memory(image: &[u8]) -> Result<CommittedMemory, MutableMemoryError
     })
 }
 
-/// Proves latest-value ordering and exact initial/final mutable-memory images.
-pub fn prove_mutable_memory(
-    trace: &NativeTraceWitness,
+/// Proves packed-block latest-value ordering and exact memory boundaries.
+pub fn prove_packed_mutable_memory(
+    trace: &BlockCpuWitness,
     trace_witness: &CommittedWitness,
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
-) -> Result<MutableMemoryProof, MutableMemoryError> {
+) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
     let protocol = NativeProtocolVersion::current();
+    if trace.columns().len() != BLOCK_CPU_COLUMN_COUNT {
+        return Err(MutableMemoryError::Shape);
+    }
     initial.commitment.validate()?;
     final_memory.commitment.validate()?;
-    let final_timestamps = commit_u64_columns(&[trace.final_memory_timestamps().to_vec()])?;
+    let final_timestamps = commit_u64_column(trace.final_memory_timestamps())?;
     let phase_one = phase_one_descriptor(
         protocol,
         trace_witness.commitments(),
@@ -191,15 +197,15 @@ pub fn prove_mutable_memory(
         final_timestamps.commitments(),
     )?;
     let challenges = challenges(&phase_one)?;
-    let trace_inverse_columns = event::inverse_columns(trace, challenges)?;
+    let trace_inverse_columns = block_event::inverse_columns(trace, challenges)?;
     let trace_inverses = crate::commit_witness(&trace_inverse_columns)?;
     let (initial_inverse_values, final_inverse_values) =
         boundary::inverse_columns(initial, final_memory, &final_timestamps, challenges)?;
     let initial_inverses = commit_u64_columns(&initial_inverse_values)?;
     let final_inverses = commit_u64_columns(&final_inverse_values)?;
-    let relation = event::MemoryEventRelation::new(challenges);
+    let relation = block_event::BlockMemoryEventRelation::new(challenges);
     let event_relation = prove_uniform_composite(&relation, trace_witness, &trace_inverses)?;
-    let clock = clock::prove(trace_witness, &phase_one)?;
+    let clock = clock::prove_at(trace_witness, &phase_one, BLOCK_MEMORY_ROW_BITS_START)?;
     let full = full_descriptor(
         protocol,
         &phase_one,
@@ -217,7 +223,7 @@ pub fn prove_mutable_memory(
         &full,
     )?;
     let multiset_sum = sum::prove(&trace_inverses, &initial_inverses, &final_inverses, &full)?;
-    Ok(MutableMemoryProof {
+    Ok(PackedMutableMemoryProof {
         final_timestamps: final_timestamps.into_commitments(),
         trace_inverses: trace_inverses.into_commitments(),
         initial_inverses: initial_inverses.into_commitments(),
@@ -229,14 +235,14 @@ pub fn prove_mutable_memory(
     })
 }
 
-/// Verifies mutable-memory consistency without receiving images or replaying execution.
-pub fn verify_mutable_memory(
-    proof: &MutableMemoryProof,
+/// Verifies packed-block mutable-memory consistency without execution replay.
+pub fn verify_packed_mutable_memory(
+    proof: &PackedMutableMemoryProof,
     trace: &WitnessCommitments,
     initial: &MemoryCommitment,
     final_memory: &MemoryCommitment,
 ) -> Result<(), MutableMemoryError> {
-    verify_mutable_memory_for_protocol(
+    verify_packed_mutable_memory_for_protocol(
         NativeProtocolVersion::current(),
         proof,
         trace,
@@ -245,9 +251,9 @@ pub fn verify_mutable_memory(
     )
 }
 
-pub(crate) fn verify_mutable_memory_for_protocol(
+pub(crate) fn verify_packed_mutable_memory_for_protocol(
     protocol: NativeProtocolVersion,
-    proof: &MutableMemoryProof,
+    proof: &PackedMutableMemoryProof,
     trace: &WitnessCommitments,
     initial: &MemoryCommitment,
     final_memory: &MemoryCommitment,
@@ -265,7 +271,7 @@ pub(crate) fn verify_mutable_memory_for_protocol(
         &proof.final_timestamps,
     )?;
     let challenges = challenges(&phase_one)?;
-    let relation = event::MemoryEventRelation::new(challenges);
+    let relation = block_event::BlockMemoryEventRelation::new(challenges);
     verify_uniform_composite_for_protocol(
         protocol,
         &relation,
@@ -273,7 +279,13 @@ pub(crate) fn verify_mutable_memory_for_protocol(
         &proof.trace_inverses,
         &proof.event_relation,
     )?;
-    clock::verify(protocol, trace, &phase_one, &proof.clock)?;
+    clock::verify_at(
+        protocol,
+        trace,
+        &phase_one,
+        &proof.clock,
+        BLOCK_MEMORY_ROW_BITS_START,
+    )?;
     let full = full_descriptor(
         protocol,
         &phase_one,
@@ -326,6 +338,17 @@ fn commit_u64_columns(values: &[Vec<u64>]) -> Result<CommittedMemoryColumns, Mut
     })
 }
 
+fn commit_u64_column(value: &[u64]) -> Result<CommittedMemoryColumns, MutableMemoryError> {
+    if value.len() != MEMORY_IMAGE_BYTES {
+        return Err(MutableMemoryError::Shape);
+    }
+    on_worker(|| {
+        Ok(CommittedMemoryColumns {
+            inner: commit_columns(MEMORY_LAYOUT, &[value])?,
+        })
+    })
+}
+
 fn phase_one_descriptor(
     protocol: NativeProtocolVersion,
     trace: &WitnessCommitments,
@@ -336,6 +359,7 @@ fn phase_one_descriptor(
     let mut descriptor = Vec::new();
     push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
     push_bytes(&mut descriptor, AKITA_MEMORY_SCHEDULE_SHA256.as_bytes())?;
+    push_bytes(&mut descriptor, PACKED_TRACE_DOMAIN)?;
     push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
     push_bytes(&mut descriptor, &initial.canonical_bytes()?)?;
     push_bytes(&mut descriptor, &final_memory.canonical_bytes()?)?;
@@ -447,13 +471,8 @@ fn evaluate_field_column(
     }
     let mut values = values.to_vec();
     for coordinate in point {
-        let mut folded = Vec::with_capacity(values.len() / 2);
-        for pair in values.chunks_exact(2) {
-            let zero = pair.first().copied().ok_or(MutableMemoryError::Shape)?;
-            let one = pair.get(1).copied().ok_or(MutableMemoryError::Shape)?;
-            folded.push(zero + *coordinate * (one - zero));
-        }
-        values = folded;
+        crate::field_fold::fold_binary_layer(&mut values, *coordinate)
+            .map_err(|_| MutableMemoryError::Shape)?;
     }
     values.first().copied().ok_or(MutableMemoryError::Shape)
 }

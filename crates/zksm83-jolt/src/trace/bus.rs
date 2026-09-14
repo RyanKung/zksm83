@@ -18,15 +18,16 @@ pub(super) fn append_bus(
     row_index: usize,
     memory_order: &mut MemoryOrderTracker,
 ) -> Result<(), NativeTraceError> {
-    let events = row.effects().bus_events().collect::<Vec<_>>();
-    if events.len() > TRACE_BUS_SLOTS {
+    let events = row.effects().ordered_bus_events();
+    let event_count = events.len();
+    if event_count > TRACE_BUS_SLOTS {
         return Err(NativeTraceError::TooManyBusEvents { index: row_index });
     }
-    for slot in 0..TRACE_BUS_SLOTS {
-        match events.get(slot).copied() {
-            Some(event) => append_bus_event(columns, slot, row_index, event, memory_order)?,
-            None => append_empty_bus_slot(columns, slot)?,
-        }
+    for (slot, event) in events.iter().enumerate() {
+        append_bus_event(columns, slot, row_index, event, memory_order)?;
+    }
+    for slot in event_count..TRACE_BUS_SLOTS {
+        append_empty_bus_slot(columns, slot)?;
     }
     Ok(())
 }

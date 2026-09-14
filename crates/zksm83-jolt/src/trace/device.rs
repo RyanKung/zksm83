@@ -1,14 +1,17 @@
 use zksm83_core::{BusEventKind, DmgInterrupt, StepKind, VmState};
 use zksm83_trace::TraceRow;
 
-use crate::{TRACE_BUS_SLOTS, TRACE_SUMMARY_AUX};
+use crate::{TRACE_BUS_SLOTS, TRACE_MEMORY_SLOT_WIDTH, TRACE_MEMORY_START};
 
 use super::{NativeTraceError, append_bits};
+
+mod timer;
 
 const INTERRUPT_BITS: usize = 5;
 
 /// First bit decomposing the before-state IF request mask.
-pub const TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START: usize = TRACE_SUMMARY_AUX + 1;
+pub const TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START: usize =
+    TRACE_MEMORY_START + TRACE_BUS_SLOTS * TRACE_MEMORY_SLOT_WIDTH;
 /// First bit decomposing the before-state IE enable mask.
 pub const TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START: usize =
     TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START + INTERRUPT_BITS;
@@ -123,7 +126,9 @@ pub(crate) const TRACE_AFTER_DMA_REMAINING_BITS_START: usize =
 pub(crate) const TRACE_CPU_OAM_ACCESS_START: usize = TRACE_AFTER_DMA_REMAINING_BITS_START + 8;
 pub(crate) const TRACE_SERIAL_COMPLETION_GAP_BITS_START: usize =
     TRACE_CPU_OAM_ACCESS_START + TRACE_BUS_SLOTS;
-pub(super) const TRACE_DEVICE_COLUMN_END: usize = TRACE_SERIAL_COMPLETION_GAP_BITS_START + 5;
+pub(crate) const TRACE_TIMER_INTERRUPT_GAP_BITS_START: usize =
+    TRACE_SERIAL_COMPLETION_GAP_BITS_START + 5;
+pub(super) const TRACE_DEVICE_COLUMN_END: usize = TRACE_TIMER_INTERRUPT_GAP_BITS_START + 2;
 
 pub(super) fn append_state_bits(
     columns: &mut [Vec<u64>],
@@ -195,9 +200,7 @@ pub(super) fn append_bus_access_witness(
     columns: &mut [Vec<u64>],
     row: Option<&TraceRow>,
 ) -> Result<(), NativeTraceError> {
-    let events = row
-        .map(|row| row.effects().bus_events().collect::<Vec<_>>())
-        .unwrap_or_default();
+    let events = row.map_or(&[][..], |row| row.effects().ordered_bus_events());
     for slot in 0..TRACE_BUS_SLOTS {
         let oam = events.get(slot).is_some_and(|event| {
             let address = event.transcript_event().address;
@@ -480,7 +483,10 @@ pub(super) fn append_serial_witness(
     let regular = row.is_some_and(|row| {
         matches!(
             row.effects().kind(),
-            StepKind::Instruction | StepKind::HaltIdle | StepKind::InterruptDispatch(_)
+            StepKind::Instruction
+                | StepKind::HaltIdle
+                | StepKind::HaltUntilSerial
+                | StepKind::InterruptDispatch(_)
         )
     });
     let gap = if regular && countdown != 0 && after_countdown == 0 {
@@ -554,7 +560,8 @@ pub(super) fn append_timer_witness(
         append_bits(columns, start + 37, u64::from(reload_phase), 3)?;
         super::append(columns, start + 40, u64::from(divider_wraps))?;
     }
-    append_timer_long_quotient(columns, before, increment, row)
+    append_timer_long_quotient(columns, before, increment, row)?;
+    timer::append_interrupt_gap(columns, before, increment, row)
 }
 
 fn timer_post_write(
@@ -621,10 +628,7 @@ fn append_timer_long_quotient(
     let long = row.is_some_and(|row| {
         matches!(
             row.effects().kind(),
-            StepKind::HaltUntilVBlank
-                | StepKind::BlueSoundWait
-                | StepKind::BlueDelayLoop
-                | StepKind::BlueDmaWait
+            StepKind::HaltUntilVBlank | StepKind::HaltUntilSerial | StepKind::HaltUntilTimer
         )
     });
     let quotient = if long {
@@ -902,12 +906,10 @@ pub(super) fn append_joypad_witness(
     }) {
         interrupt = false;
     }
-    let events = row
-        .map(|row| row.effects().bus_events().collect::<Vec<_>>())
-        .unwrap_or_default();
+    let events = row.map_or(&[][..], |row| row.effects().ordered_bus_events());
     for slot in 0..TRACE_BUS_SLOTS {
         let visible_before = visible_joypad(select, buttons);
-        let event = events.get(slot).copied();
+        let event = events.get(slot);
         let mut joypad_write = false;
         if let Some(event) = event {
             let tuple = event.transcript_event();

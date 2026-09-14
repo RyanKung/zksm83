@@ -1,11 +1,12 @@
 //! Canonical fixed-row native witness columns derived from validated SM83 rows.
 
 mod bus;
+mod cpu_semantic;
 mod daa;
 pub(crate) mod device;
-mod lookup;
 mod memory;
-mod summary;
+pub(crate) mod mode;
+mod padding;
 #[cfg(test)]
 mod tests;
 mod word;
@@ -15,9 +16,15 @@ use zksm83_core::{DmgInterrupt, StepKind, VmState};
 use zksm83_trace::{TraceRow, Witness};
 
 use crate::{
-    ISA_ADDRESS_BIT_COUNT, ISA_OUTPUT_COUNT, ISA_TABLE_ROW_COUNT, IsaLookupColumns, IsaLookupError,
-    ROM_ADDRESS_BIT_COUNT, RomLookupColumns, RomLookupError, STATE_SCALAR_COUNT, UNIFORM_ROW_COUNT,
-    encode_state_scalars, fixed_isa_table,
+    ISA_ADDRESS_BIT_COUNT, ISA_OUTPUT_COUNT, ISA_PADDING_ADDRESS, ISA_TABLE_ROW_COUNT,
+    ROM_ADDRESS_BIT_COUNT, STATE_SCALAR_COUNT, UNIFORM_ROW_COUNT, encode_state_scalars,
+    fixed_isa_table,
+};
+pub(crate) use cpu_semantic::{
+    CPU_BOUNDARY_AUX_COLUMN_COUNT, CPU_LANE_AUX_COLUMN_COUNT, CPU_SEMANTIC_AUX_COLUMN_COUNT,
+    CpuSemanticAuxEncoder, PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_DERIVED_SCALAR_COUNT,
+    cpu_semantic_legacy_column, packed_cpu_aux_offset, packed_cpu_derived_scalar,
+    packed_cpu_derived_scalar_at,
 };
 pub use device::{
     TRACE_AFTER_DMA_BITS_START, TRACE_AFTER_INTERRUPT_ENABLE_BITS_START,
@@ -27,7 +34,7 @@ pub use device::{
     TRACE_JOYPAD_STAGE_BITS_START, TRACE_JOYPAD_STAGE_WIDTH, TRACE_JOYPAD_WRITE_START,
     TRACE_PENDING_INTERRUPT,
 };
-pub(crate) use lookup::{canonical_isa_lookup_columns, canonical_rom_lookup_columns};
+use mode::TraceMode;
 
 /// First column of the row's pre-state boundary.
 pub const TRACE_BEFORE_STATE_START: usize = 0;
@@ -35,10 +42,10 @@ pub const TRACE_BEFORE_STATE_START: usize = 0;
 pub const TRACE_AFTER_STATE_START: usize = TRACE_BEFORE_STATE_START + STATE_SCALAR_COUNT;
 /// Boolean selector for a real transition rather than canonical padding.
 pub const TRACE_ACTIVE: usize = TRACE_AFTER_STATE_START + STATE_SCALAR_COUNT;
-/// First column of ten one-hot transition modes, including padding mode six.
+/// First column of seven one-hot transition modes, including padding mode six.
 pub const TRACE_MODE_START: usize = TRACE_ACTIVE + 1;
 /// Number of one-hot transition modes, including one canonical padding mode.
-pub const TRACE_MODE_COUNT: usize = 10;
+pub const TRACE_MODE_COUNT: usize = TraceMode::COUNT;
 /// First column of five one-hot interrupt sources.
 pub const TRACE_INTERRUPT_START: usize = TRACE_MODE_START + TRACE_MODE_COUNT;
 /// Number of priority-ordered DMG interrupt-source selectors.
@@ -196,15 +203,15 @@ pub const TRACE_MEMORY_PREDECESSOR_BITS_OFFSET: usize = 4;
 pub const TRACE_MEMORY_DELTA_BITS_OFFSET: usize = 21;
 /// Number of bits in ordered-memory timestamps and deltas.
 pub const TRACE_MEMORY_TIMESTAMP_BITS: usize = 17;
-/// Summary-specific quotient or iteration count; zero outside Blue summary rows.
-pub const TRACE_SUMMARY_AUX: usize = TRACE_MEMORY_START + TRACE_BUS_SLOTS * TRACE_MEMORY_SLOT_WIDTH;
-/// Total logical columns in the initial native CPU/ISA trace schema.
+/// Total logical columns in the one-transition reference schema.
 pub const NATIVE_TRACE_COLUMN_COUNT: usize = device::TRACE_DEVICE_COLUMN_END;
 
-const PADDING_MODE: usize = 6;
-const PADDING_ISA_ADDRESS: usize = 0xd3;
+const PADDING_MODE: usize = TraceMode::Padding.index();
 
-/// Fixed-shape witness plane built only from `StepRelation`-validated rows.
+/// Fixed-shape reference projection built from `StepRelation`-validated rows.
+///
+/// This type feeds packed-lane semantic construction and focused relation
+/// checks. It has no receipt or wire representation.
 #[derive(Debug)]
 pub struct NativeTraceWitness {
     columns: Vec<Vec<u64>>,
@@ -214,7 +221,7 @@ pub struct NativeTraceWitness {
     final_memory_timestamps: Vec<u64>,
 }
 
-/// Failure to encode validated native trace rows into canonical proof columns.
+/// Failure to encode validated rows into canonical reference columns.
 #[derive(Debug, Error)]
 pub enum NativeTraceError {
     /// At least one validated transition row is required.
@@ -252,12 +259,6 @@ pub enum NativeTraceError {
     /// Construction of the fixed ISA lookup table failed.
     #[error(transparent)]
     Isa(#[from] crate::IsaTableError),
-    /// Construction of the shared ISA lookup-column descriptor failed.
-    #[error(transparent)]
-    IsaLookup(#[from] IsaLookupError),
-    /// Construction of the shared ROM lookup-column descriptor failed.
-    #[error(transparent)]
-    RomLookup(#[from] RomLookupError),
     /// A mutable-memory event selected an address outside the 17-bit checkpoint table.
     #[error("mutable-memory physical address 0x{physical_address:05x} exceeds 17 bits")]
     MemoryPhysicalAddressOutOfRange {
@@ -296,9 +297,7 @@ impl NativeTraceWitness {
             encode_active_row(&mut columns, row, index, &table, &mut memory_order)?;
         }
         let final_state = last.after();
-        for index in rows.len()..UNIFORM_ROW_COUNT {
-            encode_padding_row(&mut columns, final_state, index, &table)?;
-        }
+        padding::append_rows(&mut columns, final_state, rows.len(), &table)?;
         if columns
             .iter()
             .any(|column| column.len() != UNIFORM_ROW_COUNT)
@@ -314,7 +313,7 @@ impl NativeTraceWitness {
         })
     }
 
-    /// Returns all logical columns in canonical protocol order.
+    /// Returns all reference columns in canonical order.
     #[must_use]
     pub fn columns(&self) -> &[Vec<u64>] {
         &self.columns
@@ -342,16 +341,6 @@ impl NativeTraceWitness {
     #[must_use]
     pub fn final_memory_timestamps(&self) -> &[u64] {
         &self.final_memory_timestamps
-    }
-
-    /// Returns the fixed ISA lookup positions within these shared columns.
-    pub fn isa_lookup_columns(&self) -> Result<IsaLookupColumns, NativeTraceError> {
-        canonical_isa_lookup_columns().map_err(Into::into)
-    }
-
-    /// Returns immutable-ROM lookup positions within these shared columns.
-    pub fn rom_lookup_columns(&self) -> Result<RomLookupColumns, NativeTraceError> {
-        canonical_rom_lookup_columns().map_err(Into::into)
     }
 }
 
@@ -409,8 +398,7 @@ fn encode_active_row(
         .and_then(|prefix| prefix.checked_add(usize::from(aligned.key.opcode)))
         .ok_or(NativeTraceError::Layout)?;
     append_isa(columns, address, table)?;
-    bus::append_bus(columns, row, row_index, memory_order)?;
-    summary::append_aux(columns, row, increment)
+    bus::append_bus(columns, row, row_index, memory_order)
 }
 
 fn encode_padding_row(
@@ -448,9 +436,8 @@ fn encode_padding_row(
     }
     append(columns, TRACE_CYCLE_INCREMENT, 0)?;
     append(columns, TRACE_BRANCH_TAKEN, 0)?;
-    append_isa(columns, PADDING_ISA_ADDRESS, table)?;
-    bus::append_empty_bus(columns)?;
-    summary::append_empty_aux(columns)
+    append_isa(columns, usize::from(ISA_PADDING_ADDRESS), table)?;
+    bus::append_empty_bus(columns)
 }
 
 fn append_state(
@@ -926,17 +913,7 @@ fn append_bits(
 }
 
 fn append_modes(columns: &mut [Vec<u64>], kind: StepKind) -> Result<(), NativeTraceError> {
-    let mode = match kind {
-        StepKind::Instruction => 0,
-        StepKind::HaltIdle => 1,
-        StepKind::HaltUntilVBlank => 2,
-        StepKind::BlueSoundWait => 3,
-        StepKind::BlueDelayLoop => 4,
-        StepKind::BlueDmaWait => 5,
-        StepKind::HaltWake => 7,
-        StepKind::InterruptDispatch(_) => 8,
-        StepKind::DmaByte => 9,
-    };
+    let mode = TraceMode::for_step(kind).index();
     for index in 0..TRACE_MODE_COUNT {
         append(columns, TRACE_MODE_START + index, u64::from(index == mode))?;
     }

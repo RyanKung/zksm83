@@ -8,12 +8,11 @@ mod wire;
 
 use thiserror::Error;
 
-use crate::cpu::verify_native_memory_cpu_for_protocol;
 use crate::{
-    CommittedMemory, CommittedRom, MemoryCommitment, NativeCpuStructuralError,
-    NativeExecutionClaim, NativeMemoryCpuProof, NativeProtocolVersion, NativeStateBoundary,
-    NativeTraceWitness, ProtocolLogCommitments, ProtocolLogError, ROM_IMAGE_BYTES, RomCommitment,
-    UNIFORM_ROW_COUNT, commit_protocol_logs, prove_native_memory_cpu,
+    BlockCpuWitness, CommittedMemory, CommittedRom, MemoryCommitment, NativeExecutionClaim,
+    NativeProtocolVersion, NativeStateBoundary, PackedBlockProof, PackedBlockProofError,
+    PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError, ROM_IMAGE_BYTES,
+    RomCommitment, UNIFORM_ROW_COUNT, commit_packed_protocol_logs, prove_packed_block_components,
 };
 
 pub use identity::{
@@ -27,8 +26,6 @@ use self::identity::{
 };
 use self::wire::{decode_receipt, decode_statement, encode_receipt, encode_statement};
 
-/// Verification-only historical native receipt wire version.
-pub const LEGACY_NATIVE_RECEIPT_VERSION: u64 = 1;
 /// Current canonical native receipt wire version.
 pub const NATIVE_RECEIPT_VERSION: u64 = 2;
 /// Maximum canonical receipt byte length accepted by the verifier.
@@ -49,10 +46,20 @@ pub use stream::{
     verify_native_spool_reader,
 };
 
+/// Returns the digest of every consensus-relevant current proof-backend parameter.
+///
+/// Progress checkpoints use this value to reject a spool before decoding its
+/// frames when the compiled trace layout, relation, schedules, or transcript
+/// differs from the process that created it.
+#[must_use]
+pub fn native_backend_digest() -> [u8; 32] {
+    backend_digest(NativeProtocolVersion::current())
+}
+
 /// Prover-side inputs for one contiguous native trace segment.
 #[derive(Clone, Copy)]
 pub struct NativeSegmentWitness<'a> {
-    trace: &'a NativeTraceWitness,
+    trace: &'a BlockCpuWitness,
     initial_memory: &'a CommittedMemory,
     final_memory: &'a CommittedMemory,
 }
@@ -68,7 +75,8 @@ pub struct NativeStatement {
     pub(crate) initial: NativeBoundary,
     pub(crate) final_boundary: NativeBoundary,
     pub(crate) segment_count: u64,
-    pub(crate) relation_step_count: u64,
+    pub(crate) transition_count: u64,
+    pub(crate) relation_row_count: u64,
     pub(crate) m_cycle_count: u64,
     pub(crate) logs: ProtocolLogCounts,
     pub(crate) statement_id: [u8; 32],
@@ -78,6 +86,7 @@ pub struct NativeStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeSegmentReceipt {
     pub(crate) segment_index: u64,
+    pub(crate) transition_count: u64,
     pub(crate) active_row_count: u64,
     pub(crate) padded_row_count: u64,
     pub(crate) initial: NativeBoundary,
@@ -87,7 +96,7 @@ pub struct NativeSegmentReceipt {
     pub(crate) logs: ProtocolLogCommitments,
     pub(crate) m_cycle_count: u64,
     pub(crate) log_counts: ProtocolLogCounts,
-    pub(crate) proof: NativeMemoryCpuProof,
+    pub(crate) proof: PackedBlockProof,
 }
 
 /// Canonical versioned transparent receipt for one or more native segments.
@@ -142,16 +151,16 @@ pub enum NativeReceiptError {
     /// Protocol-log commitment construction or identity validation failed.
     #[error(transparent)]
     ProtocolLog(#[from] ProtocolLogError),
-    /// A composed CPU, ISA, ROM, memory, continuity, or log proof failed.
+    /// A packed CPU, ISA, ROM, memory, continuity, or log proof failed.
     #[error(transparent)]
-    Proof(#[from] NativeCpuStructuralError),
+    Proof(#[from] PackedBlockProofError),
 }
 
 impl<'a> NativeSegmentWitness<'a> {
     /// Creates one segment input from a canonical trace and exact memory checkpoints.
     #[must_use]
     pub const fn new(
-        trace: &'a NativeTraceWitness,
+        trace: &'a BlockCpuWitness,
         initial_memory: &'a CommittedMemory,
         final_memory: &'a CommittedMemory,
     ) -> Self {
@@ -206,10 +215,16 @@ impl NativeStatement {
         self.segment_count
     }
 
+    /// Returns the exact number of source machine transitions.
+    #[must_use]
+    pub const fn transition_count(&self) -> u64 {
+        self.transition_count
+    }
+
     /// Returns the exact number of active state-transition rows.
     #[must_use]
-    pub const fn relation_step_count(&self) -> u64 {
-        self.relation_step_count
+    pub const fn relation_row_count(&self) -> u64 {
+        self.relation_row_count
     }
 
     /// Returns the exact aggregate machine-cycle delta.
@@ -247,7 +262,8 @@ impl NativeStatement {
         initial: NativeBoundary,
         final_boundary: NativeBoundary,
         segment_count: u64,
-        relation_step_count: u64,
+        transition_count: u64,
+        relation_row_count: u64,
     ) -> Result<Self, NativeReceiptError> {
         Self::new_for(
             NativeProtocolVersion::current(),
@@ -255,7 +271,8 @@ impl NativeStatement {
             initial,
             final_boundary,
             segment_count,
-            relation_step_count,
+            transition_count,
+            relation_row_count,
         )
     }
 
@@ -265,7 +282,8 @@ impl NativeStatement {
         initial: NativeBoundary,
         final_boundary: NativeBoundary,
         segment_count: u64,
-        relation_step_count: u64,
+        transition_count: u64,
+        relation_row_count: u64,
     ) -> Result<Self, NativeReceiptError> {
         let machine_profile = initial.machine_profile()?;
         let m_cycle_count = checked_delta(initial.m_cycles(), final_boundary.m_cycles())?;
@@ -280,7 +298,8 @@ impl NativeStatement {
             initial,
             final_boundary,
             segment_count,
-            relation_step_count,
+            transition_count,
+            relation_row_count,
             m_cycle_count,
             logs,
             statement_id: [0; 32],
@@ -291,6 +310,9 @@ impl NativeStatement {
     }
 
     fn validate(&self) -> Result<(), NativeReceiptError> {
+        if self.protocol != NativeProtocolVersion::current() {
+            return Err(NativeReceiptError::UnsupportedBackend);
+        }
         let maximum =
             u64::try_from(MAX_NATIVE_SEGMENT_COUNT).map_err(|_| NativeReceiptError::Counter)?;
         if self.backend_digest != backend_digest(self.protocol)
@@ -299,7 +321,16 @@ impl NativeStatement {
         {
             return Err(NativeReceiptError::UnsupportedBackend);
         }
-        if self.segment_count == 0 || self.segment_count > maximum || self.relation_step_count == 0
+        let maximum_transitions = self
+            .relation_row_count
+            .checked_mul(zksm83_trace::BASIC_BLOCK_INSTRUCTION_BOUND as u64)
+            .ok_or(NativeReceiptError::Counter)?;
+        if self.segment_count == 0
+            || self.segment_count > maximum
+            || self.relation_row_count == 0
+            || self.segment_count > self.relation_row_count
+            || self.transition_count < self.relation_row_count
+            || self.transition_count > maximum_transitions
         {
             return Err(NativeReceiptError::InvalidStatement);
         }
@@ -329,6 +360,12 @@ impl NativeSegmentReceipt {
     #[must_use]
     pub const fn segment_index(&self) -> u64 {
         self.segment_index
+    }
+
+    /// Returns the exact number of source machine transitions in this segment.
+    #[must_use]
+    pub const fn transition_count(&self) -> u64 {
+        self.transition_count
     }
 
     /// Returns the exact number of active relation rows.
@@ -406,8 +443,8 @@ fn prove_segment(
     witness: NativeSegmentWitness<'_>,
     rom: &CommittedRom,
 ) -> Result<(NativeSegmentReceipt, NativeBoundary), NativeReceiptError> {
-    let claim = NativeExecutionClaim::from_trace(witness.trace)
-        .map_err(NativeCpuStructuralError::Continuity)?;
+    let claim = NativeExecutionClaim::from_packed_trace(witness.trace)
+        .map_err(PackedBlockProofError::Continuity)?;
     let expected_initial = NativeStateBoundary::from_vm_state(witness.trace.initial_state());
     let memory_identity = direct_memory_identity(witness.initial_memory.commitment())?;
     if initial.state() != expected_initial || initial.memory() != &memory_identity {
@@ -415,19 +452,28 @@ fn prove_segment(
             "prover witness does not start at the expected boundary",
         ));
     }
-    let logs = commit_protocol_logs(witness.trace)?;
+    let logs = commit_packed_protocol_logs(witness.trace)?;
+    let log_claim = PackedProtocolLogClaim::from_trace(witness.trace, &claim)?;
     let segment_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
     let final_state = NativeStateBoundary::from_vm_state(witness.trace.final_state());
     let final_memory_identity = direct_memory_identity(witness.final_memory.commitment())?;
+    let log_counts = ProtocolLogCounts::packed(
+        initial.state(),
+        final_state,
+        log_claim.bus_event_count(),
+        log_claim.instruction_count(),
+    )?;
     let final_boundary = initial.advance(
         final_state,
         final_memory_identity,
         logs.commitment(),
         segment_index,
+        log_counts,
     )?;
-    let proof = prove_native_memory_cpu(
+    let proof = prove_packed_block_components(
         witness.trace,
         &claim,
+        log_claim,
         &logs,
         rom,
         witness.initial_memory,
@@ -438,9 +484,15 @@ fn prove_segment(
         .checked_sub(claim.active_row_count())
         .ok_or(NativeReceiptError::Counter)?;
     let m_cycle_count = checked_delta(initial.m_cycles(), final_boundary.m_cycles())?;
-    let log_counts = ProtocolLogCounts::between(&initial, &final_boundary)?;
+    let committed_log_counts = ProtocolLogCounts::between(&initial, &final_boundary)?;
+    if committed_log_counts != log_counts {
+        return Err(NativeReceiptError::SegmentChain(
+            "packed log identity counts differ from the trace claim",
+        ));
+    }
     let receipt = NativeSegmentReceipt {
         segment_index,
+        transition_count: claim.transition_count(),
         active_row_count: claim.active_row_count(),
         padded_row_count,
         initial,
@@ -449,7 +501,7 @@ fn prove_segment(
         final_memory: witness.final_memory.commitment().clone(),
         logs: logs.commitment().clone(),
         m_cycle_count,
-        log_counts,
+        log_counts: committed_log_counts,
         proof,
     };
     Ok((receipt, final_boundary))
@@ -490,22 +542,29 @@ fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceipt
         return Err(NativeReceiptError::StatementMismatch);
     }
     let mut boundary = statement.initial.clone();
-    let mut steps = 0_u64;
+    let mut transitions = 0_u64;
+    let mut rows = 0_u64;
     let mut previous_memory: Option<&MemoryCommitment> = None;
     for (index, segment) in receipt.segments.iter().enumerate() {
         if let Some(memory) = previous_memory {
             ensure_same_memory(memory, &segment.initial_memory, receipt.version)?;
         }
         verify_segment(index, segment, &boundary, &receipt.rom, receipt.version)?;
-        steps = steps
+        transitions = transitions
+            .checked_add(segment.transition_count)
+            .ok_or(NativeReceiptError::Counter)?;
+        rows = rows
             .checked_add(segment.active_row_count)
             .ok_or(NativeReceiptError::Counter)?;
         boundary = segment.final_boundary.clone();
         previous_memory = Some(&segment.final_memory);
     }
-    if boundary != statement.final_boundary || steps != statement.relation_step_count {
+    if boundary != statement.final_boundary
+        || transitions != statement.transition_count
+        || rows != statement.relation_row_count
+    {
         return Err(NativeReceiptError::SegmentChain(
-            "final boundary or relation-step count differs from the statement",
+            "final boundary, transition count, or relation-row count differs from the statement",
         ));
     }
     Ok(())
@@ -533,23 +592,13 @@ fn verify_segment(
 ) -> Result<(), NativeReceiptError> {
     let _phase = crate::metrics::start(crate::metrics::Phase::Verify);
     let expected_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
-    let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| NativeReceiptError::Counter)?;
     if segment.segment_index != expected_index {
         return Err(NativeReceiptError::SegmentChain("segment index differs"));
     }
     if &segment.initial != expected_initial {
         return Err(NativeReceiptError::SegmentChain("initial boundary differs"));
     }
-    if segment.active_row_count == 0
-        || segment
-            .active_row_count
-            .checked_add(segment.padded_row_count)
-            != Some(capacity)
-    {
-        return Err(NativeReceiptError::SegmentChain(
-            "active and padded row counts are invalid",
-        ));
-    }
+    validate_segment_counts(segment)?;
     if direct_memory_identity_for(protocol, &segment.initial_memory)? != segment.initial.memory {
         return Err(NativeReceiptError::SegmentChain(
             "initial memory commitment identity differs",
@@ -569,6 +618,7 @@ fn verify_segment(
         segment.final_boundary.memory.clone(),
         &segment.logs,
         segment.segment_index,
+        segment.log_counts,
     )?;
     if expected_final != segment.final_boundary {
         return Err(NativeReceiptError::SegmentChain(
@@ -593,18 +643,51 @@ fn verify_segment(
     }
     let claim = NativeExecutionClaim::new(
         segment.active_row_count,
+        segment.transition_count,
         segment.initial.state,
         segment.final_boundary.state,
     )
-    .map_err(NativeCpuStructuralError::Continuity)?;
-    verify_native_memory_cpu_for_protocol(
+    .map_err(PackedBlockProofError::Continuity)?;
+    let log_claim =
+        PackedProtocolLogClaim::new(segment.log_counts.bus, segment.log_counts.isa, &claim)
+            .map_err(PackedBlockProofError::ProtocolLog)?;
+    crate::block_proof::verify_packed_block_components_for_protocol(
         protocol,
         &segment.proof,
-        &claim,
-        &segment.logs,
-        rom,
-        &segment.initial_memory,
-        &segment.final_memory,
+        crate::block_proof::PackedBlockVerificationInputs {
+            claim: &claim,
+            log_claim,
+            logs: &segment.logs,
+            rom,
+            initial_memory: &segment.initial_memory,
+            final_memory: &segment.final_memory,
+        },
     )?;
+    Ok(())
+}
+
+fn validate_segment_counts(segment: &NativeSegmentReceipt) -> Result<(), NativeReceiptError> {
+    let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| NativeReceiptError::Counter)?;
+    if segment.active_row_count == 0
+        || segment
+            .active_row_count
+            .checked_add(segment.padded_row_count)
+            != Some(capacity)
+    {
+        return Err(NativeReceiptError::SegmentChain(
+            "active and padded row counts are invalid",
+        ));
+    }
+    let maximum_transitions = segment
+        .active_row_count
+        .checked_mul(zksm83_trace::BASIC_BLOCK_INSTRUCTION_BOUND as u64)
+        .ok_or(NativeReceiptError::Counter)?;
+    if segment.transition_count < segment.active_row_count
+        || segment.transition_count > maximum_transitions
+    {
+        return Err(NativeReceiptError::SegmentChain(
+            "segment transition count is invalid",
+        ));
+    }
     Ok(())
 }

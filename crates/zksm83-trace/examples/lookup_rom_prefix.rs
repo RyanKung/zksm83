@@ -1,4 +1,4 @@
-//! Measures lookup-backed Blue prefix construction without per-access Merkle paths.
+//! Measures lookup-backed cartridge execution without per-access Merkle paths.
 
 use std::{env, error::Error, ffi::OsString, fs, io, path::PathBuf, time::Instant};
 
@@ -56,14 +56,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let rom_path = arguments.next().map(PathBuf::from).ok_or_else(|| {
         io::Error::other(
-            "usage: lookup_blue_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
+            "usage: lookup_rom_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
         )
     })?;
     let steps = arguments
         .next()
         .ok_or_else(|| {
             io::Error::other(
-                "usage: lookup_blue_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
+                "usage: lookup_rom_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
             )
         })?
         .into_string()
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let profile_limit = parse_profile_limit(arguments.next())?;
     if arguments.next().is_some() {
         return Err(io::Error::other(
-            "usage: lookup_blue_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
+            "usage: lookup_rom_prefix ROM STEPS [INPUT_JSON] [CHECKPOINT_JSON] [PROFILE_JSON] [PROFILE_LIMIT]",
         )
         .into());
     }

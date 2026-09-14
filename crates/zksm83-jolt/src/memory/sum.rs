@@ -34,8 +34,9 @@ pub(super) fn prove(
     let descriptor = descriptor(full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let memory_point = half_point(MEMORY_TABLE_NUM_VARIABLES)?;
-    let trace_values = trace
-        .field_columns()
+    let trace_columns = trace.field_columns()?;
+    let trace_values = trace_columns
+        .as_slice()
         .iter()
         .map(|column| super::evaluate_field_column(column, &trace_point))
         .collect::<Result<Vec<_>, _>>()?;
@@ -159,9 +160,9 @@ fn evaluate_columns(
     columns: &CommittedMemoryColumns,
     point: &[NativeField],
 ) -> Result<Vec<NativeField>, MutableMemoryError> {
-    columns
-        .inner
-        .field_columns()
+    let field_columns = columns.inner.field_columns()?;
+    field_columns
+        .as_slice()
         .iter()
         .map(|column| super::evaluate_field_column(column, point))
         .collect()

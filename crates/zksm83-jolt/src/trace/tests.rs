@@ -5,10 +5,64 @@ use zksm83_memory::{MemoryImage, RomImage};
 use zksm83_trace::TraceRow;
 
 use super::{
-    NATIVE_TRACE_COLUMN_COUNT, NativeTraceWitness, TRACE_ACTIVE, TRACE_ISA_ADDRESS_START,
-    TRACE_MODE_START,
+    NATIVE_TRACE_COLUMN_COUNT, NativeTraceWitness, TRACE_ACTIVE, TRACE_BEFORE_CPU_BYTE_BITS_START,
+    TRACE_BEFORE_ROM_BANK_BITS_START, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_START,
+    TRACE_ISA_ADDRESS_START, TRACE_MEMORY_START, TRACE_MODE_START, TRACE_ROM_SELECTOR_START,
+    TRACE_ROW_BITS_START, encode_padding_row,
 };
-use crate::UNIFORM_ROW_COUNT;
+use crate::{
+    TRACE_BUS_SLOTS, TRACE_MEMORY_SLOT_WIDTH, TRACE_ROW_BIT_COUNT, UNIFORM_ROW_COUNT,
+    fixed_isa_table,
+};
+
+#[test]
+fn trace_column_families_partition_v2_layout() {
+    let device_start = TRACE_MEMORY_START + TRACE_BUS_SLOTS * TRACE_MEMORY_SLOT_WIDTH;
+    let families = [
+        ("state", 0, TRACE_ACTIVE, 76),
+        ("control and ISA", TRACE_ACTIVE, TRACE_BUS_START, 75),
+        (
+            "bus tuples",
+            TRACE_BUS_START,
+            TRACE_BEFORE_CPU_BYTE_BITS_START,
+            60,
+        ),
+        (
+            "CPU helpers",
+            TRACE_BEFORE_CPU_BYTE_BITS_START,
+            TRACE_BUS_ADDRESS_BITS_START,
+            280,
+        ),
+        (
+            "bus decompositions",
+            TRACE_BUS_ADDRESS_BITS_START,
+            TRACE_BEFORE_ROM_BANK_BITS_START,
+            260,
+        ),
+        (
+            "mapper",
+            TRACE_BEFORE_ROM_BANK_BITS_START,
+            TRACE_ROM_SELECTOR_START,
+            20,
+        ),
+        (
+            "ROM lookup",
+            TRACE_ROM_SELECTOR_START,
+            TRACE_ROW_BITS_START,
+            10,
+        ),
+        ("row index", TRACE_ROW_BITS_START, TRACE_MEMORY_START, 14),
+        ("memory", TRACE_MEMORY_START, device_start, 190),
+        ("devices", device_start, NATIVE_TRACE_COLUMN_COUNT, 2_307),
+    ];
+    let mut expected_start = 0;
+    for (name, start, end, expected_width) in families {
+        assert_eq!(start, expected_start, "gap or overlap before {name}");
+        assert_eq!(end - start, expected_width, "width drift in {name}");
+        expected_start = end;
+    }
+    assert_eq!(expected_start, NATIVE_TRACE_COLUMN_COUNT);
+}
 
 #[test]
 fn validated_rows_encode_and_padding_is_canonical() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,6 +118,22 @@ fn validated_rows_encode_and_padding_is_canonical() -> Result<(), Box<dyn std::e
     assert_eq!(witness.active_row_count(), 1);
     assert_eq!(witness.initial_state(), before);
     assert_eq!(witness.final_state(), after);
-    witness.isa_lookup_columns()?;
+    let padding_index = UNIFORM_ROW_COUNT / 2 + 1;
+    let mut canonical = (0..NATIVE_TRACE_COLUMN_COUNT)
+        .map(|_| Vec::with_capacity(1))
+        .collect::<Vec<_>>();
+    encode_padding_row(&mut canonical, after, padding_index, &fixed_isa_table()?)?;
+    for (actual, expected) in witness.columns().iter().zip(canonical.iter()) {
+        assert_eq!(actual.get(padding_index), expected.first());
+    }
+    for bit in 0..TRACE_ROW_BIT_COUNT {
+        assert_eq!(
+            witness
+                .columns()
+                .get(TRACE_ROW_BITS_START + bit)
+                .and_then(|column| column.last()),
+            Some(&u64::from((((UNIFORM_ROW_COUNT - 1) >> bit) & 1) != 0))
+        );
+    }
     Ok(())
 }

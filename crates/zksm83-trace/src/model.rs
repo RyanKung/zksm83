@@ -1,11 +1,10 @@
 //! Validated trace rows, chunks, and complete witnesses.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use thiserror::Error;
-use zksm83_core::{
-    BLUE_SOUND_WAIT_ROM_ROOT, BusEvent, MachineProfile, RunState, StepEffects, StepError,
-    StepInput, StepKind, StepRelation, VmState,
-};
+use zksm83_core::{BusEvent, StepEffects, StepError, StepInput, StepKind, StepRelation, VmState};
 
 /// One instruction or zero-time machine transition validated by the pure relation.
 #[derive(Debug, Eq, PartialEq, Serialize)]
@@ -140,30 +139,23 @@ pub struct ExecutionMetrics {
     halt_idle_m_cycles: u64,
     halt_until_vblank_steps: u64,
     halt_until_vblank_m_cycles: u64,
-    blue_sound_wait_steps: u64,
-    blue_sound_wait_m_cycles: u64,
-    blue_delay_loop_steps: u64,
-    blue_delay_loop_iterations: u64,
-    blue_delay_loop_m_cycles: u64,
-    blue_dma_wait_steps: u64,
-    blue_dma_wait_m_cycles: u64,
-    blue_rom_block_steps: u64,
-    blue_rom_block_instructions: u64,
-    blue_rom_block_saved_rows: u64,
-    #[serde(skip)]
-    blue_rom_block_pending: u8,
-    #[serde(skip)]
-    blue_rom_block_pending_events: u8,
-    #[serde(skip)]
-    blue_rom_block_pending_m_cycles: u8,
+    halt_until_serial_steps: u64,
+    halt_until_serial_m_cycles: u64,
+    halt_until_timer_steps: u64,
+    halt_until_timer_m_cycles: u64,
     halt_wake_steps: u64,
     interrupt_dispatches: u64,
     dma_byte_steps: u64,
     bus_events: u64,
+    rom_reads: u64,
+    memory_reads: u64,
+    memory_writes: u64,
+    input_events: u64,
+    output_events: u64,
+    isa_rows: u64,
     joypad_samples: u64,
     battery_sram_writes: u64,
     dma_starts: u64,
-    blue_quiet_boundary_violations: u64,
 }
 
 /// One instruction-address frequency in a profiled execution prefix.
@@ -180,17 +172,9 @@ pub struct ProgramCounterCount {
 }
 
 /// Bounded 16-bit instruction-address histogram collected without retaining rows.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct ProgramCounterProfile {
-    counts: Box<[u64]>,
-}
-
-impl Default for ProgramCounterProfile {
-    fn default() -> Self {
-        Self {
-            counts: vec![0; (1_usize << 20) + (1_usize << 16)].into_boxed_slice(),
-        }
-    }
+    counts: BTreeMap<u32, u64>,
 }
 
 impl ProgramCounterProfile {
@@ -205,12 +189,7 @@ impl ProgramCounterProfile {
             0x4000..=0x7fff => u32::from(state.mbc3().rom_bank()) * 0x4000 + u32::from(pc - 0x4000),
             0x8000..=0xffff => (1_u32 << 20) + u32::from(pc),
         };
-        let index =
-            usize::try_from(physical_pc).map_err(|_| TraceError::ProgramCounterProfileInvariant)?;
-        let count = self
-            .counts
-            .get_mut(index)
-            .ok_or(TraceError::ProgramCounterProfileInvariant)?;
+        let count = self.counts.entry(physical_pc).or_insert(0);
         increment(count)
     }
 
@@ -220,11 +199,7 @@ impl ProgramCounterProfile {
         let mut counts = self
             .counts
             .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, count)| *count != 0)
-            .filter_map(|(physical_pc, count)| {
-                let physical_pc = u32::try_from(physical_pc).ok()?;
+            .filter_map(|(&physical_pc, &count)| {
                 if physical_pc < 1_u32 << 20 {
                     let bank = u8::try_from(physical_pc / 0x4000).ok()?;
                     let offset = u16::try_from(physical_pc % 0x4000).ok()?;
@@ -299,10 +274,7 @@ impl ExecutionBoundary {
 impl ExecutionMetrics {
     pub(crate) fn record(&mut self, row: &TraceRow) -> Result<(), TraceError> {
         increment(&mut self.relation_steps)?;
-        self.record_blue_rom_block(row)?;
-        if !blue_quiet_state(row.before()) || !blue_quiet_state(row.after()) {
-            increment(&mut self.blue_quiet_boundary_violations)?;
-        }
+        increment(&mut self.isa_rows)?;
         match row.effects().kind() {
             StepKind::Instruction => increment(&mut self.instructions)?,
             StepKind::HaltIdle => {
@@ -331,51 +303,29 @@ impl ExecutionMetrics {
                     .checked_add(elapsed)
                     .ok_or(TraceError::MetricOverflow)?;
             }
-            StepKind::BlueSoundWait => {
-                increment(&mut self.blue_sound_wait_steps)?;
+            StepKind::HaltUntilSerial => {
+                increment(&mut self.halt_until_serial_steps)?;
                 let elapsed = row
                     .after()
                     .cpu()
                     .m_cycles()
                     .checked_sub(row.before().cpu().m_cycles())
                     .ok_or(TraceError::CycleRegression)?;
-                self.blue_sound_wait_m_cycles = self
-                    .blue_sound_wait_m_cycles
+                self.halt_until_serial_m_cycles = self
+                    .halt_until_serial_m_cycles
                     .checked_add(elapsed)
                     .ok_or(TraceError::MetricOverflow)?;
             }
-            StepKind::BlueDelayLoop => {
-                increment(&mut self.blue_delay_loop_steps)?;
-                let before = row.before().cpu().registers();
-                let after = row.after().cpu().registers();
-                let iterations = u16::from_be_bytes([before.d, before.e])
-                    .checked_sub(u16::from_be_bytes([after.d, after.e]))
-                    .ok_or(TraceError::DelayIterationRegression)?;
-                self.blue_delay_loop_iterations = self
-                    .blue_delay_loop_iterations
-                    .checked_add(u64::from(iterations))
-                    .ok_or(TraceError::MetricOverflow)?;
+            StepKind::HaltUntilTimer => {
+                increment(&mut self.halt_until_timer_steps)?;
                 let elapsed = row
                     .after()
                     .cpu()
                     .m_cycles()
                     .checked_sub(row.before().cpu().m_cycles())
                     .ok_or(TraceError::CycleRegression)?;
-                self.blue_delay_loop_m_cycles = self
-                    .blue_delay_loop_m_cycles
-                    .checked_add(elapsed)
-                    .ok_or(TraceError::MetricOverflow)?;
-            }
-            StepKind::BlueDmaWait => {
-                increment(&mut self.blue_dma_wait_steps)?;
-                let elapsed = row
-                    .after()
-                    .cpu()
-                    .m_cycles()
-                    .checked_sub(row.before().cpu().m_cycles())
-                    .ok_or(TraceError::CycleRegression)?;
-                self.blue_dma_wait_m_cycles = self
-                    .blue_dma_wait_m_cycles
+                self.halt_until_timer_m_cycles = self
+                    .halt_until_timer_m_cycles
                     .checked_add(elapsed)
                     .ok_or(TraceError::MetricOverflow)?;
             }
@@ -389,6 +339,28 @@ impl ExecutionMetrics {
     fn record_bus_events(&mut self, row: &TraceRow) -> Result<(), TraceError> {
         for event in row.effects().bus_events() {
             increment(&mut self.bus_events)?;
+            match event {
+                BusEvent::OpcodeFetch(_)
+                | BusEvent::ImmediateRead(_)
+                | BusEvent::RomRead(_)
+                | BusEvent::DmgDmaRomRead(_) => increment(&mut self.rom_reads)?,
+                BusEvent::MemoryOpcodeFetch(_)
+                | BusEvent::MemoryImmediateRead(_)
+                | BusEvent::MemoryRead(_)
+                | BusEvent::DmgDmaMemoryRead(_) => increment(&mut self.memory_reads)?,
+                BusEvent::MemoryWrite(_) | BusEvent::DmgDmaWrite(_) => {
+                    increment(&mut self.memory_writes)?
+                }
+                BusEvent::InputRead { .. } | BusEvent::DmgJoypadRead { .. } => {
+                    increment(&mut self.input_events)?
+                }
+                BusEvent::OutputWrite { .. } => increment(&mut self.output_events)?,
+                BusEvent::Mbc3ControlWrite { .. }
+                | BusEvent::Mbc3OpenBusRead { .. }
+                | BusEvent::Mbc3IgnoredWrite { .. }
+                | BusEvent::DmgMmioRead { .. }
+                | BusEvent::DmgMmioWrite { .. } => {}
+            }
             match event {
                 BusEvent::DmgJoypadRead { .. } => increment(&mut self.joypad_samples)?,
                 BusEvent::MemoryWrite(write)
@@ -407,63 +379,6 @@ impl ExecutionMetrics {
         Ok(())
     }
 
-    fn record_blue_rom_block(&mut self, row: &TraceRow) -> Result<(), TraceError> {
-        let Some(cost) = blue_rom_block_cost(row) else {
-            self.reset_blue_rom_block_pending();
-            return Ok(());
-        };
-        let can_append = self.blue_rom_block_pending < BLUE_ROM_BLOCK_MAX_INSTRUCTIONS
-            && self
-                .blue_rom_block_pending_events
-                .checked_add(cost.events())
-                .is_some_and(|events| events <= BLUE_ROM_BLOCK_MAX_EVENTS)
-            && self
-                .blue_rom_block_pending_m_cycles
-                .checked_add(cost.m_cycles())
-                .is_some_and(|cycles| cycles <= BLUE_ROM_BLOCK_MAX_M_CYCLES);
-        if self.blue_rom_block_pending == 0 || !can_append {
-            self.blue_rom_block_pending = 1;
-            self.blue_rom_block_pending_events = cost.events();
-            self.blue_rom_block_pending_m_cycles = cost.m_cycles();
-            return Ok(());
-        }
-        self.blue_rom_block_pending = self
-            .blue_rom_block_pending
-            .checked_add(1)
-            .ok_or(TraceError::MetricOverflow)?;
-        self.blue_rom_block_pending_events = self
-            .blue_rom_block_pending_events
-            .checked_add(cost.events())
-            .ok_or(TraceError::MetricOverflow)?;
-        self.blue_rom_block_pending_m_cycles = self
-            .blue_rom_block_pending_m_cycles
-            .checked_add(cost.m_cycles())
-            .ok_or(TraceError::MetricOverflow)?;
-        if self.blue_rom_block_pending == 2 {
-            increment(&mut self.blue_rom_block_steps)?;
-            self.blue_rom_block_instructions = self
-                .blue_rom_block_instructions
-                .checked_add(2)
-                .ok_or(TraceError::MetricOverflow)?;
-            increment(&mut self.blue_rom_block_saved_rows)?;
-        } else if self.blue_rom_block_pending <= BLUE_ROM_BLOCK_MAX_INSTRUCTIONS {
-            increment(&mut self.blue_rom_block_instructions)?;
-            increment(&mut self.blue_rom_block_saved_rows)?;
-            if self.blue_rom_block_pending == BLUE_ROM_BLOCK_MAX_INSTRUCTIONS {
-                self.reset_blue_rom_block_pending();
-            }
-        } else {
-            return Err(TraceError::ProgramCounterProfileInvariant);
-        }
-        Ok(())
-    }
-
-    fn reset_blue_rom_block_pending(&mut self) {
-        self.blue_rom_block_pending = 0;
-        self.blue_rom_block_pending_events = 0;
-        self.blue_rom_block_pending_m_cycles = 0;
-    }
-
     /// Returns total native/circuit relation rows.
     #[must_use]
     pub const fn relation_steps(self) -> u64 {
@@ -476,64 +391,28 @@ impl ExecutionMetrics {
         self.instructions
     }
 
-    /// Returns ROM-bound Pokémon Blue sound-wait summary rows.
+    /// Returns guarded long-HALT rows ending at serial completion.
     #[must_use]
-    pub const fn blue_sound_wait_steps(self) -> u64 {
-        self.blue_sound_wait_steps
+    pub const fn halt_until_serial_steps(self) -> u64 {
+        self.halt_until_serial_steps
     }
 
-    /// Returns M-cycles represented by Pokémon Blue sound-wait summaries.
+    /// Returns M-cycles compressed by guarded serial-completion HALT rows.
     #[must_use]
-    pub const fn blue_sound_wait_m_cycles(self) -> u64 {
-        self.blue_sound_wait_m_cycles
+    pub const fn halt_until_serial_m_cycles(self) -> u64 {
+        self.halt_until_serial_m_cycles
     }
 
-    /// Returns ROM-bound Pokémon Blue pure-delay summary rows.
+    /// Returns guarded long-HALT rows ending at a timer reload interrupt.
     #[must_use]
-    pub const fn blue_delay_loop_steps(self) -> u64 {
-        self.blue_delay_loop_steps
+    pub const fn halt_until_timer_steps(self) -> u64 {
+        self.halt_until_timer_steps
     }
 
-    /// Returns DE-loop iterations represented by Pokémon Blue delay summaries.
+    /// Returns M-cycles compressed by guarded timer-interrupt HALT rows.
     #[must_use]
-    pub const fn blue_delay_loop_iterations(self) -> u64 {
-        self.blue_delay_loop_iterations
-    }
-
-    /// Returns M-cycles represented by Pokémon Blue delay summaries.
-    #[must_use]
-    pub const fn blue_delay_loop_m_cycles(self) -> u64 {
-        self.blue_delay_loop_m_cycles
-    }
-
-    /// Returns authenticated Pokémon Blue HRAM DMA-wait summary rows.
-    #[must_use]
-    pub const fn blue_dma_wait_steps(self) -> u64 {
-        self.blue_dma_wait_steps
-    }
-
-    /// Returns M-cycles represented by Pokémon Blue HRAM DMA-wait summaries.
-    #[must_use]
-    pub const fn blue_dma_wait_m_cycles(self) -> u64 {
-        self.blue_dma_wait_m_cycles
-    }
-
-    /// Returns rows that each summarize two to five consecutive Blue ROM instructions.
-    #[must_use]
-    pub const fn blue_rom_block_steps(self) -> u64 {
-        self.blue_rom_block_steps
-    }
-
-    /// Returns native instructions covered by safe Blue ROM micro-blocks.
-    #[must_use]
-    pub const fn blue_rom_block_instructions(self) -> u64 {
-        self.blue_rom_block_instructions
-    }
-
-    /// Returns native relation rows removed by greedy two-to-five instruction packing.
-    #[must_use]
-    pub const fn blue_rom_block_saved_rows(self) -> u64 {
-        self.blue_rom_block_saved_rows
+    pub const fn halt_until_timer_m_cycles(self) -> u64 {
+        self.halt_until_timer_m_cycles
     }
 
     /// Returns authenticated zero-time OAM DMA byte rows.
@@ -548,6 +427,42 @@ impl ExecutionMetrics {
         self.bus_events
     }
 
+    /// Returns authenticated immutable-ROM reads, including instruction fetches.
+    #[must_use]
+    pub const fn rom_reads(self) -> u64 {
+        self.rom_reads
+    }
+
+    /// Returns authenticated mutable-memory reads, including executable memory and DMA.
+    #[must_use]
+    pub const fn memory_reads(self) -> u64 {
+        self.memory_reads
+    }
+
+    /// Returns authenticated mutable-memory writes, including DMA destinations.
+    #[must_use]
+    pub const fn memory_writes(self) -> u64 {
+        self.memory_writes
+    }
+
+    /// Returns ordered private-input events, including joypad samples.
+    #[must_use]
+    pub const fn input_events(self) -> u64 {
+        self.input_events
+    }
+
+    /// Returns ordered public-output events.
+    #[must_use]
+    pub const fn output_events(self) -> u64 {
+        self.output_events
+    }
+
+    /// Returns fixed-ISA rows selected by active execution rows.
+    #[must_use]
+    pub const fn isa_rows(self) -> u64 {
+        self.isa_rows
+    }
+
     /// Returns committed P1 samples.
     #[must_use]
     pub const fn joypad_samples(self) -> u64 {
@@ -559,140 +474,6 @@ impl ExecutionMetrics {
     pub const fn battery_sram_writes(self) -> u64 {
         self.battery_sram_writes
     }
-
-    /// Returns rows whose before or after boundary cannot use BlueQuiet timing.
-    #[must_use]
-    pub const fn blue_quiet_boundary_violations(self) -> u64 {
-        self.blue_quiet_boundary_violations
-    }
-}
-
-/// Maximum number of native instructions represented by one Blue ROM micro-block.
-pub const BLUE_ROM_BLOCK_MAX_INSTRUCTIONS: u8 = 5;
-/// Maximum immutable fetch and safe read events authenticated by one Blue ROM micro-block.
-pub const BLUE_ROM_BLOCK_MAX_EVENTS: u8 = 5;
-/// Maximum aggregate M-cycles advanced by one Blue ROM micro-block.
-pub const BLUE_ROM_BLOCK_MAX_M_CYCLES: u8 = 6;
-
-/// Resource use of one native instruction eligible for Blue ROM micro-block packing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlueRomBlockCost {
-    fetches: u8,
-    data_reads: u8,
-    events: u8,
-    m_cycles: u8,
-}
-
-impl BlueRomBlockCost {
-    /// Returns authenticated immutable-ROM fetches consumed by this instruction.
-    #[must_use]
-    pub const fn fetches(self) -> u8 {
-        self.fetches
-    }
-
-    /// Returns authenticated ROM or timing-insensitive mutable-memory data reads.
-    #[must_use]
-    pub const fn data_reads(self) -> u8 {
-        self.data_reads
-    }
-
-    /// Returns the total authenticated bus slots consumed by this instruction.
-    #[must_use]
-    pub const fn events(self) -> u8 {
-        self.events
-    }
-
-    /// Returns M-cycles consumed by this instruction.
-    #[must_use]
-    pub const fn m_cycles(self) -> u8 {
-        self.m_cycles
-    }
-}
-
-/// Returns the bounded fetch and timing cost of an atomic Blue ROM micro-block candidate.
-///
-/// Candidates execute entirely from immutable ROM and may read only immutable ROM or
-/// timing-insensitive WRAM, battery SRAM, or HRAM. They keep IME and the running state unchanged
-/// and do not raise an interrupt. A block may contain at most five such instructions while
-/// consuming at most five authenticated events and six M-cycles. MMIO, mapper, input, write,
-/// VRAM, and OAM effects remain atomic rows so timing is additive and no hidden device boundary
-/// is lost between packed rows.
-#[must_use]
-pub fn blue_rom_block_cost(row: &TraceRow) -> Option<BlueRomBlockCost> {
-    let before = row.before();
-    let after = row.after();
-    let elapsed = u8::try_from(
-        after
-            .cpu()
-            .m_cycles()
-            .checked_sub(before.cpu().m_cycles())?,
-    )
-    .ok()?;
-    let events = row.effects().bus_events();
-    let event_count = u8::try_from(events.len()).ok()?;
-    let mut fetches = 0_u8;
-    let mut data_reads = 0_u8;
-    let mut saw_data = false;
-    let mut allowed_events = true;
-    for event in events {
-        match event {
-            BusEvent::OpcodeFetch(_) | BusEvent::ImmediateRead(_) if !saw_data => {
-                fetches = fetches.checked_add(1)?;
-            }
-            BusEvent::RomRead(_) => {
-                saw_data = true;
-                data_reads = data_reads.checked_add(1)?;
-            }
-            BusEvent::MemoryRead(read) if blue_rom_block_memory_read(read.address) => {
-                saw_data = true;
-                data_reads = data_reads.checked_add(1)?;
-            }
-            _ => allowed_events = false,
-        }
-    }
-    let first_is_opcode = matches!(
-        row.effects().bus_events().next(),
-        Some(BusEvent::OpcodeFetch(_))
-    );
-    let eligible = row.effects().kind() == StepKind::Instruction
-        && fetches == row.effects().instruction().byte_len()
-        && first_is_opcode
-        && allowed_events
-        && blue_rom_block_state(before)
-        && blue_rom_block_state(after)
-        && before.cpu().run_state() == RunState::Running
-        && after.cpu().run_state() == RunState::Running
-        && before.cpu().ime() == after.cpu().ime()
-        && before.dmg_devices().interrupt_request() == after.dmg_devices().interrupt_request()
-        && (1..=BLUE_ROM_BLOCK_MAX_EVENTS).contains(&event_count)
-        && (1..=BLUE_ROM_BLOCK_MAX_M_CYCLES).contains(&elapsed);
-    eligible.then_some(BlueRomBlockCost {
-        fetches,
-        data_reads,
-        events: event_count,
-        m_cycles: elapsed,
-    })
-}
-
-fn blue_rom_block_memory_read(address: u16) -> bool {
-    matches!(address, 0xa000..=0xdfff | 0xff80..=0xfffe)
-}
-
-/// Returns whether an atomic Blue instruction can share a bounded summary row with adjacent rows.
-#[must_use]
-pub fn blue_rom_block_candidate(row: &TraceRow) -> bool {
-    blue_rom_block_cost(row).is_some()
-}
-
-fn blue_rom_block_state(state: VmState) -> bool {
-    state.profile() == MachineProfile::DmgPostBootMbc3V1
-        && state.dmg_devices().blue_quiet_proof_compatible()
-}
-
-fn blue_quiet_state(state: VmState) -> bool {
-    state.profile() == MachineProfile::DmgPostBootMbc3V1
-        && state.rom_root().to_bytes() == BLUE_SOUND_WAIT_ROM_ROOT
-        && state.dmg_devices().blue_quiet_proof_compatible()
 }
 
 fn increment(value: &mut u64) -> Result<(), TraceError> {
@@ -759,6 +540,14 @@ impl Witness {
     pub fn chunks(&self) -> impl ExactSizeIterator<Item = &TraceChunk> {
         self.chunks.iter()
     }
+
+    pub(crate) fn into_rows(self) -> Vec<TraceRow> {
+        let mut rows = Vec::new();
+        for chunk in self.chunks {
+            rows.extend(chunk.rows);
+        }
+        rows
+    }
 }
 
 /// Failure to construct a validated trace object.
@@ -797,13 +586,7 @@ pub enum TraceError {
     /// An exact execution metric exceeded the `u64` representation.
     #[error("execution metric overflow")]
     MetricOverflow,
-    /// The fixed 16-bit PC histogram did not contain a valid CPU address.
-    #[error("program-counter profile violated its 16-bit shape")]
-    ProgramCounterProfileInvariant,
     /// A validated row unexpectedly moved the hardware clock backwards.
     #[error("validated trace cycle count regressed")]
     CycleRegression,
-    /// A Blue delay summary increased its remaining DE iteration count.
-    #[error("validated Blue delay summary iteration count regressed")]
-    DelayIterationRegression,
 }

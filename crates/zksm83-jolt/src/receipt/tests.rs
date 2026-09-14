@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use zksm83_memory::{MemoryImage, RomImage};
-use zksm83_trace::{TraceBuilder, TraceRow};
+use zksm83_trace::{TraceBuilder, TraceRow, Witness, pack_witness_basic_blocks};
 
 use super::{
     CommitmentIdentity, CommitmentKind, NativeBoundary, NativeReceipt, NativeReceiptStreamProver,
@@ -9,7 +9,7 @@ use super::{
     verify_native_receipt_bytes, verify_native_receipt_reader,
 };
 use crate::{
-    MEMORY_IMAGE_BYTES, NativeProtocolVersion, NativeStateBoundary, NativeTraceWitness,
+    BlockCpuWitness, MEMORY_IMAGE_BYTES, NativeProtocolVersion, NativeStateBoundary,
     ROM_IMAGE_BYTES,
 };
 
@@ -55,22 +55,25 @@ fn statement_wire_is_canonical_and_binds_every_field() -> Result<(), Box<dyn std
     let mut tampered = statement.clone();
     tampered.statement_id[0] ^= 1;
     assert!(NativeStatement::from_bytes(&tampered.to_bytes()?).is_err());
+
+    let mut impossible = statement;
+    impossible.segment_count = impossible
+        .relation_row_count
+        .checked_add(1)
+        .ok_or("segment count overflow")?;
+    impossible.statement_id = impossible.compute_id();
+    assert!(NativeStatement::from_bytes(&impossible.to_bytes()?).is_err());
     Ok(())
 }
 
 #[test]
-fn statement_wire_keeps_v1_read_only_and_separates_v2() -> Result<(), Box<dyn std::error::Error>> {
-    let v1 = structural_statement_for(NativeProtocolVersion::V1)?;
+fn statement_wire_rejects_v1_and_accepts_only_v2() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(NativeProtocolVersion::from_code(1), None);
     let v2 = structural_statement_for(NativeProtocolVersion::V2)?;
-    let v1_bytes = v1.to_bytes()?;
     let v2_bytes = v2.to_bytes()?;
 
-    assert_eq!(v1_bytes.get(..8), Some(b"ZKSM83S1".as_slice()));
     assert_eq!(v2_bytes.get(..8), Some(b"ZKSM83S2".as_slice()));
-    assert_eq!(NativeStatement::from_bytes(&v1_bytes)?, v1);
     assert_eq!(NativeStatement::from_bytes(&v2_bytes)?, v2);
-    assert_ne!(v1.statement_id(), v2.statement_id());
-    assert_ne!(v1.backend_digest(), v2.backend_digest());
 
     let mut relabeled = v2_bytes;
     relabeled
@@ -94,11 +97,16 @@ fn receipt_magic_and_numeric_version_must_agree() -> Result<(), Box<dyn std::err
 #[test]
 fn receipt_and_embedded_statement_versions_cannot_be_mixed()
 -> Result<(), Box<dyn std::error::Error>> {
-    for (receipt_magic, version, statement_protocol) in [
-        (b"ZKSM83R1", 1_u64, NativeProtocolVersion::V2),
-        (b"ZKSM83R2", 2_u64, NativeProtocolVersion::V1),
+    let v2_statement = structural_statement()?.to_bytes()?;
+    for (receipt_magic, version, statement_magic) in [
+        (b"ZKSM83R1", 1_u64, b"ZKSM83S2"),
+        (b"ZKSM83R2", 2_u64, b"ZKSM83S1"),
     ] {
-        let statement = structural_statement_for(statement_protocol)?.to_bytes()?;
+        let mut statement = v2_statement.clone();
+        statement
+            .get_mut(..8)
+            .ok_or("missing statement magic")?
+            .copy_from_slice(statement_magic);
         let mut bytes = receipt_magic.to_vec();
         bytes.extend_from_slice(&version.to_le_bytes());
         bytes.extend_from_slice(&u64::try_from(statement.len())?.to_le_bytes());
@@ -109,14 +117,6 @@ fn receipt_and_embedded_statement_versions_cannot_be_mixed()
         ));
     }
     Ok(())
-}
-
-#[test]
-fn v1_backend_digest_remains_byte_compatible() {
-    assert_eq!(
-        hex::encode(super::identity::backend_digest(NativeProtocolVersion::V1)),
-        "fe6d281688b19eb1adedc36a91f6c7138ee8224ccbd70479db07c1f41855d474"
-    );
 }
 
 #[test]
@@ -216,10 +216,18 @@ fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
     eprintln!("receipt gate byte verify: {:.2?}", started.elapsed());
 
     let mut wrong = expected.clone();
-    wrong.relation_step_count = wrong
-        .relation_step_count
+    wrong.relation_row_count = wrong
+        .relation_row_count
         .checked_add(1)
         .ok_or("step count overflow")?;
+    wrong.statement_id = wrong.compute_id();
+    assert!(verify_native_receipt(&decoded, &wrong).is_err());
+
+    let mut wrong = expected.clone();
+    wrong.transition_count = wrong
+        .transition_count
+        .checked_add(1)
+        .ok_or("transition count overflow")?;
     wrong.statement_id = wrong.compute_id();
     assert!(verify_native_receipt(&decoded, &wrong).is_err());
 
@@ -235,6 +243,17 @@ fn native_receipt_round_trip_and_structural_tampering_are_fail_closed()
     let mut omitted = decoded.clone();
     omitted.segments.clear();
     assert!(verify_native_receipt(&omitted, &expected).is_err());
+
+    let mut wrong_transition_count = decoded.clone();
+    let first = wrong_transition_count
+        .segments
+        .first_mut()
+        .ok_or("missing segment")?;
+    first.transition_count = first
+        .transition_count
+        .checked_add(1)
+        .ok_or("transition count overflow")?;
+    assert!(verify_native_receipt(&wrong_transition_count, &expected).is_err());
 
     let mut duplicated = decoded.clone();
     let segment = duplicated
@@ -286,7 +305,8 @@ fn two_segment_receipt_authenticates_exact_shared_boundary()
     let statement = prover.finish(&mut receipt_bytes)?;
     let expected = NativeStatement::from_bytes(&statement.to_bytes()?)?;
     assert_eq!(expected.segment_count(), 2);
-    assert_eq!(expected.relation_step_count(), 2);
+    assert_eq!(expected.transition_count(), 2);
+    assert_eq!(expected.relation_row_count(), 2);
     assert_eq!(
         verify_native_receipt_reader(Cursor::new(&receipt_bytes), &expected)?.segment_count(),
         2
@@ -344,10 +364,10 @@ fn structural_statement_for(
         u64::try_from(ROM_IMAGE_BYTES)?,
         b"structural-rom-commitment",
     )?;
-    NativeStatement::new_for(protocol, rom, boundary.clone(), boundary, 1, 1).map_err(Into::into)
+    NativeStatement::new_for(protocol, rom, boundary.clone(), boundary, 1, 1, 1).map_err(Into::into)
 }
 
-type ReceiptTrace = (NativeTraceWitness, Vec<u8>, Vec<u8>, Vec<u8>);
+type ReceiptTrace = (BlockCpuWitness, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn receipt_trace() -> Result<ReceiptTrace, Box<dyn std::error::Error>> {
     let mut rom_bytes = vec![0_u8; ROM_IMAGE_BYTES];
@@ -370,16 +390,16 @@ fn receipt_trace() -> Result<ReceiptTrace, Box<dyn std::error::Error>> {
         rows.push(builder.step()?);
     }
     let final_memory = builder.checkpoint_memory();
-    let references = rows.iter().collect::<Vec<_>>();
+    let blocks = pack_witness_basic_blocks(Witness::from_rows(rows)?)?;
     Ok((
-        crate::NativeTraceWitness::from_rows(&references)?,
+        BlockCpuWitness::from_blocks(&blocks)?,
         rom_bytes,
         initial,
         final_memory,
     ))
 }
 
-type TwoSegmentTrace = ([NativeTraceWitness; 2], Vec<u8>, [Vec<u8>; 3]);
+type TwoSegmentTrace = ([BlockCpuWitness; 2], Vec<u8>, [Vec<u8>; 3]);
 
 fn two_segment_trace() -> Result<TwoSegmentTrace, Box<dyn std::error::Error>> {
     let mut rom_bytes = vec![0_u8; ROM_IMAGE_BYTES];
@@ -399,9 +419,11 @@ fn two_segment_trace() -> Result<TwoSegmentTrace, Box<dyn std::error::Error>> {
     let middle = builder.checkpoint_memory();
     let second = builder.step()?;
     let final_memory = builder.checkpoint_memory();
+    let first = pack_witness_basic_blocks(Witness::from_rows(vec![first])?)?;
+    let second = pack_witness_basic_blocks(Witness::from_rows(vec![second])?)?;
     let traces = [
-        NativeTraceWitness::from_rows(&[&first])?,
-        NativeTraceWitness::from_rows(&[&second])?,
+        BlockCpuWitness::from_blocks(&first)?,
+        BlockCpuWitness::from_blocks(&second)?,
     ];
     Ok((traces, rom_bytes, [initial, middle, final_memory]))
 }

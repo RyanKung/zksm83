@@ -4,8 +4,38 @@
 #![forbid(unsafe_code)]
 
 mod baseline;
+mod block_boundary;
+mod block_bus;
+mod block_control;
+mod block_cpu;
+mod block_device;
+mod block_device_apu;
+mod block_device_dma;
+mod block_device_joypad;
+mod block_device_mmio;
+mod block_device_ppu;
+mod block_device_ppu_interrupt;
+mod block_device_ppu_mmio;
+mod block_device_serial;
+mod block_device_serial_mmio;
+mod block_device_timer;
+mod block_device_timer_core;
+mod block_device_timer_mmio;
+mod block_device_timer_stage;
+mod block_flow;
+mod block_frontend;
+mod block_isa;
+mod block_isa_control;
+mod block_machine;
+mod block_memory;
+mod block_metadata;
+mod block_proof;
+mod block_routing;
+#[cfg(test)]
+mod block_test_support;
 mod continuity;
 mod cpu;
+mod field_fold;
 mod isa;
 mod isa_lookup;
 mod logs;
@@ -63,33 +93,142 @@ pub(crate) fn on_akita_worker<T: Send>(
 }
 
 pub use baseline::{BaselineError, BaselineReport, verify_transparent_opening};
+pub use block_boundary::{
+    BLOCK_BOUNDARY_COLUMN_COUNT, BLOCK_BOUNDARY_CONSTRAINT_COUNT, BLOCK_BOUNDARY_MAX_DEGREE,
+    BLOCK_DEVICE_STATE_SCALAR_COUNT, BLOCK_LOCAL_STATE_SCALAR_COUNT, BlockBoundaryError,
+    BlockBoundaryRelation, BlockBoundaryWitness,
+};
+pub use block_bus::{
+    BLOCK_BUS_COLUMN_COUNT, BLOCK_BUS_CONSTRAINT_COUNT, BLOCK_BUS_MAX_DEGREE, BlockBusError,
+    BlockBusRelation, BlockBusWitness,
+};
+pub use block_control::{
+    BLOCK_CONTROL_COLUMN_COUNT, BLOCK_CONTROL_CONSTRAINT_COUNT, BLOCK_CONTROL_MAX_DEGREE,
+    BlockControlError, BlockControlRelation, BlockControlWitness,
+};
+pub use block_cpu::{
+    BLOCK_CPU_COLUMN_COUNT, BLOCK_CPU_CONSTRAINT_COUNT, BLOCK_CPU_MAX_DEGREE, BlockCpuError,
+    BlockCpuRelation, BlockCpuWitness,
+};
+pub use block_device::{
+    BLOCK_DEVICE_ENVELOPE_COLUMN_COUNT, BLOCK_DEVICE_ENVELOPE_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_ENVELOPE_MAX_DEGREE, BlockDeviceEnvelopeError, BlockDeviceEnvelopeRelation,
+    BlockDeviceEnvelopeWitness,
+};
+pub use block_device_apu::{
+    BLOCK_DEVICE_APU_COLUMN_COUNT, BLOCK_DEVICE_APU_CONSTRAINT_COUNT, BLOCK_DEVICE_APU_MAX_DEGREE,
+    BlockDeviceApuError, BlockDeviceApuRelation, BlockDeviceApuWitness,
+};
+pub use block_device_dma::{
+    BLOCK_DEVICE_DMA_COLUMN_COUNT, BLOCK_DEVICE_DMA_CONSTRAINT_COUNT, BLOCK_DEVICE_DMA_MAX_DEGREE,
+    BlockDeviceDmaError, BlockDeviceDmaRelation, BlockDeviceDmaWitness,
+};
+pub use block_device_joypad::{
+    BLOCK_DEVICE_JOYPAD_COLUMN_COUNT, BLOCK_DEVICE_JOYPAD_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_JOYPAD_MAX_DEGREE, BlockDeviceJoypadError, BlockDeviceJoypadRelation,
+    BlockDeviceJoypadWitness,
+};
+pub use block_device_mmio::{
+    BLOCK_DEVICE_MMIO_COLUMN_COUNT, BLOCK_DEVICE_MMIO_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_MMIO_MAX_DEGREE, BlockDeviceMmioError, BlockDeviceMmioRelation,
+    BlockDeviceMmioWitness,
+};
+pub use block_device_ppu::{
+    BLOCK_DEVICE_PPU_COLUMN_COUNT, BLOCK_DEVICE_PPU_CONSTRAINT_COUNT, BLOCK_DEVICE_PPU_MAX_DEGREE,
+    BlockDevicePpuError, BlockDevicePpuRelation, BlockDevicePpuWitness,
+};
+pub use block_device_ppu_interrupt::{
+    BLOCK_DEVICE_PPU_INTERRUPT_COLUMN_COUNT, BLOCK_DEVICE_PPU_INTERRUPT_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_PPU_INTERRUPT_MAX_DEGREE, BlockDevicePpuInterruptError,
+    BlockDevicePpuInterruptRelation, BlockDevicePpuInterruptWitness,
+};
+pub use block_device_ppu_mmio::{
+    BLOCK_DEVICE_PPU_MMIO_COLUMN_COUNT, BLOCK_DEVICE_PPU_MMIO_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_PPU_MMIO_MAX_DEGREE, BlockDevicePpuMmioError, BlockDevicePpuMmioRelation,
+    BlockDevicePpuMmioWitness,
+};
+pub use block_device_serial::{
+    BLOCK_DEVICE_SERIAL_COLUMN_COUNT, BLOCK_DEVICE_SERIAL_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_SERIAL_MAX_DEGREE, BlockDeviceSerialError, BlockDeviceSerialRelation,
+    BlockDeviceSerialWitness,
+};
+pub use block_device_serial_mmio::{
+    BLOCK_DEVICE_SERIAL_MMIO_COLUMN_COUNT, BLOCK_DEVICE_SERIAL_MMIO_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_SERIAL_MMIO_MAX_DEGREE, BlockDeviceSerialMmioError, BlockDeviceSerialMmioRelation,
+    BlockDeviceSerialMmioWitness,
+};
+pub use block_device_timer::{
+    BLOCK_DEVICE_TIMER_COLUMN_COUNT, BLOCK_DEVICE_TIMER_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_TIMER_MAX_DEGREE, BlockDeviceTimerError, BlockDeviceTimerRelation,
+    BlockDeviceTimerWitness,
+};
+pub use block_device_timer_core::{
+    BLOCK_DEVICE_TIMER_CORE_COLUMN_COUNT, BLOCK_DEVICE_TIMER_CORE_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_TIMER_CORE_MAX_DEGREE, BlockDeviceTimerCoreError, BlockDeviceTimerCoreRelation,
+    BlockDeviceTimerCoreWitness,
+};
+pub use block_device_timer_mmio::{
+    BLOCK_DEVICE_TIMER_MMIO_COLUMN_COUNT, BLOCK_DEVICE_TIMER_MMIO_CONSTRAINT_COUNT,
+    BLOCK_DEVICE_TIMER_MMIO_MAX_DEGREE, BlockDeviceTimerMmioError, BlockDeviceTimerMmioRelation,
+    BlockDeviceTimerMmioWitness,
+};
+pub use block_flow::{
+    BLOCK_FLOW_COLUMN_COUNT, BLOCK_FLOW_CONSTRAINT_COUNT, BLOCK_FLOW_MAX_DEGREE, BlockFlowRelation,
+};
+pub use block_frontend::{
+    BLOCK_FRONTEND_COLUMN_COUNT, BLOCK_FRONTEND_CONSTRAINT_COUNT, BLOCK_FRONTEND_MAX_DEGREE,
+    BlockFrontendError, BlockFrontendRelation, BlockFrontendWitness,
+};
+pub use block_isa::{
+    BLOCK_ISA_COLUMN_COUNT, BLOCK_ISA_CONSTRAINT_COUNT, BLOCK_ISA_LANE_COLUMN_COUNT,
+    BLOCK_ISA_MAX_DEGREE, BlockIsaError, BlockIsaRelation, BlockIsaWitness,
+};
+pub use block_isa_control::{
+    BLOCK_ISA_CONTROL_COLUMN_COUNT, BLOCK_ISA_CONTROL_CONSTRAINT_COUNT,
+    BLOCK_ISA_CONTROL_MAX_DEGREE, BlockIsaControlError, BlockIsaControlRelation,
+    BlockIsaControlWitness,
+};
+pub use block_machine::{
+    BLOCK_MACHINE_COLUMN_COUNT, BLOCK_MACHINE_CONSTRAINT_COUNT, BLOCK_MACHINE_MAX_DEGREE,
+    BlockMachineError, BlockMachineRelation, BlockMachineWitness,
+};
+pub use block_memory::{
+    BLOCK_MEMORY_COLUMN_COUNT, BLOCK_MEMORY_CONSTRAINT_COUNT, BLOCK_MEMORY_MAX_DEGREE,
+    BlockMemoryError, BlockMemoryRelation, BlockMemoryWitness,
+};
+pub use block_proof::{
+    PACKED_BLOCK_ISA_LOOKUP_COUNT, PackedBlockProof, PackedBlockProofError,
+    prove_packed_block_components, verify_packed_block_components,
+};
+pub use block_routing::{
+    BLOCK_ROUTING_COLUMN_COUNT, BLOCK_ROUTING_CONSTRAINT_COUNT, BLOCK_ROUTING_MAX_DEGREE,
+    BlockRoutingError, BlockRoutingRelation, BlockRoutingWitness,
+};
 pub use continuity::{
-    ContinuityError, ContinuityProof, NativeExecutionClaim, prove_continuity, verify_continuity,
+    ContinuityError, NativeExecutionClaim, PackedContinuityProof, prove_packed_continuity,
+    verify_packed_continuity,
 };
-pub use cpu::{
-    CPU_STRUCTURAL_CONSTRAINT_COUNT, CPU_STRUCTURAL_MAX_DEGREE, CpuStructuralRelation,
-    NativeCpuStructuralError, NativeCpuStructuralProof, NativeMemoryCpuProof, NativeRomCpuProof,
-    prove_native_cpu_structural, prove_native_memory_cpu, prove_native_rom_cpu,
-    verify_native_cpu_structural, verify_native_memory_cpu, verify_native_rom_cpu,
-};
+pub use cpu::{CPU_STRUCTURAL_CONSTRAINT_COUNT, CPU_STRUCTURAL_MAX_DEGREE, CpuStructuralRelation};
 pub use isa::{
-    ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_OPERATION_BITS_START,
-    ISA_OUTPUT_COUNT, ISA_PACKED_HIGH, ISA_PACKED_LOW, ISA_TABLE_ROW_COUNT, ISA_TAKEN_TIMING,
-    ISA_VALID, ISA_WRITE_BITS_START, IsaTableError, IsaTableRow, fixed_isa_table,
-    fixed_isa_table_digest,
+    ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_BASE_M_CYCLES, ISA_DATA_READS,
+    ISA_DATA_WRITES, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES, ISA_OPERATION_BITS_START,
+    ISA_OUTPUT_COUNT, ISA_PACKED_HIGH, ISA_PACKED_LOW, ISA_PADDING_ADDRESS, ISA_TABLE_ROW_COUNT,
+    ISA_TAKEN_DATA_READS, ISA_TAKEN_DATA_WRITES, ISA_TAKEN_M_CYCLES, ISA_TAKEN_TIMING, ISA_VALID,
+    ISA_WRITE_BITS_START, IsaTableError, IsaTableRow, fixed_isa_table, fixed_isa_table_digest,
 };
 pub use isa_lookup::{
     FIXED_ISA_TABLE_COMMITMENT_SHA256, FixedIsaCommitments, ISA_ADDRESS_BIT_COUNT,
     IsaLookupColumns, IsaLookupError, IsaLookupProof, prove_isa_lookup, verify_isa_lookup,
 };
 pub use logs::{
-    CommittedProtocolLogs, ProtocolLogCommitments, ProtocolLogError, ProtocolLogProof,
-    commit_protocol_logs, prove_protocol_logs, verify_protocol_logs,
+    CommittedProtocolLogs, PackedProtocolLogClaim, PackedProtocolLogProof, ProtocolLogCommitments,
+    ProtocolLogError, commit_packed_protocol_logs, prove_packed_protocol_logs,
+    verify_packed_protocol_logs,
 };
 pub use memory::{
     CommittedMemory, MEMORY_IMAGE_BYTES, MEMORY_TABLE_NUM_VARIABLES, MemoryCommitment,
-    MutableMemoryError, MutableMemoryProof, commit_memory, prove_mutable_memory,
-    verify_mutable_memory,
+    MutableMemoryError, PackedMutableMemoryProof, commit_memory, prove_packed_mutable_memory,
+    verify_packed_mutable_memory,
 };
 pub use metrics::{NativeProofPhaseMetrics, native_proof_phase_metrics};
 pub use pcs_batch_gate::{
@@ -97,14 +236,13 @@ pub use pcs_batch_gate::{
     run_pcs_batch_gate_worker,
 };
 pub use receipt::{
-    CommitmentIdentity, CommitmentKind, LEGACY_NATIVE_RECEIPT_VERSION, MAX_NATIVE_RECEIPT_BYTES,
-    MAX_NATIVE_ROM_COMMITMENT_BYTES, MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT,
-    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION,
-    NativeBoundary, NativeReceipt, NativeReceiptError, NativeReceiptStreamProver,
-    NativeSegmentReceipt, NativeSegmentWitness, NativeStatement, ProtocolLogCounts,
-    ProtocolLogIdentities, ProtocolLogKind, VerifiedNativeReceipt, VerifiedNativeSpool,
-    verify_native_receipt, verify_native_receipt_bytes, verify_native_receipt_reader,
-    verify_native_spool_reader,
+    CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
+    MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
+    MAX_NATIVE_STREAM_RECEIPT_BYTES, NATIVE_RECEIPT_VERSION, NativeBoundary, NativeReceipt,
+    NativeReceiptError, NativeReceiptStreamProver, NativeSegmentReceipt, NativeSegmentWitness,
+    NativeStatement, ProtocolLogCounts, ProtocolLogIdentities, ProtocolLogKind,
+    VerifiedNativeReceipt, VerifiedNativeSpool, native_backend_digest, verify_native_receipt,
+    verify_native_receipt_bytes, verify_native_receipt_reader, verify_native_spool_reader,
 };
 pub use rom_lookup::{
     CommittedRom, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment, RomLookupColumns,
@@ -112,7 +250,15 @@ pub use rom_lookup::{
 };
 use serde::Serialize;
 pub use state::{
-    NativeStateBoundary, STATE_SCALAR_COUNT, STATE_SCALAR_NAMES, encode_state_scalars,
+    NativeStateBoundary, STATE_APU_CONTROL_HIGH_PACK_INDEX, STATE_APU_CONTROL_LOW_PACK_INDEX,
+    STATE_APU_MIXER_PACK_INDEX, STATE_APU_WAVE_HIGH_PACK_INDEX, STATE_APU_WAVE_LOW_PACK_INDEX,
+    STATE_BUS_NEXT_INDEX, STATE_CPU_M_CYCLES_INDEX, STATE_DMA_PACK_INDEX,
+    STATE_DMG_HIGH_REGISTER_PACK_INDEX, STATE_DMG_LOW_REGISTER_PACK_INDEX, STATE_INPUT_NEXT_INDEX,
+    STATE_INTERRUPT_ENABLE_INDEX, STATE_INTERRUPT_REQUEST_INDEX, STATE_ISA_NEXT_INDEX,
+    STATE_JOYPAD_PACK_INDEX, STATE_MACHINE_PROFILE_INDEX, STATE_OUTPUT_NEXT_INDEX,
+    STATE_PPU_DOT_INDEX, STATE_PPU_LINE_INDEX, STATE_SCALAR_COUNT, STATE_SCALAR_NAMES,
+    STATE_TIMER_COUNTER_INDEX, STATE_TIMER_DIV_INDEX, STATE_TIMER_EDGE_LATCH_INDEX,
+    STATE_TIMER_RELOAD_PHASE_INDEX, encode_state_scalars,
 };
 pub use trace::{
     NATIVE_TRACE_COLUMN_COUNT, NativeTraceError, NativeTraceWitness, TRACE_ACTIVE,
@@ -142,14 +288,17 @@ pub use trace::{
     TRACE_RESULT_ZERO, TRACE_RESULT_ZERO_PRODUCT_COUNT, TRACE_RESULT_ZERO_PRODUCTS_START,
     TRACE_ROM_SELECTOR_START, TRACE_ROM_VALUE_START, TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START,
     TRACE_SEQUENTIAL_PC, TRACE_SEQUENTIAL_PC_BITS_START, TRACE_SIGNED_SP_OVERFLOW,
-    TRACE_SIGNED_SP_UNDERFLOW, TRACE_STACK_FIRST_WRAP, TRACE_STACK_WRAP, TRACE_SUMMARY_AUX,
-    TRACE_WORD_CARRY, TRACE_WORD_HALF_CARRY, TRACE_WORD_WRAP,
+    TRACE_SIGNED_SP_UNDERFLOW, TRACE_STACK_FIRST_WRAP, TRACE_STACK_WRAP, TRACE_WORD_CARRY,
+    TRACE_WORD_HALF_CARRY, TRACE_WORD_WRAP,
 };
 pub use uniform::{
-    COMMITMENT_GROUP_COLUMNS, CommittedWitness, NativeField, UNIFORM_NUM_VARIABLES,
-    UNIFORM_ROW_COUNT, UniformError, UniformProof, UniformRelation, UniformRelationProof,
-    WitnessCommitments, commit_witness, prove_uniform, prove_uniform_committed, verify_uniform,
-    verify_uniform_committed,
+    BLOCK_CPU_COMMITMENT_GROUP_COUNT, BLOCK_CPU_OPENING_COUNT, BLOCK_CPU_PADDED_COLUMN_COUNT,
+    BLOCK_CPU_PADDING_COLUMN_COUNT, COMMITMENT_GROUP_COLUMNS, CommittedWitness, ConstraintOutput,
+    NATIVE_TRACE_COMMITMENT_GROUP_COUNT, NATIVE_TRACE_OPENING_COUNT,
+    NATIVE_TRACE_PADDED_COLUMN_COUNT, NATIVE_TRACE_PADDING_COLUMN_COUNT, NativeField,
+    UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT, UniformError, UniformProof, UniformRelation,
+    UniformRelationProof, WitnessCommitments, commit_witness, prove_uniform,
+    prove_uniform_committed, validate_uniform_witness, verify_uniform, verify_uniform_committed,
 };
 
 /// Exact Jolt protocol revision used as the native-SM83 integration reference.
@@ -165,8 +314,8 @@ pub const JOLT_FIELD_REVISION: &str = "72dc6451628d8b1dd794147a1f1cc40be0d77963"
 pub const AKITA_BASELINE_SCHEDULE_SHA256: &str =
     "c2098502e4c976a6a6cf687e4f70acfcb818372e2fbd589bff7b18e8decfa9cf";
 
-/// SHA-256 of the version-one 14-variable, 128-column relation schedule.
-pub const AKITA_SCHEDULE_SHA256_V1: &str =
+/// SHA-256 of the single-group 14-variable auxiliary relation schedule.
+pub const AKITA_AUXILIARY_SCHEDULE_SHA256: &str =
     "e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646";
 
 /// SHA-256 of the version-two paired 14-variable, 128-column relation schedule.
@@ -175,9 +324,6 @@ pub const AKITA_SCHEDULE_SHA256_V2: &str =
 
 /// SHA-256 of the current native trace schedule.
 pub const AKITA_SCHEDULE_SHA256: &str = AKITA_SCHEDULE_SHA256_V2;
-
-/// SHA-256 of the single-group schedule used by v2 auxiliary trace planes.
-pub const AKITA_AUXILIARY_SCHEDULE_SHA256: &str = AKITA_SCHEDULE_SHA256_V1;
 
 /// SHA-256 of the generated 9-variable, 128-column fixed-ISA schedule.
 pub const AKITA_ISA_TABLE_SCHEDULE_SHA256: &str =
@@ -195,21 +341,20 @@ pub const AKITA_MEMORY_SCHEDULE_SHA256: &str =
 pub const AKITA_LOG_SCHEDULE_SHA256: &str =
     "2dba5b6d53ca57eaee58c872ceba3cdf6c7dbfe522162144577e71cadf543a80";
 
-/// Stable protocol identifier for verification-only version-one receipts.
-pub const PROTOCOL_ID_V1: &str = "zksm83-native-jolt-akita-v1";
-
 /// Stable protocol identifier for canonical version-two receipts.
 pub const PROTOCOL_ID_V2: &str = "zksm83-native-jolt-akita-v2";
 
 /// Stable protocol identifier emitted by the current prover.
 pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
 
-/// Supported native receipt protocol revisions.
+/// Explicit proof/receipt composition revision bound by current backend identities.
+pub const PROOF_COMPOSITION_REVISION_V2: &str =
+    "packed-block-transition-count-derived-cpu-scalars-v2";
+
+/// The sole native receipt protocol revision supported by this build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeProtocolVersion {
-    /// Historical independent-opening receipt accepted only for verification.
-    V1,
     /// Canonical paired-opening receipt emitted by current provers.
     V2,
 }
@@ -225,7 +370,6 @@ impl NativeProtocolVersion {
     #[must_use]
     pub const fn from_code(code: u64) -> Option<Self> {
         match code {
-            1 => Some(Self::V1),
             2 => Some(Self::V2),
             _ => None,
         }
@@ -235,7 +379,6 @@ impl NativeProtocolVersion {
     #[must_use]
     pub const fn code(self) -> u64 {
         match self {
-            Self::V1 => 1,
             Self::V2 => 2,
         }
     }
@@ -244,7 +387,6 @@ impl NativeProtocolVersion {
     #[must_use]
     pub const fn protocol_id(self) -> &'static str {
         match self {
-            Self::V1 => PROTOCOL_ID_V1,
             Self::V2 => PROTOCOL_ID_V2,
         }
     }
@@ -253,7 +395,6 @@ impl NativeProtocolVersion {
     #[must_use]
     pub const fn trace_schedule_sha256(self) -> &'static str {
         match self {
-            Self::V1 => AKITA_SCHEDULE_SHA256_V1,
             Self::V2 => AKITA_SCHEDULE_SHA256_V2,
         }
     }
@@ -305,6 +446,8 @@ pub struct BackendIdentity {
     pub field: &'static str,
     /// Fiat-Shamir transcript selected for native proofs.
     pub transcript: &'static str,
+    /// Exact proof/receipt composition revision, including auxiliary relations and wire fields.
+    pub proof_composition_revision: &'static str,
     /// Number of Boolean row-address variables in one trace segment.
     pub relation_num_variables: usize,
     /// Number of logical trace columns committed by the CPU relation.
@@ -343,10 +486,11 @@ pub const fn backend_identity_for(protocol: NativeProtocolVersion) -> BackendIde
         isa_table_commitment_sha256: FIXED_ISA_TABLE_COMMITMENT_SHA256,
         field: "akita-proof-optimized-fp128-dense-bounded",
         transcript: "blake2b-512",
+        proof_composition_revision: PROOF_COMPOSITION_REVISION_V2,
         relation_num_variables: UNIFORM_NUM_VARIABLES,
-        trace_column_count: NATIVE_TRACE_COLUMN_COUNT,
-        constraint_count: CPU_STRUCTURAL_CONSTRAINT_COUNT,
-        max_constraint_degree: CPU_STRUCTURAL_MAX_DEGREE,
+        trace_column_count: BLOCK_CPU_COLUMN_COUNT,
+        constraint_count: BLOCK_CPU_CONSTRAINT_COUNT,
+        max_constraint_degree: BLOCK_CPU_MAX_DEGREE,
         commitment_group_columns: COMMITMENT_GROUP_COLUMNS,
         privacy: ProofPrivacy::Transparent,
         uses_rv64_guest: false,
@@ -356,8 +500,10 @@ pub const fn backend_identity_for(protocol: NativeProtocolVersion) -> BackendIde
 #[cfg(test)]
 mod tests {
     use super::{
-        LEGACY_NATIVE_RECEIPT_VERSION, NATIVE_RECEIPT_VERSION, NativeProtocolVersion, ProofPrivacy,
-        backend_identity, backend_identity_for,
+        BLOCK_CPU_COLUMN_COUNT, BLOCK_CPU_COMMITMENT_GROUP_COUNT, BLOCK_CPU_CONSTRAINT_COUNT,
+        BLOCK_CPU_MAX_DEGREE, BLOCK_CPU_OPENING_COUNT, BLOCK_CPU_PADDED_COLUMN_COUNT,
+        BLOCK_CPU_PADDING_COLUMN_COUNT, NATIVE_RECEIPT_VERSION, NativeProtocolVersion,
+        ProofPrivacy, backend_identity,
     };
 
     #[test]
@@ -369,16 +515,20 @@ mod tests {
     }
 
     #[test]
-    fn protocol_versions_have_distinct_backend_identities() {
-        let legacy = backend_identity_for(NativeProtocolVersion::V1);
-        let current = backend_identity_for(NativeProtocolVersion::V2);
-        assert_ne!(legacy.protocol, current.protocol);
-        assert_ne!(legacy.schedule_sha256, current.schedule_sha256);
-        assert_eq!(backend_identity(), current);
+    fn protocol_identity_is_v2_only() {
+        assert_eq!(NativeProtocolVersion::from_code(1), None);
+        let current = backend_identity();
+        assert_eq!(current.trace_column_count, BLOCK_CPU_COLUMN_COUNT);
+        assert_eq!(current.constraint_count, BLOCK_CPU_CONSTRAINT_COUNT);
+        assert_eq!(current.max_constraint_degree, BLOCK_CPU_MAX_DEGREE);
         assert_eq!(
-            NativeProtocolVersion::V1.code(),
-            LEGACY_NATIVE_RECEIPT_VERSION
+            current.proof_composition_revision,
+            super::PROOF_COMPOSITION_REVISION_V2
         );
+        assert_eq!(BLOCK_CPU_COMMITMENT_GROUP_COUNT, 36);
+        assert_eq!(BLOCK_CPU_OPENING_COUNT, 18);
+        assert_eq!(BLOCK_CPU_PADDED_COLUMN_COUNT, 4_608);
+        assert_eq!(BLOCK_CPU_PADDING_COLUMN_COUNT, 103);
         assert_eq!(NativeProtocolVersion::V2.code(), NATIVE_RECEIPT_VERSION);
         assert_eq!(NativeProtocolVersion::current(), NativeProtocolVersion::V2);
     }

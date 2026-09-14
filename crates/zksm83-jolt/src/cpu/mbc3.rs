@@ -9,8 +9,7 @@ use crate::{
 use super::{
     BUS_AUXILIARY_OFFSET, BUS_BEFORE_OFFSET, BUS_INDEX_OFFSET, BUS_PHYSICAL_ADDRESS_OFFSET,
     BUS_VALUE_OFFSET, ConstraintSink, RowView, STATE_MBC3_RAM_ENABLED, STATE_MBC3_RAM_RTC_SELECT,
-    STATE_MBC3_ROM_BANK, bit_selector, boolean, bus_field, bus_kind_bits, packed_bits,
-    zero_from_bits,
+    STATE_MBC3_ROM_BANK, boolean, bus_field, packed_bits, zero_from_bits,
 };
 
 pub(super) fn constrain_mapper_and_rom(
@@ -32,9 +31,8 @@ fn constrain_external_ram_policy(
     let available =
         ram_enabled * (one - view.value(select_bits + 2)?) * (one - view.value(select_bits + 3)?);
     for slot in 0..TRACE_BUS_SLOTS {
-        let kinds = bus_kind_bits(view, slot)?;
-        let open_read = bit_selector(kinds, 9)?;
-        let ignored_write = bit_selector(kinds, 10)?;
+        let open_read = view.bus_kind_selector(slot, 9)?;
+        let ignored_write = view.bus_kind_selector(slot, 10)?;
         let selected = open_read + ignored_write;
         let address = TRACE_BUS_ADDRESS_BITS_START + slot * 16;
         sink.push(selected * (one - view.value(address + 15)?))?;
@@ -82,7 +80,7 @@ fn constrain_mapper_updates(
     let mut bank_update = NativeField::from_u64(0);
     let mut select_update = NativeField::from_u64(0);
     for slot in 0..TRACE_BUS_SLOTS {
-        let control = bit_selector(bus_kind_bits(view, slot)?, 8)?;
+        let control = view.bus_kind_selector(slot, 8)?;
         let address_bits = TRACE_BUS_ADDRESS_BITS_START + slot * 16;
         let value_bits = TRACE_BUS_VALUE_BITS_START + slot * 8;
         let [ram_segment, bank_segment, select_segment, _] =

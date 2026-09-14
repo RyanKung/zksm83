@@ -26,7 +26,6 @@ pub const FIXED_ISA_TABLE_COMMITMENT_SHA256: &str =
     "fc4afaeb9c3d6a7dc063e2927caee773ae4a29f3c16e7d3f1aa5f266ea3f9c9a";
 
 const ISA_TABLE_NUM_VARIABLES: usize = 9;
-const ISA_LOOKUP_TRANSCRIPT_DOMAIN: &[u8] = b"zksm83-native-isa-shout/v1";
 const ISA_LOOKUP_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-isa-shout/v2";
 const ISA_TABLE_COMMITMENT_DOMAIN: &[u8] = b"zksm83/native-isa-table-commitment/v1";
 const ISA_TABLE_OPENING_DOMAIN: &[u8] = b"zksm83-native-isa-table-opening/v1";
@@ -241,11 +240,17 @@ fn prove_isa_lookup_on_worker(
     let output_mix = nonzero_challenge(&mut transcript, b"isa-output-mix")?;
     let coefficients = challenge_powers(output_mix, ISA_OUTPUT_COUNT);
     let cycle_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES, b"isa-cycle-point");
-    let mixed_table = mix_columns(table.field_columns(), &canonical_indices(), &coefficients)?;
-    let mixed_trace = mix_columns(witness.field_columns(), &layout.outputs, &coefficients)?;
+    let table_columns = table.field_columns()?;
+    let trace_columns = witness.field_columns()?;
+    let mixed_table = mix_columns(
+        table_columns.as_slice(),
+        &canonical_indices(),
+        &coefficients,
+    )?;
+    let mixed_trace = mix_columns(trace_columns.as_slice(), &layout.outputs, &coefficients)?;
     let claimed_output = evaluate_mle(&mixed_trace, &cycle_point)?;
     transcript.append_field(b"isa-claimed-output", &claimed_output);
-    let addresses = trace_addresses(witness.field_columns(), &layout.address_bits)?;
+    let addresses = trace_addresses(trace_columns.as_slice(), &layout.address_bits)?;
     let cycle_weights = equality_evaluations(&cycle_point);
     let read_address = read_address_table(&addresses, &cycle_weights)?;
     let (table_sumcheck, actual_claim, table_point) =
@@ -253,7 +258,7 @@ fn prove_isa_lookup_on_worker(
     if actual_claim != claimed_output {
         return Err(IsaLookupError::OutputClaimMismatch);
     }
-    let table_values = evaluate_columns(table.field_columns(), &table_point)?;
+    let table_values = evaluate_columns(table_columns.as_slice(), &table_point)?;
     require_mixed_value(
         &table_values,
         &canonical_indices(),
@@ -263,7 +268,7 @@ fn prove_isa_lookup_on_worker(
     )?;
     let address_factors = address_binding_factors(
         &cycle_weights,
-        witness.field_columns(),
+        trace_columns.as_slice(),
         &layout.address_bits,
         &table_point,
     )?;
@@ -272,7 +277,7 @@ fn prove_isa_lookup_on_worker(
     if address_claim != table_sumcheck.final_left() {
         return Err(IsaLookupError::AddressBindingMismatch);
     }
-    let trace_cycle_values = evaluate_columns(witness.field_columns(), &cycle_point)?;
+    let trace_cycle_values = evaluate_columns(trace_columns.as_slice(), &cycle_point)?;
     require_mixed_value(
         &trace_cycle_values,
         &layout.outputs,
@@ -280,7 +285,7 @@ fn prove_isa_lookup_on_worker(
         claimed_output,
         IsaLookupError::OutputClaimMismatch,
     )?;
-    let trace_address_values = evaluate_columns(witness.field_columns(), &address_point)?;
+    let trace_address_values = evaluate_columns(trace_columns.as_slice(), &address_point)?;
     verify_address_terminal(
         &address_sumcheck,
         &cycle_point,
@@ -428,15 +433,21 @@ fn fixed_table_columns() -> Result<Vec<Vec<u64>>, IsaLookupError> {
 }
 
 fn trace_addresses(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     address_bits: &[usize; ISA_ADDRESS_BIT_COUNT],
 ) -> Result<Vec<usize>, IsaLookupError> {
-    let row_count = columns.first().map(Vec::len).ok_or(IsaLookupError::Shape)?;
+    let row_count = columns
+        .first()
+        .map(|column| column.as_ref().len())
+        .ok_or(IsaLookupError::Shape)?;
     let zero = NativeField::from_u64(0);
     let one = NativeField::from_u64(1);
     let mut addresses = vec![0_usize; row_count];
     for (bit, column_index) in address_bits.iter().copied().enumerate() {
-        let column = columns.get(column_index).ok_or(IsaLookupError::Shape)?;
+        let column = columns
+            .get(column_index)
+            .map(AsRef::as_ref)
+            .ok_or(IsaLookupError::Shape)?;
         if column.len() != row_count {
             return Err(IsaLookupError::Shape);
         }
@@ -483,7 +494,7 @@ fn read_address_table(
 
 fn address_binding_factors(
     cycle_weights: &[NativeField],
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     address_bits: &[usize; ISA_ADDRESS_BIT_COUNT],
     table_point: &[NativeField],
 ) -> Result<Vec<Vec<NativeField>>, IsaLookupError> {
@@ -494,7 +505,10 @@ fn address_binding_factors(
     let mut factors = Vec::with_capacity(ISA_ADDRESS_BIT_COUNT + 1);
     factors.push(cycle_weights.to_vec());
     for (column_index, point) in address_bits.iter().copied().zip(table_point) {
-        let column = columns.get(column_index).ok_or(IsaLookupError::Shape)?;
+        let column = columns
+            .get(column_index)
+            .map(AsRef::as_ref)
+            .ok_or(IsaLookupError::Shape)?;
         if column.len() != cycle_weights.len() {
             return Err(IsaLookupError::Shape);
         }
@@ -572,7 +586,6 @@ fn lookup_transcript(
     side: TranscriptSide,
 ) -> AkitaTranscript<NativeField> {
     let domain = match protocol {
-        NativeProtocolVersion::V1 => ISA_LOOKUP_TRANSCRIPT_DOMAIN,
         NativeProtocolVersion::V2 => ISA_LOOKUP_TRANSCRIPT_DOMAIN_V2,
     };
     let mut transcript = match side {
@@ -620,17 +633,23 @@ fn canonical_indices() -> [usize; ISA_OUTPUT_COUNT] {
 }
 
 fn mix_columns(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     indices: &[usize],
     coefficients: &[NativeField],
 ) -> Result<Vec<NativeField>, IsaLookupError> {
     if indices.is_empty() || indices.len() != coefficients.len() {
         return Err(IsaLookupError::Shape);
     }
-    let row_count = columns.first().map(Vec::len).ok_or(IsaLookupError::Shape)?;
+    let row_count = columns
+        .first()
+        .map(|column| column.as_ref().len())
+        .ok_or(IsaLookupError::Shape)?;
     let mut mixed = vec![NativeField::from_u64(0); row_count];
     for (column_index, coefficient) in indices.iter().copied().zip(coefficients) {
-        let column = columns.get(column_index).ok_or(IsaLookupError::Shape)?;
+        let column = columns
+            .get(column_index)
+            .map(AsRef::as_ref)
+            .ok_or(IsaLookupError::Shape)?;
         if column.len() != row_count {
             return Err(IsaLookupError::Shape);
         }
@@ -668,12 +687,12 @@ fn require_mixed_value(
 }
 
 fn evaluate_columns(
-    columns: &[Vec<NativeField>],
+    columns: &[impl AsRef<[NativeField]>],
     point: &[NativeField],
 ) -> Result<Vec<NativeField>, IsaLookupError> {
     columns
         .iter()
-        .map(|column| evaluate_mle(column, point))
+        .map(|column| evaluate_mle(column.as_ref(), point))
         .collect()
 }
 
@@ -698,14 +717,7 @@ fn fold(values: &mut Vec<NativeField>, challenge: NativeField) -> Result<(), Isa
     if values.len() <= 1 || !values.len().is_multiple_of(2) {
         return Err(IsaLookupError::Shape);
     }
-    let mut folded = Vec::with_capacity(values.len() / 2);
-    for pair in values.chunks_exact(2) {
-        let low = pair.first().copied().ok_or(IsaLookupError::Shape)?;
-        let high = pair.get(1).copied().ok_or(IsaLookupError::Shape)?;
-        folded.push(low + challenge * (high - low));
-    }
-    *values = folded;
-    Ok(())
+    crate::field_fold::fold_binary_layer(values, challenge).map_err(|_| IsaLookupError::Shape)
 }
 
 fn equality_evaluations(point: &[NativeField]) -> Vec<NativeField> {

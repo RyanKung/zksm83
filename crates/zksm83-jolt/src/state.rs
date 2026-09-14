@@ -5,6 +5,53 @@ use zksm83_core::VmState;
 /// Number of canonical `u64` limbs in a native semantic state boundary.
 pub const STATE_SCALAR_COUNT: usize = 38;
 
+/// State-scalar index of the cumulative CPU machine-cycle counter.
+pub const STATE_CPU_M_CYCLES_INDEX: usize = 12;
+/// State-scalar index of the next committed private-input position.
+pub const STATE_INPUT_NEXT_INDEX: usize = 16;
+/// State-scalar index of the next committed public-output position.
+pub const STATE_OUTPUT_NEXT_INDEX: usize = 17;
+/// State-scalar index of the next ordered bus-transcript position.
+pub const STATE_BUS_NEXT_INDEX: usize = 18;
+/// State-scalar index of the next fixed-ISA transcript position.
+pub const STATE_ISA_NEXT_INDEX: usize = 19;
+/// State-scalar index of the immutable machine-profile discriminator.
+pub const STATE_MACHINE_PROFILE_INDEX: usize = 20;
+/// State-scalar index of the DMG interrupt-request mask.
+pub const STATE_INTERRUPT_REQUEST_INDEX: usize = 21;
+/// State-scalar index of the DMG interrupt-enable mask.
+pub const STATE_INTERRUPT_ENABLE_INDEX: usize = 22;
+/// State-scalar index of the packed low DMG MMIO registers.
+pub const STATE_DMG_LOW_REGISTER_PACK_INDEX: usize = 23;
+/// State-scalar index of the packed high DMG MMIO registers.
+pub const STATE_DMG_HIGH_REGISTER_PACK_INDEX: usize = 24;
+/// State-scalar index of the current PPU line.
+pub const STATE_PPU_LINE_INDEX: usize = 25;
+/// State-scalar index of the current PPU dot.
+pub const STATE_PPU_DOT_INDEX: usize = 26;
+/// State-scalar index of the timer divider.
+pub const STATE_TIMER_DIV_INDEX: usize = 27;
+/// State-scalar index of the timer counter.
+pub const STATE_TIMER_COUNTER_INDEX: usize = 28;
+/// State-scalar index of the timer reload phase.
+pub const STATE_TIMER_RELOAD_PHASE_INDEX: usize = 29;
+/// State-scalar index of the timer edge latch.
+pub const STATE_TIMER_EDGE_LATCH_INDEX: usize = 30;
+/// State-scalar index of the packed low APU control registers.
+pub const STATE_APU_CONTROL_LOW_PACK_INDEX: usize = 31;
+/// State-scalar index of the packed high APU control registers.
+pub const STATE_APU_CONTROL_HIGH_PACK_INDEX: usize = 32;
+/// State-scalar index of the packed APU mixer registers.
+pub const STATE_APU_MIXER_PACK_INDEX: usize = 33;
+/// State-scalar index of the packed low APU wave RAM.
+pub const STATE_APU_WAVE_LOW_PACK_INDEX: usize = 34;
+/// State-scalar index of the packed high APU wave RAM.
+pub const STATE_APU_WAVE_HIGH_PACK_INDEX: usize = 35;
+/// State-scalar index of the packed joypad state.
+pub const STATE_JOYPAD_PACK_INDEX: usize = 36;
+/// State-scalar index of the packed OAM DMA state.
+pub const STATE_DMA_PACK_INDEX: usize = 37;
+
 /// Canonical scalar names in the same order as [`encode_state_scalars`].
 pub const STATE_SCALAR_NAMES: [&str; STATE_SCALAR_COUNT] = [
     "cpu_a",

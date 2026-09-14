@@ -4,8 +4,9 @@ use akita_pcs::Ring;
 
 use super::{
     BUS_ADDRESS_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, DMA_BYTE_MODE, HALT_IDLE_MODE,
-    INSTRUCTION_MODE, RowView, STATE_IME, STATE_RUN_STATE, bit_selector, bus_field, bus_kind_bits,
-    operation_selector, packed_bits, zero_from_bits,
+    HALT_UNTIL_SERIAL_MODE, HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, HALT_WAKE_MODE,
+    INSTRUCTION_MODE, INTERRUPT_MODE, RowView, STATE_IME, STATE_RUN_STATE, bit_selector, bus_field,
+    bus_kind_bits, operation_selector, packed_bits, zero_from_bits,
 };
 use crate::{
     NativeField, TRACE_ACTIVE, TRACE_AFTER_DMA_BITS_START, TRACE_AFTER_INTERRUPT_ENABLE_BITS_START,
@@ -21,12 +22,6 @@ use crate::{
 };
 
 const INTERRUPT_BITS: usize = 5;
-const HALT_UNTIL_VBLANK_MODE: usize = 2;
-const BLUE_SOUND_WAIT_MODE: usize = 3;
-const BLUE_DELAY_LOOP_MODE: usize = 4;
-const BLUE_DMA_WAIT_MODE: usize = 5;
-const HALT_WAKE_MODE: usize = 7;
-const INTERRUPT_MODE: usize = 8;
 const STATE_INTERRUPT_REQUEST: usize = 21;
 const STATE_INTERRUPT_ENABLE: usize = 22;
 const STATE_DMA_PACK: usize = 37;
@@ -145,7 +140,7 @@ fn constrain_dma_state(
     )?;
     constrain_dma_general_transition(view, sink)?;
     constrain_dma_priority_and_copy(view, sink)?;
-    constrain_dma_wait_pack(view, sink)
+    Ok(())
 }
 
 fn constrain_dma_snapshot(
@@ -176,8 +171,7 @@ fn constrain_dma_general_transition(
 ) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
     let dma = view.mode(DMA_BYTE_MODE)?;
-    let blue_wait = view.mode(BLUE_DMA_WAIT_MODE)?;
-    let general = one - dma - blue_wait;
+    let general = one - dma;
     let source = packed_bits(view, TRACE_BEFORE_DMA_BITS_START, 8)?;
     let index = packed_bits(view, TRACE_BEFORE_DMA_BITS_START + 8, 8)?;
     let active = view.value(TRACE_BEFORE_DMA_BITS_START + 16)?;
@@ -205,10 +199,10 @@ fn constrain_dma_scheduling(
     let one = NativeField::from_u64(1);
     let regular =
         view.mode(INSTRUCTION_MODE)? + view.mode(HALT_IDLE_MODE)? + view.mode(INTERRUPT_MODE)?;
-    let excluded = regular + view.mode(DMA_BYTE_MODE)? + view.mode(BLUE_DMA_WAIT_MODE)?;
+    let excluded = regular + view.mode(DMA_BYTE_MODE)?;
     let quiet_long = view.mode(HALT_UNTIL_VBLANK_MODE)?
-        + view.mode(BLUE_SOUND_WAIT_MODE)?
-        + view.mode(BLUE_DELAY_LOOP_MODE)?;
+        + view.mode(HALT_UNTIL_SERIAL_MODE)?
+        + view.mode(HALT_UNTIL_TIMER_MODE)?;
     let after_owed = packed_bits(view, TRACE_AFTER_DMA_BITS_START + 24, 8)?;
     let before_owed = packed_bits(view, TRACE_BEFORE_DMA_BITS_START + 24, 8)?;
     let mut scheduled = NativeField::from_u64(0);
@@ -293,29 +287,6 @@ fn constrain_dma_copy_bus(
                 * view.value(TRACE_BEFORE_DMA_BITS_START + 13)?);
     sink.push(dma * high_invalid)?;
     sink.push(dma * index_over_159)
-}
-
-fn constrain_dma_wait_pack(
-    view: &RowView<'_>,
-    sink: &mut ConstraintSink<'_>,
-) -> Result<(), UniformError> {
-    let selected = view.mode(BLUE_DMA_WAIT_MODE)?;
-    let before_source = packed_bits(view, TRACE_BEFORE_DMA_BITS_START, 8)?;
-    let after_source = packed_bits(view, TRACE_AFTER_DMA_BITS_START, 8)?;
-    sink.push(selected * (after_source - before_source))?;
-    for (start, expected_index, expected_active, expected_owed) in [
-        (TRACE_BEFORE_DMA_BITS_START, 2, 1, 0),
-        (TRACE_AFTER_DMA_BITS_START, 2, 1, 158),
-    ] {
-        sink.push(
-            selected * (packed_bits(view, start + 8, 8)? - NativeField::from_u64(expected_index)),
-        )?;
-        sink.push(selected * (view.value(start + 16)? - NativeField::from_u64(expected_active)))?;
-        sink.push(
-            selected * (packed_bits(view, start + 24, 8)? - NativeField::from_u64(expected_owed)),
-        )?;
-    }
-    Ok(())
 }
 
 fn fixed_byte_selector(
@@ -434,12 +405,14 @@ fn constrain_mode_selection(
     let ime = view.before(STATE_IME)?;
     let ime_enabled_scaled = ime * (ime - NativeField::from_u64(1));
     let instruction = view.mode(INSTRUCTION_MODE)?;
-    let summaries = view.mode(BLUE_SOUND_WAIT_MODE)? + view.mode(BLUE_DELAY_LOOP_MODE)?;
-    sink.push((instruction + summaries) * ime_enabled_scaled * pending)?;
+    sink.push(instruction * ime_enabled_scaled * pending)?;
     let wake = view.mode(HALT_WAKE_MODE)?;
     sink.push(wake * (pending - NativeField::from_u64(1)))?;
     sink.push(wake * ime_enabled_scaled)?;
-    let sleeping = view.mode(HALT_IDLE_MODE)? + view.mode(HALT_UNTIL_VBLANK_MODE)?;
+    let sleeping = view.mode(HALT_IDLE_MODE)?
+        + view.mode(HALT_UNTIL_VBLANK_MODE)?
+        + view.mode(HALT_UNTIL_SERIAL_MODE)?
+        + view.mode(HALT_UNTIL_TIMER_MODE)?;
     sink.push(sleeping * pending)?;
     let halt = instruction * operation_selector(view, 18)?;
     let not_enabled_scaled = NativeField::from_u64(2) - ime_enabled_scaled;

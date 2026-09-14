@@ -9,6 +9,8 @@ pub const ISA_TABLE_ROW_COUNT: usize = 512;
 
 /// Number of scalar outputs in one native ISA-table row.
 pub const ISA_OUTPUT_COUNT: usize = 49;
+/// Canonical undefined primary opcode used for inactive ISA lookup lanes.
+pub const ISA_PADDING_ADDRESS: u16 = 0x00d3;
 
 /// Index of the validity bit in [`IsaTableRow::outputs`].
 pub const ISA_VALID: usize = 0;
@@ -18,6 +20,22 @@ pub const ISA_PACKED_LOW: usize = 1;
 pub const ISA_PACKED_HIGH: usize = 2;
 /// First index of the 13 register-write selector bits.
 pub const ISA_WRITE_BITS_START: usize = 22;
+/// Index of the fixed primary/CB opcode-fetch count.
+pub const ISA_OPCODE_FETCHES: usize = 16;
+/// Index of the fixed immediate-byte read count.
+pub const ISA_IMMEDIATE_READS: usize = 17;
+/// Index of the fixed base-path data-read count.
+pub const ISA_DATA_READS: usize = 18;
+/// Index of the fixed base-path data-write count.
+pub const ISA_DATA_WRITES: usize = 19;
+/// Index of the instruction's unconditional machine-cycle count.
+pub const ISA_BASE_M_CYCLES: usize = 10;
+/// Index of the additional machine-cycle count for a taken branch.
+pub const ISA_TAKEN_M_CYCLES: usize = 11;
+/// Index of the conditional taken-path data-read count.
+pub const ISA_TAKEN_DATA_READS: usize = 20;
+/// Index of the conditional taken-path data-write count.
+pub const ISA_TAKEN_DATA_WRITES: usize = 21;
 /// Index indicating that the instruction has taken-branch timing.
 pub const ISA_TAKEN_TIMING: usize = 35;
 /// First index of the six operation-code bits.
@@ -32,6 +50,9 @@ const OPERATION_BITS: usize = 6;
 const ARGUMENT_ZERO_BITS: usize = 3;
 const ARGUMENT_ONE_BITS: usize = 4;
 const ISA_TABLE_DIGEST_DOMAIN: &[u8] = b"zksm83/native-isa-table/v1";
+
+const _: () = assert!(ISA_TABLE_ROW_COUNT == 512);
+const _: () = assert!(ISA_PADDING_ADDRESS < 512);
 
 /// One fixed output row selected by the nine-bit `(prefix, opcode)` address.
 ///

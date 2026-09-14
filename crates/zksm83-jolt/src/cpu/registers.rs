@@ -29,6 +29,7 @@ const STATE_TIMER_DIV: usize = 27;
 const STATE_TIMER_COUNTER: usize = 28;
 const STATE_TIMER_PHASE: usize = 29;
 const STATE_TIMER_EDGE_LATCH: usize = 30;
+const VISIBLE_REGISTER_COUNT: usize = 20;
 
 pub(super) fn constrain_visible_registers(
     view: &RowView<'_>,
@@ -333,7 +334,9 @@ fn constrain_mmio_values(
     Ok(())
 }
 
-fn visible_registers(view: &RowView<'_>) -> Result<Vec<(u8, NativeField)>, UniformError> {
+fn visible_registers(
+    view: &RowView<'_>,
+) -> Result<[(u8, NativeField); VISIBLE_REGISTER_COUNT], UniformError> {
     let low = TRACE_BEFORE_DMG_LOW_BITS_START;
     let high = TRACE_BEFORE_DMG_HIGH_BITS_START;
     let tma = byte(view, low, 2)?;
@@ -344,7 +347,7 @@ fn visible_registers(view: &RowView<'_>) -> Result<Vec<(u8, NativeField)>, Unifo
         + byte(view, low, 5)?
         + NativeField::from_u64(4) * view.value(TRACE_PPU_COINCIDENCE)?
         + mode;
-    Ok(vec![
+    Ok([
         (0x01, byte(view, low, 0)?),
         (0x02, byte(view, low, 1)?),
         (0x04, byte(view, TRACE_BEFORE_TIMER_DIV_BITS_START, 1)?),

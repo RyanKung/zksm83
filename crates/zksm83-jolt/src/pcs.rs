@@ -52,10 +52,17 @@ enum PcsOpeningMode {
 
 /// Prover-owned columns, commitment hints, and verifier-visible commitments.
 pub(crate) struct CommittedColumns {
-    field_columns: Vec<Vec<NativeField>>,
     commitments: ColumnCommitments,
     batches: Vec<ProverBatch>,
     context: PcsContextLease,
+}
+
+/// Borrowed logical field columns in commitment order.
+///
+/// The slices point into the committed dense polynomials. Physical zero-padding
+/// polynomials and each polynomial's backend padding are excluded.
+pub(crate) struct FieldColumnView<'a> {
+    columns: Vec<&'a [NativeField]>,
 }
 
 struct PcsProverContext {
@@ -189,12 +196,45 @@ impl CommittedColumns {
         &self.commitments
     }
 
-    pub(crate) fn field_columns(&self) -> &[Vec<NativeField>] {
-        &self.field_columns
+    pub(crate) fn field_columns(&self) -> Result<FieldColumnView<'_>, PcsError> {
+        self.commitments.validate(self.context.layout())?;
+        field_column_view(
+            self.context.layout(),
+            self.commitments.logical_column_count,
+            self.batches
+                .iter()
+                .flat_map(|batch| batch.polynomials.iter()),
+        )
+    }
+
+    pub(crate) fn field_column(&self, index: usize) -> Result<&[NativeField], PcsError> {
+        let layout = self.context.layout();
+        self.commitments.validate(layout)?;
+        if index >= self.commitments.logical_column_count {
+            return Err(PcsError::Shape);
+        }
+        let row_count = layout.row_count()?;
+        let batch_index = index / layout.group_columns;
+        let polynomial_index = index % layout.group_columns;
+        self.batches
+            .get(batch_index)
+            .and_then(|batch| batch.polynomials.get(polynomial_index))
+            .and_then(|polynomial| polynomial.field_coeffs().get(..row_count))
+            .ok_or(PcsError::Shape)
     }
 
     pub(crate) const fn layout(&self) -> PcsLayout {
         self.context.layout()
+    }
+}
+
+impl<'a> FieldColumnView<'a> {
+    pub(crate) fn as_slice(&self) -> &[&'a [NativeField]] {
+        &self.columns
+    }
+
+    pub(crate) fn into_owned_columns(self) -> Vec<Vec<NativeField>> {
+        self.columns.into_iter().map(<[_]>::to_vec).collect()
     }
 }
 
@@ -322,33 +362,26 @@ impl ColumnCommitments {
     }
 }
 
-pub(crate) fn commit_columns(
+pub(crate) fn commit_columns<C>(
     layout: PcsLayout,
-    columns: &[Vec<u64>],
-) -> Result<CommittedColumns, PcsError> {
+    columns: &[C],
+) -> Result<CommittedColumns, PcsError>
+where
+    C: AsRef<[u64]>,
+{
     let row_count = validate_column_shape(layout, columns)?;
     let context = PcsContextLease::acquire(layout)?;
     let prover = context.context(layout)?;
     let stack = prover.stack()?;
     let _phase = metrics::start(Phase::Commit);
-    let field_columns = columns
-        .iter()
-        .map(|column| {
-            column
-                .iter()
-                .copied()
-                .map(NativeField::from_u64)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let zero_column = vec![NativeField::from_u64(0); row_count];
-    let group_count = field_columns.len().div_ceil(layout.group_columns);
+    let logical_column_count = columns.len();
+    let group_count = logical_column_count.div_ceil(layout.group_columns);
     let _opening_count = layout.opening_count(group_count)?;
     let mut groups = Vec::with_capacity(group_count);
     let mut batches = Vec::with_capacity(group_count);
-    let polynomial_groups = field_columns
+    let polynomial_groups = columns
         .chunks(layout.group_columns)
-        .map(|columns| padded_polynomials(layout, columns, &zero_column))
+        .map(|columns| padded_polynomials(layout, columns, row_count))
         .collect::<Result<Vec<_>, _>>()?;
     commit_polynomial_groups(
         layout,
@@ -360,13 +393,12 @@ pub(crate) fn commit_columns(
     )?;
     let commitments = ColumnCommitments {
         num_variables: layout.num_variables,
-        logical_column_count: field_columns.len(),
+        logical_column_count,
         group_columns: layout.group_columns,
         groups,
     };
     commitments.validate(layout)?;
     Ok(CommittedColumns {
-        field_columns,
         commitments,
         batches,
         context,
@@ -784,31 +816,78 @@ fn verify_group_batch(
     Ok(())
 }
 
-fn padded_polynomials(
+fn padded_polynomials<C>(
     layout: PcsLayout,
-    column_group: &[Vec<NativeField>],
-    zero_column: &[NativeField],
-) -> Result<Vec<DensePoly<NativeField>>, PcsError> {
+    column_group: &[C],
+    row_count: usize,
+) -> Result<Vec<DensePoly<NativeField>>, PcsError>
+where
+    C: AsRef<[u64]>,
+{
     let mut polynomials = column_group
         .iter()
-        .map(|column| DensePoly::from_field_evals(layout.num_variables, column))
+        .map(|column| {
+            let field_column = column
+                .as_ref()
+                .iter()
+                .copied()
+                .map(NativeField::from_u64)
+                .collect::<Vec<_>>();
+            DensePoly::from_field_evals(layout.num_variables, field_column)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     while polynomials.len() < layout.group_columns {
         polynomials.push(DensePoly::from_field_evals(
             layout.num_variables,
-            zero_column,
+            vec![NativeField::from_u64(0); row_count],
         )?);
     }
     Ok(polynomials)
 }
 
-fn validate_column_shape<T>(layout: PcsLayout, columns: &[Vec<T>]) -> Result<usize, PcsError> {
+fn field_column_view<'a>(
+    layout: PcsLayout,
+    logical_column_count: usize,
+    polynomials: impl IntoIterator<Item = &'a DensePoly<NativeField>>,
+) -> Result<FieldColumnView<'a>, PcsError> {
+    let row_count = layout.row_count()?;
+    let physical_column_count = logical_column_count
+        .div_ceil(layout.group_columns)
+        .checked_mul(layout.group_columns)
+        .ok_or(PcsError::Shape)?;
+    let mut columns = polynomials
+        .into_iter()
+        .map(|polynomial| {
+            polynomial
+                .field_coeffs()
+                .get(..row_count)
+                .ok_or(PcsError::Shape)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if logical_column_count == 0 || columns.len() != physical_column_count {
+        return Err(PcsError::Shape);
+    }
+    columns.truncate(logical_column_count);
+    Ok(FieldColumnView { columns })
+}
+
+fn validate_column_shape<T, C>(layout: PcsLayout, columns: &[C]) -> Result<usize, PcsError>
+where
+    C: AsRef<[T]>,
+{
     if layout.group_columns == 0 {
         return Err(PcsError::Shape);
     }
-    let row_count = columns.first().map(Vec::len).ok_or(PcsError::Shape)?;
+    let row_count = columns
+        .first()
+        .map(|column| column.as_ref().len())
+        .ok_or(PcsError::Shape)?;
     let expected_row_count = layout.row_count()?;
-    if row_count != expected_row_count || columns.iter().any(|column| column.len() != row_count) {
+    if row_count != expected_row_count
+        || columns
+            .iter()
+            .any(|column| column.as_ref().len() != row_count)
+    {
         return Err(PcsError::Shape);
     }
     Ok(row_count)

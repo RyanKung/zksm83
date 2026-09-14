@@ -3,15 +3,20 @@
 
 //! Validated, contiguous SM83 execution witnesses.
 
+mod block;
 mod builder;
 mod lookup_builder;
 mod model;
 
+pub use block::{
+    BASIC_BLOCK_BUS_EVENT_BOUND, BASIC_BLOCK_INSTRUCTION_BOUND, BASIC_BLOCK_M_CYCLE_BOUND,
+    BasicBlock, BasicBlockCut, BasicBlockLane, BasicBlockLaneDescriptor, BasicBlockLaneIndex,
+    BasicBlockPlanError, BasicBlockResourceOwner, BasicBlockSpan, pack_witness_basic_blocks,
+    pack_witness_basic_blocks_at, plan_basic_blocks, plan_witness_basic_blocks,
+};
 pub use builder::{TraceBuilder, TraceBuilderError};
 pub use lookup_builder::{LookupTraceBuilder, LookupTraceBuilderError};
 pub use model::{
-    BLUE_ROM_BLOCK_MAX_EVENTS, BLUE_ROM_BLOCK_MAX_INSTRUCTIONS, BLUE_ROM_BLOCK_MAX_M_CYCLES,
-    BlueRomBlockCost, ExecutionBoundary, ExecutionMetrics, ProgramCounterCount,
-    ProgramCounterProfile, TraceChunk, TraceError, TraceRow, Witness, blue_rom_block_candidate,
-    blue_rom_block_cost,
+    ExecutionBoundary, ExecutionMetrics, ProgramCounterCount, ProgramCounterProfile, TraceChunk,
+    TraceError, TraceRow, Witness,
 };

@@ -7,7 +7,6 @@ use zksm83_core::{
 use zksm83_memory::{LogAccumulator, LogKind, MemoryImage, RomImage};
 use zksm83_trace::{
     LookupTraceBuilder, TraceBuilder, TraceBuilderError, TraceChunk, TraceError, TraceRow,
-    blue_rom_block_candidate,
 };
 
 #[test]
@@ -79,6 +78,57 @@ fn lookup_builder_matches_authenticated_semantics_and_ordered_events()
             .collect::<Vec<_>>();
         assert_eq!(lookup_events, authenticated_events);
     }
+    Ok(())
+}
+
+#[test]
+fn lookup_builder_preserves_ordered_multi_write_instruction_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = vec![0_u8; 0x101];
+    *bytes
+        .get_mut(0x100)
+        .ok_or_else(|| std::io::Error::other("missing PUSH opcode"))? = 0xc5;
+    let rom = RomImage::new(bytes.clone())?;
+    let rom_root = rom.root();
+    let memory = MemoryImage::zeroed()?;
+    let memory_root = memory.root();
+    let initial_memory = memory.checkpoint_bytes();
+
+    let mut authenticated = TraceBuilder::new_dmg_post_boot_mbc3(rom, memory, Vec::new());
+    let expected = authenticated.step()?;
+    let expected_memory = authenticated.checkpoint_memory();
+
+    let mut lookup = LookupTraceBuilder::new_dmg_post_boot_mbc3(
+        bytes,
+        initial_memory,
+        Vec::new(),
+        rom_root,
+        memory_root,
+    )?;
+    let actual = lookup.step()?;
+
+    assert_eq!(lookup.checkpoint_memory(), expected_memory);
+    assert_eq!(actual.after().cpu(), expected.after().cpu());
+    assert_eq!(
+        actual
+            .effects()
+            .bus_events()
+            .map(|event| event.transcript_event())
+            .collect::<Vec<_>>(),
+        expected
+            .effects()
+            .bus_events()
+            .map(|event| event.transcript_event())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        actual
+            .effects()
+            .bus_events()
+            .filter(|event| matches!(event, zksm83_core::BusEvent::MemoryWrite(_)))
+            .count(),
+        2
+    );
     Ok(())
 }
 
@@ -336,105 +386,6 @@ fn streaming_boundary_matches_retained_exact_witness() -> Result<(), Box<dyn std
     assert_eq!(boundary.metrics().relation_steps(), 4);
     assert_eq!(boundary.metrics().instructions(), 4);
     assert_eq!(boundary.metrics().dma_byte_steps(), 0);
-    Ok(())
-}
-
-#[test]
-fn streaming_metrics_match_greedy_blue_rom_micro_block_packing()
--> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes = vec![0_u8; 0x105];
-    bytes
-        .get_mut(0x100..0x105)
-        .ok_or_else(|| std::io::Error::other("missing cartridge-entry program"))?
-        .fill(0x00);
-    let mut builder = TraceBuilder::new_dmg_post_boot_mbc3(
-        RomImage::new(bytes)?,
-        MemoryImage::zeroed()?,
-        Vec::new(),
-    );
-
-    let boundary = builder.run_exact_boundary(5)?;
-    let metrics = boundary.metrics();
-
-    assert_eq!(metrics.relation_steps(), 5);
-    assert_eq!(metrics.instructions(), 5);
-    assert_eq!(metrics.blue_rom_block_steps(), 1);
-    assert_eq!(metrics.blue_rom_block_instructions(), 5);
-    assert_eq!(metrics.blue_rom_block_saved_rows(), 4);
-    Ok(())
-}
-
-#[test]
-fn blue_rom_micro_block_metrics_include_immutable_immediate_fetches()
--> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes = vec![0_u8; 0x104];
-    bytes
-        .get_mut(0x100..0x104)
-        .ok_or_else(|| std::io::Error::other("missing cartridge-entry program"))?
-        .copy_from_slice(&[
-            0x06, 0x12, // LD B,0x12: two fetches, two M-cycles
-            0xaf, // XOR A: one fetch, one M-cycle
-            0x04, // INC B: one fetch, one M-cycle
-        ]);
-    let mut builder = TraceBuilder::new_dmg_post_boot_mbc3(
-        RomImage::new(bytes)?,
-        MemoryImage::zeroed()?,
-        Vec::new(),
-    );
-
-    let boundary = builder.run_exact_boundary(3)?;
-    let metrics = boundary.metrics();
-
-    assert_eq!(metrics.blue_rom_block_steps(), 1);
-    assert_eq!(metrics.blue_rom_block_instructions(), 3);
-    assert_eq!(metrics.blue_rom_block_saved_rows(), 2);
-    Ok(())
-}
-
-#[test]
-fn blue_rom_micro_blocks_include_safe_wram_reads_but_exclude_vram_reads()
--> Result<(), Box<dyn std::error::Error>> {
-    let program = [
-        0x21, 0x00, 0xc0, // LD HL,0xc000: three fetches, three M-cycles
-        0x7e, // LD A,(HL): one fetch, one safe WRAM read, two M-cycles
-    ];
-    let mut bytes = vec![0_u8; 0x104];
-    bytes
-        .get_mut(0x100..0x104)
-        .ok_or_else(|| std::io::Error::other("missing WRAM-read program"))?
-        .copy_from_slice(&program);
-    let mut memory = MemoryImage::zeroed()?;
-    memory.write(0xc000, 0x42)?;
-    let mut builder =
-        TraceBuilder::new_dmg_post_boot_mbc3(RomImage::new(bytes)?, memory, Vec::new());
-    let witness = builder.run_exact_steps(2)?;
-    let rows = witness.rows().collect::<Vec<_>>();
-
-    assert!(rows.iter().all(|row| blue_rom_block_candidate(row)));
-    assert_eq!(witness.final_state().cpu().registers().a, 0x42);
-
-    let mut vram_program = program;
-    vram_program[2] = 0x80;
-    let mut vram_bytes = vec![0_u8; 0x104];
-    vram_bytes
-        .get_mut(0x100..0x104)
-        .ok_or_else(|| std::io::Error::other("missing VRAM-read program"))?
-        .copy_from_slice(&vram_program);
-    let mut vram_memory = MemoryImage::zeroed()?;
-    vram_memory.write(0x8000, 0x24)?;
-    let mut vram_builder =
-        TraceBuilder::new_dmg_post_boot_mbc3(RomImage::new(vram_bytes)?, vram_memory, Vec::new());
-    let vram = vram_builder.run_exact_steps(2)?;
-    let vram_rows = vram.rows().collect::<Vec<_>>();
-
-    let first_vram = vram_rows
-        .first()
-        .ok_or_else(|| std::io::Error::other("missing first VRAM row"))?;
-    let second_vram = vram_rows
-        .get(1)
-        .ok_or_else(|| std::io::Error::other("missing second VRAM row"))?;
-    assert!(blue_rom_block_candidate(first_vram));
-    assert!(!blue_rom_block_candidate(second_vram));
     Ok(())
 }
 

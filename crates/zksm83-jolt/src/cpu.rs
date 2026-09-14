@@ -22,12 +22,14 @@ mod memory;
 mod mmio;
 #[cfg(test)]
 mod mmio_tests;
+pub(crate) mod packed;
 mod ppu;
 #[cfg(test)]
 mod ppu_tests;
 #[cfg(test)]
 mod register_tests;
 mod registers;
+mod selectors;
 mod semantics;
 mod serial;
 #[cfg(test)]
@@ -48,17 +50,14 @@ mod word;
 use std::cell::Cell;
 
 use akita_pcs::Ring;
-use thiserror::Error;
 
 use crate::{
-    CommittedMemory, CommittedProtocolLogs, CommittedRom, CommittedWitness, ContinuityError,
-    ContinuityProof, ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START,
-    ISA_OPERATION_BITS_START, ISA_OUTPUT_COUNT, ISA_TAKEN_TIMING, ISA_VALID, ISA_WRITE_BITS_START,
-    IsaLookupError, IsaLookupProof, MemoryCommitment, MutableMemoryError, MutableMemoryProof,
-    NATIVE_TRACE_COLUMN_COUNT, NativeExecutionClaim, NativeField, NativeProtocolVersion,
-    NativeTraceError, NativeTraceWitness, ProtocolLogCommitments, ProtocolLogError,
-    ProtocolLogProof, ROM_ADDRESS_BIT_COUNT, RomCommitment, RomLookupError, RomLookupProof,
-    STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
+    ConstraintOutput, ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_BASE_M_CYCLES,
+    ISA_DATA_READS, ISA_DATA_WRITES, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES,
+    ISA_OPERATION_BITS_START, ISA_OUTPUT_COUNT, ISA_PADDING_ADDRESS, ISA_TAKEN_DATA_READS,
+    ISA_TAKEN_DATA_WRITES, ISA_TAKEN_M_CYCLES, ISA_TAKEN_TIMING, ISA_VALID, ISA_WRITE_BITS_START,
+    NATIVE_TRACE_COLUMN_COUNT, NativeField, ROM_ADDRESS_BIT_COUNT, STATE_SCALAR_COUNT,
+    TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
     TRACE_AFTER_RAM_RTC_BITS_START, TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_SP_BITS_START,
     TRACE_AFTER_STATE_START, TRACE_BEFORE_CPU_BYTE_BITS_START, TRACE_BEFORE_PC_BITS_START,
     TRACE_BEFORE_RAM_RTC_BITS_START, TRACE_BEFORE_ROM_BANK_BITS_START, TRACE_BEFORE_SP_BITS_START,
@@ -68,31 +67,27 @@ use crate::{
     TRACE_CYCLE_INCREMENT, TRACE_HALT_BUG, TRACE_INTERRUPT_COUNT, TRACE_INTERRUPT_START,
     TRACE_ISA_ADDRESS_START, TRACE_ISA_OUTPUT_START, TRACE_MODE_COUNT, TRACE_MODE_START,
     TRACE_ROM_SELECTOR_START, TRACE_ROM_VALUE_START, UniformError, UniformRelation,
-    UniformRelationProof, WitnessCommitments, commit_witness, prove_continuity, prove_isa_lookup,
-    prove_mutable_memory, prove_protocol_logs, prove_rom_lookup, prove_uniform_committed,
-    verify_isa_lookup, verify_rom_lookup, verify_uniform_committed,
+    trace::mode::TraceMode,
 };
-use crate::{
-    continuity::verify_continuity_for_protocol, isa_lookup::verify_isa_lookup_for_protocol,
-    logs::verify_protocol_logs_for_protocol, memory::verify_mutable_memory_for_protocol,
-    rom_lookup::verify_rom_lookup_for_protocol, uniform::verify_uniform_committed_for_protocol,
-};
+use selectors::{argument_selector, operation_selector};
 
 /// Number of relation slots; unused tail slots are canonical zero identities.
 pub const CPU_STRUCTURAL_CONSTRAINT_COUNT: usize = 6144;
-// Keep the 789-slot zero tail explicit while guarding every real constraint push.
-const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5355;
+// Keep the 876-slot zero tail explicit while guarding every real constraint push.
+const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5268;
 /// Maximum algebraic degree of one CPU/device constraint before equality weighting.
 pub const CPU_STRUCTURAL_MAX_DEGREE: usize = 18;
 
-const CPU_STRUCTURAL_DOMAIN: &[u8] = b"zksm83/native-cpu-structural/v17";
-const PADDING_MODE: usize = 6;
-const INTERRUPT_MODE: usize = 8;
-pub(super) const INSTRUCTION_MODE: usize = 0;
-const HALT_IDLE_MODE: usize = 1;
-const HALT_WAKE_MODE: usize = 7;
-const DMA_BYTE_MODE: usize = 9;
-const PADDING_ISA_ADDRESS: usize = 0xd3;
+const CPU_STRUCTURAL_DOMAIN: &[u8] = b"zksm83/native-cpu-structural/v21";
+const PADDING_MODE: usize = TraceMode::Padding.index();
+const INTERRUPT_MODE: usize = TraceMode::Interrupt.index();
+pub(super) const INSTRUCTION_MODE: usize = TraceMode::Instruction.index();
+const HALT_IDLE_MODE: usize = TraceMode::HaltIdle.index();
+const HALT_UNTIL_VBLANK_MODE: usize = TraceMode::HaltUntilVBlank.index();
+const HALT_UNTIL_SERIAL_MODE: usize = TraceMode::HaltUntilSerial.index();
+const HALT_UNTIL_TIMER_MODE: usize = TraceMode::HaltUntilTimer.index();
+const HALT_WAKE_MODE: usize = TraceMode::HaltWake.index();
+const DMA_BYTE_MODE: usize = TraceMode::DmaByte.index();
 pub(super) const STATE_FLAGS: usize = 7;
 const STATE_PC: usize = 8;
 const STATE_SP: usize = 9;
@@ -108,14 +103,6 @@ const ISA_OPCODE: usize = 4;
 const ISA_OPERATION: usize = 6;
 const ISA_ARGUMENT_ZERO: usize = 7;
 const ISA_ARGUMENT_ONE: usize = 8;
-const ISA_BASE_CYCLES: usize = 10;
-const ISA_TAKEN_CYCLES: usize = 11;
-const ISA_OPCODE_FETCHES: usize = 16;
-const ISA_IMMEDIATE_READS: usize = 17;
-const ISA_DATA_READS: usize = 18;
-const ISA_DATA_WRITES: usize = 19;
-const ISA_TAKEN_DATA_READS: usize = 20;
-const ISA_TAKEN_DATA_WRITES: usize = 21;
 pub(super) const BUS_ADDRESS_OFFSET: usize = 1 + TRACE_BUS_KIND_BITS;
 pub(super) const BUS_PHYSICAL_ADDRESS_OFFSET: usize = BUS_ADDRESS_OFFSET + 1;
 pub(super) const BUS_BEFORE_OFFSET: usize = BUS_ADDRESS_OFFSET + 2;
@@ -126,245 +113,11 @@ const BUS_TUPLE_FIELDS: usize = 6;
 
 /// Row-local native CPU, fixed-ISA, bus, memory-routing, and partial-device relation.
 ///
-/// Ordinary SM83 instruction and current machine-step CPU semantics are complete.
-/// The receipt remains incomplete until every DMG device transition, ordered log
-/// commitment, segment-continuity rule, and public-statement check is composed.
+/// This retained one-transition-per-row reference relation exercises the same
+/// instruction helpers reused by the packed v2 projection. It has no receipt
+/// or wire entry point; receipts commit only [`crate::BlockCpuRelation`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CpuStructuralRelation;
-
-/// Transparent CPU/ISA structural proof sharing one trace commitment plane.
-///
-/// This is an integration proof, not a complete SM83 receipt. Row-to-row
-/// continuity, committed logs, and the remaining DMG device relations are
-/// separate unfinished obligations.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeCpuStructuralProof {
-    commitments: WitnessCommitments,
-    relation: UniformRelationProof,
-    isa_lookup: IsaLookupProof,
-}
-
-/// CPU, fixed-ISA, and dynamic-ROM proof sharing one trace commitment plane.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeRomCpuProof {
-    commitments: WitnessCommitments,
-    relation: UniformRelationProof,
-    isa_lookup: IsaLookupProof,
-    rom_lookup: RomLookupProof,
-}
-
-/// CPU, ISA, ROM, mutable-memory, and ordered-continuity proof sharing one trace plane.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NativeMemoryCpuProof {
-    pub(crate) commitments: WitnessCommitments,
-    pub(crate) relation: UniformRelationProof,
-    pub(crate) isa_lookup: IsaLookupProof,
-    pub(crate) rom_lookup: RomLookupProof,
-    pub(crate) memory: MutableMemoryProof,
-    pub(crate) continuity: ContinuityProof,
-    pub(crate) logs: ProtocolLogProof,
-}
-
-/// Failure to build or verify the incomplete CPU/ISA structural proof.
-#[derive(Debug, Error)]
-pub enum NativeCpuStructuralError {
-    /// Canonical native trace construction failed.
-    #[error(transparent)]
-    Trace(#[from] NativeTraceError),
-    /// Shared witness commitment or structural-relation proof failed.
-    #[error(transparent)]
-    Uniform(#[from] UniformError),
-    /// Fixed ISA Shout lookup construction or verification failed.
-    #[error(transparent)]
-    IsaLookup(#[from] IsaLookupError),
-    /// Dynamic cartridge-ROM Shout lookup construction or verification failed.
-    #[error(transparent)]
-    RomLookup(#[from] RomLookupError),
-    /// Ordered mutable-memory proof construction or verification failed.
-    #[error(transparent)]
-    MutableMemory(#[from] MutableMemoryError),
-    /// Ordered row-continuity or public semantic-boundary proof failed.
-    #[error(transparent)]
-    Continuity(#[from] ContinuityError),
-    /// Ordered input, output, bus, or ISA log proof failed.
-    #[error(transparent)]
-    ProtocolLog(#[from] ProtocolLogError),
-}
-
-impl NativeCpuStructuralProof {
-    /// Returns the shared commitments consumed by both relation claims.
-    #[must_use]
-    pub const fn commitments(&self) -> &WitnessCommitments {
-        &self.commitments
-    }
-}
-
-impl NativeRomCpuProof {
-    /// Returns the shared commitments consumed by all three claims.
-    #[must_use]
-    pub const fn commitments(&self) -> &WitnessCommitments {
-        &self.commitments
-    }
-}
-
-impl NativeMemoryCpuProof {
-    /// Returns the trace commitments consumed by all four native claims.
-    #[must_use]
-    pub const fn commitments(&self) -> &WitnessCommitments {
-        &self.commitments
-    }
-}
-
-/// Proves the current CPU/ISA structural subset from canonical trace columns.
-pub fn prove_native_cpu_structural(
-    trace: &NativeTraceWitness,
-) -> Result<NativeCpuStructuralProof, NativeCpuStructuralError> {
-    let witness = commit_witness(trace.columns())?;
-    prove_cpu_claims(trace, witness)
-}
-
-/// Verifies the current CPU/ISA structural subset without replaying execution.
-pub fn verify_native_cpu_structural(
-    proof: &NativeCpuStructuralProof,
-) -> Result<(), NativeCpuStructuralError> {
-    let relation = CpuStructuralRelation;
-    verify_uniform_committed(&relation, &proof.commitments, &proof.relation)?;
-    let layout = crate::trace::canonical_isa_lookup_columns()?;
-    verify_isa_lookup(layout, &proof.commitments, &proof.isa_lookup)?;
-    Ok(())
-}
-
-/// Proves the current CPU relation, fixed ISA, and all immutable-ROM reads.
-pub fn prove_native_rom_cpu(
-    trace: &NativeTraceWitness,
-    rom: &CommittedRom,
-) -> Result<NativeRomCpuProof, NativeCpuStructuralError> {
-    let witness = commit_witness(trace.columns())?;
-    let relation = CpuStructuralRelation;
-    let relation = prove_uniform_committed(&relation, &witness)?;
-    let isa_lookup = prove_isa_lookup(trace.isa_lookup_columns()?, &witness)?;
-    let rom_lookup = prove_rom_lookup(trace.rom_lookup_columns()?, rom, &witness)?;
-    Ok(NativeRomCpuProof {
-        commitments: witness.into_commitments(),
-        relation,
-        isa_lookup,
-        rom_lookup,
-    })
-}
-
-/// Verifies the combined CPU/ISA/ROM proof without replaying SM83 execution.
-pub fn verify_native_rom_cpu(
-    proof: &NativeRomCpuProof,
-    rom: &RomCommitment,
-) -> Result<(), NativeCpuStructuralError> {
-    let relation = CpuStructuralRelation;
-    verify_uniform_committed(&relation, &proof.commitments, &proof.relation)?;
-    let isa_layout = crate::trace::canonical_isa_lookup_columns()?;
-    verify_isa_lookup(isa_layout, &proof.commitments, &proof.isa_lookup)?;
-    let rom_layout = crate::trace::canonical_rom_lookup_columns()?;
-    verify_rom_lookup(rom_layout, rom, &proof.commitments, &proof.rom_lookup)?;
-    Ok(())
-}
-
-/// Proves CPU/ISA semantics, immutable ROM, and ordered mutable memory together.
-pub fn prove_native_memory_cpu(
-    trace: &NativeTraceWitness,
-    claim: &NativeExecutionClaim,
-    logs: &CommittedProtocolLogs,
-    rom: &CommittedRom,
-    initial_memory: &CommittedMemory,
-    final_memory: &CommittedMemory,
-) -> Result<NativeMemoryCpuProof, NativeCpuStructuralError> {
-    let witness = commit_witness(trace.columns())?;
-    let relation = CpuStructuralRelation;
-    let relation = prove_uniform_committed(&relation, &witness)?;
-    let isa_lookup = prove_isa_lookup(trace.isa_lookup_columns()?, &witness)?;
-    let rom_lookup = prove_rom_lookup(trace.rom_lookup_columns()?, rom, &witness)?;
-    let memory = prove_mutable_memory(trace, &witness, initial_memory, final_memory)?;
-    let continuity = prove_continuity(trace, &witness, claim)?;
-    let logs = prove_protocol_logs(trace, &witness, logs, claim)?;
-    Ok(NativeMemoryCpuProof {
-        commitments: witness.into_commitments(),
-        relation,
-        isa_lookup,
-        rom_lookup,
-        memory,
-        continuity,
-        logs,
-    })
-}
-
-/// Verifies the combined CPU/ISA/ROM/memory proof without replaying execution.
-pub fn verify_native_memory_cpu(
-    proof: &NativeMemoryCpuProof,
-    claim: &NativeExecutionClaim,
-    logs: &ProtocolLogCommitments,
-    rom: &RomCommitment,
-    initial_memory: &MemoryCommitment,
-    final_memory: &MemoryCommitment,
-) -> Result<(), NativeCpuStructuralError> {
-    verify_native_memory_cpu_for_protocol(
-        NativeProtocolVersion::current(),
-        proof,
-        claim,
-        logs,
-        rom,
-        initial_memory,
-        final_memory,
-    )
-}
-
-pub(crate) fn verify_native_memory_cpu_for_protocol(
-    protocol: NativeProtocolVersion,
-    proof: &NativeMemoryCpuProof,
-    claim: &NativeExecutionClaim,
-    logs: &ProtocolLogCommitments,
-    rom: &RomCommitment,
-    initial_memory: &MemoryCommitment,
-    final_memory: &MemoryCommitment,
-) -> Result<(), NativeCpuStructuralError> {
-    let relation = CpuStructuralRelation;
-    verify_uniform_committed_for_protocol(
-        protocol,
-        &relation,
-        &proof.commitments,
-        &proof.relation,
-    )?;
-    let isa_layout = crate::trace::canonical_isa_lookup_columns()?;
-    verify_isa_lookup_for_protocol(protocol, isa_layout, &proof.commitments, &proof.isa_lookup)?;
-    let rom_layout = crate::trace::canonical_rom_lookup_columns()?;
-    verify_rom_lookup_for_protocol(
-        protocol,
-        rom_layout,
-        rom,
-        &proof.commitments,
-        &proof.rom_lookup,
-    )?;
-    verify_mutable_memory_for_protocol(
-        protocol,
-        &proof.memory,
-        &proof.commitments,
-        initial_memory,
-        final_memory,
-    )?;
-    verify_continuity_for_protocol(protocol, &proof.continuity, &proof.commitments, claim)?;
-    verify_protocol_logs_for_protocol(protocol, &proof.logs, &proof.commitments, logs, claim)?;
-    Ok(())
-}
-
-fn prove_cpu_claims(
-    trace: &NativeTraceWitness,
-    witness: CommittedWitness,
-) -> Result<NativeCpuStructuralProof, NativeCpuStructuralError> {
-    let relation = CpuStructuralRelation;
-    let relation_proof = prove_uniform_committed(&relation, &witness)?;
-    let isa_lookup = prove_isa_lookup(trace.isa_lookup_columns()?, &witness)?;
-    Ok(NativeCpuStructuralProof {
-        commitments: witness.into_commitments(),
-        relation: relation_proof,
-        isa_lookup,
-    })
-}
 
 impl UniformRelation for CpuStructuralRelation {
     fn domain(&self) -> &'static [u8] {
@@ -375,7 +128,7 @@ impl UniformRelation for CpuStructuralRelation {
         let mut statement = Vec::new();
         statement.extend_from_slice(&(NATIVE_TRACE_COLUMN_COUNT as u64).to_le_bytes());
         statement.extend_from_slice(&(CPU_STRUCTURAL_CONSTRAINT_COUNT as u64).to_le_bytes());
-        statement.extend_from_slice(&(PADDING_ISA_ADDRESS as u64).to_le_bytes());
+        statement.extend_from_slice(&u64::from(ISA_PADDING_ADDRESS).to_le_bytes());
         statement
     }
 
@@ -389,6 +142,10 @@ impl UniformRelation for CpuStructuralRelation {
 
     fn max_constraint_degree(&self) -> usize {
         CPU_STRUCTURAL_MAX_DEGREE
+    }
+
+    fn constraint_output(&self) -> ConstraintOutput {
+        ConstraintOutput::Overwritten
     }
 
     fn evaluate(
@@ -431,7 +188,6 @@ fn evaluate_constraints_for_view(
     view: &RowView<'_>,
     constraints: &mut [NativeField],
 ) -> Result<usize, UniformError> {
-    constraints.fill(NativeField::from_u64(0));
     let mut sink = ConstraintSink::new(constraints);
     constrain_selectors(view, &mut sink)?;
     constrain_cpu_ranges(view, &mut sink)?;
@@ -458,26 +214,30 @@ fn evaluate_constraints_for_view(
     bit::constrain_rotate_and_bit_operations(view, &mut sink)?;
     daa::constrain_decimal_adjust(view, &mut sink)?;
     machine::constrain_machine_cpu(view, &mut sink)?;
-    Ok(sink.used())
+    sink.finish()
 }
 
 pub(super) struct RowView<'a> {
-    row: &'a [NativeField],
+    native: Option<&'a [NativeField]>,
+    packed: Option<packed::PackedProjection<'a>>,
+    selectors: selectors::IsaSelectorCache,
     #[cfg(test)]
     accessed: Option<&'a [Cell<bool>]>,
 }
 
-impl RowView<'_> {
+impl<'a> RowView<'a> {
     fn new(row: &[NativeField]) -> RowView<'_> {
         RowView {
-            row,
+            native: Some(row),
+            packed: None,
+            selectors: selectors::IsaSelectorCache::new(),
             #[cfg(test)]
             accessed: None,
         }
     }
 
     #[cfg(test)]
-    fn tracked<'a>(
+    fn tracked(
         row: &'a [NativeField],
         accessed: &'a [Cell<bool>],
     ) -> Result<RowView<'a>, UniformError> {
@@ -485,15 +245,33 @@ impl RowView<'_> {
             return Err(UniformError::Shape);
         }
         Ok(RowView {
-            row,
+            native: Some(row),
+            packed: None,
+            selectors: selectors::IsaSelectorCache::new(),
             accessed: Some(accessed),
         })
     }
 
+    pub(crate) fn packed(row: &'a [NativeField], lane: usize) -> Result<Self, UniformError> {
+        Ok(Self {
+            native: None,
+            packed: Some(packed::PackedProjection::new(row, lane)?),
+            selectors: selectors::IsaSelectorCache::new(),
+            #[cfg(test)]
+            accessed: None,
+        })
+    }
+
     pub(super) fn value(&self, index: usize) -> Result<NativeField, UniformError> {
-        let value = self.row.get(index).copied().ok_or(UniformError::Shape)?;
+        let value = match (self.native, self.packed.as_ref()) {
+            (Some(row), None) => row.get(index).copied().ok_or(UniformError::Shape)?,
+            (None, Some(projection)) => projection.value(index)?,
+            _ => return Err(UniformError::Shape),
+        };
         #[cfg(test)]
-        if let Some(accessed) = self.accessed {
+        if self.native.is_some()
+            && let Some(accessed) = self.accessed
+        {
             accessed.get(index).ok_or(UniformError::Shape)?.set(true);
         }
         Ok(value)
@@ -501,9 +279,15 @@ impl RowView<'_> {
 
     fn values(&self, start: usize, count: usize) -> Result<&[NativeField], UniformError> {
         let end = start.checked_add(count).ok_or(UniformError::Shape)?;
-        let values = self.row.get(start..end).ok_or(UniformError::Shape)?;
+        let values = match (self.native, self.packed.as_ref()) {
+            (Some(row), None) => row.get(start..end).ok_or(UniformError::Shape)?,
+            (None, Some(projection)) => projection.values(start, count)?,
+            _ => return Err(UniformError::Shape),
+        };
         #[cfg(test)]
-        if let Some(accessed) = self.accessed {
+        if self.native.is_some()
+            && let Some(accessed) = self.accessed
+        {
             for marker in accessed.get(start..end).ok_or(UniformError::Shape)? {
                 marker.set(true);
             }
@@ -525,6 +309,21 @@ impl RowView<'_> {
 
     pub(super) fn isa(&self, index: usize) -> Result<NativeField, UniformError> {
         self.value(TRACE_ISA_OUTPUT_START + index)
+    }
+
+    fn isa_values(&self, start: usize, count: usize) -> Result<&[NativeField], UniformError> {
+        let absolute_start = TRACE_ISA_OUTPUT_START
+            .checked_add(start)
+            .ok_or(UniformError::Shape)?;
+        self.values(absolute_start, count)
+    }
+
+    fn bus_kind_selector(&self, slot: usize, code: u8) -> Result<NativeField, UniformError> {
+        match (self.native, self.packed.as_ref()) {
+            (Some(_), None) => bit_selector(bus_kind_bits(self, slot)?, code),
+            (None, Some(projection)) => projection.bus_kind_selector(slot, code),
+            _ => Err(UniformError::Shape),
+        }
     }
 }
 
@@ -551,8 +350,13 @@ impl<'a> ConstraintSink<'a> {
         Ok(())
     }
 
-    const fn used(&self) -> usize {
-        self.cursor
+    fn finish(self) -> Result<usize, UniformError> {
+        let used = self.cursor;
+        self.constraints
+            .get_mut(used..)
+            .ok_or(UniformError::Shape)?
+            .fill(NativeField::from_u64(0));
+        Ok(used)
     }
 }
 
@@ -690,7 +494,7 @@ fn constrain_isa(view: &RowView<'_>, sink: &mut ConstraintSink<'_>) -> Result<()
         sink.push(padding * view.isa(output)?)?;
     }
     for bit in 0..9 {
-        let expected = NativeField::from_u64(((PADDING_ISA_ADDRESS >> bit) & 1) as u64);
+        let expected = NativeField::from_u64(u64::from((ISA_PADDING_ADDRESS >> bit) & 1));
         sink.push(padding * (view.value(TRACE_ISA_ADDRESS_START + bit)? - expected))?;
     }
     sink.push(active * (view.isa(ISA_PREFIX)? - view.value(TRACE_ISA_ADDRESS_START + 8)?))?;
@@ -725,8 +529,8 @@ fn constrain_cycles_and_frames(
     sink.push(halt_idle_range)?;
     let branch = view.value(TRACE_BRANCH_TAKEN)?;
     let halt_bug = view.value(TRACE_HALT_BUG)?;
-    let base = view.isa(ISA_BASE_CYCLES)?;
-    let taken = view.isa(ISA_TAKEN_CYCLES)?;
+    let base = view.isa(ISA_BASE_M_CYCLES)?;
+    let taken = view.isa(ISA_TAKEN_M_CYCLES)?;
     let selected = base + branch * view.isa(ISA_TAKEN_TIMING)? * (taken - base);
     sink.push(view.mode(INSTRUCTION_MODE)? * (increment - selected))?;
     for state in 0..STATE_CYCLES {
@@ -750,7 +554,7 @@ fn constrain_cycles_and_frames(
 
 fn constrain_bus(view: &RowView<'_>, sink: &mut ConstraintSink<'_>) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
-    let mut slot_active = Vec::with_capacity(TRACE_BUS_SLOTS);
+    let mut slot_active = [NativeField::from_u64(0); TRACE_BUS_SLOTS];
     for slot in 0..TRACE_BUS_SLOTS {
         let active = bus_field(view, slot, 0)?;
         let kind_bits = bus_kind_bits(view, slot)?;
@@ -797,7 +601,8 @@ fn constrain_bus(view: &RowView<'_>, sink: &mut ConstraintSink<'_>) -> Result<()
                 - rom_selector * bus_field(view, slot, BUS_VALUE_OFFSET)?,
         )?;
         sink.push(view.mode(PADDING_MODE)? * active)?;
-        slot_active.push(active);
+        let slot_value = slot_active.get_mut(slot).ok_or(UniformError::Shape)?;
+        *slot_value = active;
     }
     for pair in slot_active.windows(2) {
         let prior = pair.first().copied().ok_or(UniformError::Shape)?;
@@ -933,34 +738,6 @@ pub(super) fn bit_selector(bits: &[NativeField], code: u8) -> Result<NativeField
                 selector * (one - value)
             }
         }))
-}
-
-pub(super) fn operation_selector(
-    view: &RowView<'_>,
-    code: u8,
-) -> Result<NativeField, UniformError> {
-    isa_selector(view, ISA_OPERATION_BITS_START, 6, code)
-}
-
-pub(super) fn argument_selector(
-    view: &RowView<'_>,
-    start: usize,
-    width: usize,
-    code: u8,
-) -> Result<NativeField, UniformError> {
-    isa_selector(view, start, width, code)
-}
-
-fn isa_selector(
-    view: &RowView<'_>,
-    start: usize,
-    width: usize,
-    code: u8,
-) -> Result<NativeField, UniformError> {
-    let bits = (0..width)
-        .map(|bit| view.isa(start + bit))
-        .collect::<Result<Vec<_>, _>>()?;
-    bit_selector(&bits, code)
 }
 
 #[cfg(test)]

@@ -6,12 +6,15 @@ mod tests;
 use akita_pcs::{AkitaTranscript, Ring, Transcript};
 use jolt_field::{CanonicalBytes, Field};
 use thiserror::Error;
+use zksm83_trace::BASIC_BLOCK_INSTRUCTION_BOUND;
 
 use crate::{
-    AkitaWorkerError, NativeField, NativeProtocolVersion, NativeStateBoundary, NativeTraceWitness,
-    STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_STATE_START, TRACE_BEFORE_STATE_START,
-    TRACE_ROW_BIT_COUNT, TRACE_ROW_BITS_START, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
-    UniformError, UniformRelation, WitnessCommitments,
+    AkitaWorkerError, BLOCK_CPU_COLUMN_COUNT, BLOCK_ROUTING_COLUMN_COUNT, BlockCpuWitness,
+    ConstraintOutput, NativeField, NativeProtocolVersion, NativeStateBoundary, STATE_SCALAR_COUNT,
+    TRACE_ROW_BIT_COUNT, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT, UniformError, UniformRelation,
+    WitnessCommitments,
+    block_boundary::{BLOCK_LOCAL_STATE_SCALAR_COUNT, device_state_column, local_state_column},
+    block_memory::BLOCK_MEMORY_ROW_BITS_START,
     pcs::OpeningProof,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, prove_uniform_composite,
@@ -20,25 +23,24 @@ use crate::{
     },
 };
 
-const CLAIM_DOMAIN: &[u8] = b"zksm83/native-execution-claim/v1";
 const CLAIM_DOMAIN_V2: &[u8] = b"zksm83/native-execution-claim/v2";
-const CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-continuity-challenges/v1";
-const CHALLENGE_DOMAIN_V2: &[u8] = b"zksm83-native-continuity-challenges/v2";
-const SUM_DOMAIN: &[u8] = b"zksm83-native-continuity-sum/v1";
-const SUM_DOMAIN_V2: &[u8] = b"zksm83-native-continuity-sum/v2";
-const INVERSE_COLUMN_COUNT: usize = 4;
+const PACKED_LAYOUT_DOMAIN: &[u8] = b"zksm83/native-block-continuity-layout/v2";
+const PACKED_CHALLENGE_DOMAIN: &[u8] = b"zksm83-native-block-continuity-challenges/v2";
+const PACKED_SUM_DOMAIN: &[u8] = b"zksm83-native-block-continuity-sum/v2";
+const PACKED_INVERSE_COLUMN_COUNT: usize = 5;
 
 /// Public semantic claim for one fixed-capacity native trace segment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeExecutionClaim {
     active_row_count: u64,
+    transition_count: u64,
     initial_state: NativeStateBoundary,
     final_state: NativeStateBoundary,
 }
 
-/// Transparent proof that active rows form one ordered state-transition chain.
+/// Transparent v2 proof that packed blocks form one ordered state chain.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ContinuityProof {
+pub struct PackedContinuityProof {
     pub(crate) inverse_commitments: WitnessCommitments,
     pub(crate) relation: CompositeUniformRelationProof,
     pub(crate) sum: ContinuitySumProof,
@@ -86,11 +88,13 @@ impl NativeExecutionClaim {
     /// Creates a checked public segment claim.
     pub fn new(
         active_row_count: u64,
+        transition_count: u64,
         initial_state: NativeStateBoundary,
         final_state: NativeStateBoundary,
     ) -> Result<Self, ContinuityError> {
         let claim = Self {
             active_row_count,
+            transition_count,
             initial_state,
             final_state,
         };
@@ -98,10 +102,11 @@ impl NativeExecutionClaim {
         Ok(claim)
     }
 
-    /// Derives the exact claim represented by a prover-side trace witness.
-    pub fn from_trace(trace: &NativeTraceWitness) -> Result<Self, ContinuityError> {
+    /// Derives the exact public claim represented by a packed-block witness.
+    pub fn from_packed_trace(trace: &BlockCpuWitness) -> Result<Self, ContinuityError> {
         Self::new(
-            u64::try_from(trace.active_row_count()).map_err(|_| ContinuityError::Shape)?,
+            u64::try_from(trace.active_block_count()).map_err(|_| ContinuityError::Shape)?,
+            u64::try_from(trace.transition_count()).map_err(|_| ContinuityError::Shape)?,
             NativeStateBoundary::from_vm_state(trace.initial_state()),
             NativeStateBoundary::from_vm_state(trace.final_state()),
         )
@@ -111,6 +116,12 @@ impl NativeExecutionClaim {
     #[must_use]
     pub const fn active_row_count(&self) -> u64 {
         self.active_row_count
+    }
+
+    /// Returns the exact number of source machine transitions represented.
+    #[must_use]
+    pub const fn transition_count(&self) -> u64 {
+        self.transition_count
     }
 
     /// Returns the claimed first pre-state.
@@ -134,11 +145,11 @@ impl NativeExecutionClaim {
     pub(crate) fn canonical_bytes_for(&self, protocol: NativeProtocolVersion) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(24 + 16 * STATE_SCALAR_COUNT);
         let domain = match protocol {
-            NativeProtocolVersion::V1 => CLAIM_DOMAIN,
             NativeProtocolVersion::V2 => CLAIM_DOMAIN_V2,
         };
         append_bytes_infallible(&mut bytes, domain);
         bytes.extend_from_slice(&self.active_row_count.to_le_bytes());
+        bytes.extend_from_slice(&self.transition_count.to_le_bytes());
         self.initial_state.append_canonical_bytes(&mut bytes);
         self.final_state.append_canonical_bytes(&mut bytes);
         bytes
@@ -146,74 +157,98 @@ impl NativeExecutionClaim {
 
     pub(crate) fn validate(&self) -> Result<(), ContinuityError> {
         let capacity = u64::try_from(UNIFORM_ROW_COUNT).map_err(|_| ContinuityError::Shape)?;
-        if self.active_row_count == 0 || self.active_row_count > capacity {
+        let maximum_transitions = self
+            .active_row_count
+            .checked_mul(BASIC_BLOCK_INSTRUCTION_BOUND as u64)
+            .ok_or(ContinuityError::Shape)?;
+        if self.active_row_count == 0
+            || self.active_row_count > capacity
+            || self.transition_count < self.active_row_count
+            || self.transition_count > maximum_transitions
+        {
             return Err(ContinuityError::Shape);
         }
         Ok(())
     }
 }
 
-/// Proves exact initial/final states, active-row prefix, and row adjacency.
-pub fn prove_continuity(
-    trace: &NativeTraceWitness,
+/// Proves exact packed initial/final states, active prefix, and block adjacency.
+pub fn prove_packed_continuity(
+    trace: &BlockCpuWitness,
     trace_witness: &CommittedWitness,
     claim: &NativeExecutionClaim,
-) -> Result<ContinuityProof, ContinuityError> {
+) -> Result<PackedContinuityProof, ContinuityError> {
     let protocol = NativeProtocolVersion::current();
+    let layout = ContinuityLayout::Packed;
     claim.validate()?;
-    let phase_one = phase_one_descriptor(protocol, trace_witness.commitments(), claim)?;
-    let challenges = challenges(protocol, &phase_one)?;
-    let inverse_columns = inverse_columns(trace.columns(), challenges)?;
+    let phase_one = phase_one_descriptor(protocol, layout, trace_witness.commitments(), claim)?;
+    let challenges = challenges(protocol, layout, &phase_one)?;
+    let inverse_columns = inverse_columns(trace.columns(), layout, challenges)?;
     let inverses = crate::commit_witness(&inverse_columns)?;
-    let relation = ContinuityRelation {
-        protocol,
-        challenges,
-    };
+    let relation = ContinuityRelation::new(layout, challenges);
     let relation_proof = prove_uniform_composite(&relation, trace_witness, &inverses)?;
     let full = full_descriptor(protocol, &phase_one, inverses.commitments())?;
-    let sum = on_worker(|| prove_sum(protocol, &inverses, claim, challenges, &full))?;
-    Ok(ContinuityProof {
+    let sum = on_worker(|| prove_sum(protocol, layout, &inverses, claim, challenges, &full))?;
+    Ok(PackedContinuityProof {
         inverse_commitments: inverses.into_commitments(),
         relation: relation_proof,
         sum,
     })
 }
 
-/// Verifies continuity without receiving trace rows or replaying the emulator.
-pub fn verify_continuity(
-    proof: &ContinuityProof,
+/// Verifies packed-block continuity without receiving rows or replaying execution.
+pub fn verify_packed_continuity(
+    proof: &PackedContinuityProof,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<(), ContinuityError> {
-    verify_continuity_for_protocol(NativeProtocolVersion::current(), proof, trace, claim)
+    verify_packed_continuity_for_protocol(NativeProtocolVersion::current(), proof, trace, claim)
 }
 
-pub(crate) fn verify_continuity_for_protocol(
+pub(crate) fn verify_packed_continuity_for_protocol(
     protocol: NativeProtocolVersion,
-    proof: &ContinuityProof,
+    proof: &PackedContinuityProof,
+    trace: &WitnessCommitments,
+    claim: &NativeExecutionClaim,
+) -> Result<(), ContinuityError> {
+    verify_for_layout(
+        protocol,
+        ContinuityLayout::Packed,
+        &proof.inverse_commitments,
+        &proof.relation,
+        &proof.sum,
+        trace,
+        claim,
+    )
+}
+
+fn verify_for_layout(
+    protocol: NativeProtocolVersion,
+    layout: ContinuityLayout,
+    inverse_commitments: &WitnessCommitments,
+    relation_proof: &CompositeUniformRelationProof,
+    sum: &ContinuitySumProof,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<(), ContinuityError> {
     claim.validate()?;
-    let phase_one = phase_one_descriptor(protocol, trace, claim)?;
-    let challenges = challenges(protocol, &phase_one)?;
-    let relation = ContinuityRelation {
-        protocol,
-        challenges,
-    };
+    let phase_one = phase_one_descriptor(protocol, layout, trace, claim)?;
+    let challenges = challenges(protocol, layout, &phase_one)?;
+    let relation = ContinuityRelation::new(layout, challenges);
     verify_uniform_composite_for_protocol(
         protocol,
         &relation,
         trace,
-        &proof.inverse_commitments,
-        &proof.relation,
+        inverse_commitments,
+        relation_proof,
     )?;
-    let full = full_descriptor(protocol, &phase_one, &proof.inverse_commitments)?;
+    let full = full_descriptor(protocol, &phase_one, inverse_commitments)?;
     on_worker(|| {
         verify_sum(
             protocol,
-            &proof.sum,
-            &proof.inverse_commitments,
+            layout,
+            sum,
+            inverse_commitments,
             claim,
             challenges,
             &full,
@@ -231,35 +266,89 @@ fn on_worker<T: Send>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuityLayout {
+    Packed,
+}
+
+impl ContinuityLayout {
+    const fn trace_column_count(self) -> usize {
+        BLOCK_CPU_COLUMN_COUNT
+    }
+
+    const fn active_column(self) -> usize {
+        crate::block_metadata::BLOCK_ACTIVE
+    }
+
+    const fn inverse_column_count(self) -> usize {
+        PACKED_INVERSE_COLUMN_COUNT
+    }
+
+    const fn row_bits_start(self) -> usize {
+        BLOCK_MEMORY_ROW_BITS_START
+    }
+
+    fn state_column(self, after: bool, scalar: usize) -> Option<usize> {
+        let relative = if scalar < BLOCK_LOCAL_STATE_SCALAR_COUNT {
+            let boundary = if after {
+                BASIC_BLOCK_INSTRUCTION_BOUND
+            } else {
+                0
+            };
+            local_state_column(boundary, scalar)
+        } else {
+            device_state_column(after, scalar)
+        }?;
+        BLOCK_ROUTING_COLUMN_COUNT.checked_add(relative)
+    }
+}
+
 struct ContinuityRelation {
-    protocol: NativeProtocolVersion,
+    layout: ContinuityLayout,
     challenges: ContinuityChallenges,
+    state_mix_powers: [NativeField; STATE_SCALAR_COUNT],
+}
+
+impl ContinuityRelation {
+    fn new(layout: ContinuityLayout, challenges: ContinuityChallenges) -> Self {
+        Self {
+            layout,
+            challenges,
+            state_mix_powers: state_mix_powers(challenges.state_mix),
+        }
+    }
 }
 
 impl UniformRelation for ContinuityRelation {
     fn domain(&self) -> &'static [u8] {
-        match self.protocol {
-            NativeProtocolVersion::V1 => b"zksm83/native-continuity-inverses/v1",
-            NativeProtocolVersion::V2 => b"zksm83/native-continuity-inverses/v2",
-        }
+        b"zksm83/native-block-continuity-inverses/v2"
     }
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut bytes = field_bytes(self.challenges.state_mix);
         bytes.extend_from_slice(&field_bytes(self.challenges.inverse_point));
+        bytes.extend_from_slice(&(BLOCK_CPU_COLUMN_COUNT as u64).to_le_bytes());
+        bytes.extend_from_slice(&(STATE_SCALAR_COUNT as u64).to_le_bytes());
+        bytes.extend_from_slice(&(TRACE_ROW_BIT_COUNT as u64).to_le_bytes());
+        bytes.extend_from_slice(&(PACKED_INVERSE_COLUMN_COUNT as u64).to_le_bytes());
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
         bytes
     }
 
     fn column_count(&self) -> usize {
-        crate::NATIVE_TRACE_COLUMN_COUNT + INVERSE_COLUMN_COUNT
+        self.layout.trace_column_count() + self.layout.inverse_column_count()
     }
 
     fn constraint_count(&self) -> usize {
-        2
+        self.layout.inverse_column_count() - 2
     }
 
     fn max_constraint_degree(&self) -> usize {
         2
+    }
+
+    fn constraint_output(&self) -> ConstraintOutput {
+        ConstraintOutput::Overwritten
     }
 
     fn evaluate(
@@ -267,61 +356,69 @@ impl UniformRelation for ContinuityRelation {
         row: &[NativeField],
         constraints: &mut [NativeField],
     ) -> Result<(), UniformError> {
-        if row.len() != self.column_count() || constraints.len() != 2 {
+        if row.len() != self.column_count() || constraints.len() != self.constraint_count() {
             return Err(UniformError::Shape);
         }
-        let active = value(row, TRACE_ACTIVE)?;
-        let row_index = packed(row, TRACE_ROW_BITS_START, TRACE_ROW_BIT_COUNT)?;
-        let after = state_token_from_row(
+        let active = value(row, self.layout.active_column())?;
+        let row_index = packed(row, self.layout.row_bits_start(), TRACE_ROW_BIT_COUNT)?;
+        let after = state_token_from_layout_row(
             row,
-            TRACE_AFTER_STATE_START,
+            self.layout,
+            true,
             row_index + NativeField::from_u64(1),
-            self.challenges.state_mix,
+            &self.state_mix_powers,
         )?;
-        let before = state_token_from_row(
+        let before = state_token_from_layout_row(
             row,
-            TRACE_BEFORE_STATE_START,
+            self.layout,
+            false,
             row_index,
-            self.challenges.state_mix,
+            &self.state_mix_powers,
         )?;
-        let after_inverse = inverse_from_row(row, crate::NATIVE_TRACE_COLUMN_COUNT)?;
-        let before_inverse = inverse_from_row(row, crate::NATIVE_TRACE_COLUMN_COUNT + 2)?;
+        let trace_columns = self.layout.trace_column_count();
+        let after_inverse = inverse_from_row(row, trace_columns)?;
+        let before_inverse = inverse_from_row(row, trace_columns + 2)?;
         *constraints.get_mut(0).ok_or(UniformError::Shape)? =
             (self.challenges.inverse_point - after) * after_inverse - active;
         *constraints.get_mut(1).ok_or(UniformError::Shape)? =
             (self.challenges.inverse_point - before) * before_inverse - active;
+        let transition = value(row, trace_columns + 4)?;
+        let instruction = value(row, crate::block_metadata::INSTRUCTION_BLOCK)?;
+        let mut expected = active - instruction;
+        for lane in 0..BASIC_BLOCK_INSTRUCTION_BOUND {
+            let column = crate::block_metadata::lane_column(lane).ok_or(UniformError::Shape)?;
+            expected += value(row, column)?;
+        }
+        *constraints.get_mut(2).ok_or(UniformError::Shape)? = transition - expected;
         Ok(())
     }
 }
 
 fn inverse_columns(
     trace: &[Vec<u64>],
+    layout: ContinuityLayout,
     challenges: ContinuityChallenges,
 ) -> Result<Vec<Vec<u64>>, ContinuityError> {
-    if trace.len() != crate::NATIVE_TRACE_COLUMN_COUNT {
+    if trace.len() != layout.trace_column_count() {
         return Err(ContinuityError::Shape);
     }
-    let mut columns = (0..INVERSE_COLUMN_COUNT)
+    let mut columns = (0..layout.inverse_column_count())
         .map(|_| Vec::with_capacity(UNIFORM_ROW_COUNT))
         .collect::<Vec<_>>();
+    let powers = state_mix_powers(challenges.state_mix);
     for row in 0..UNIFORM_ROW_COUNT {
-        let active = trace_value(trace, TRACE_ACTIVE, row)?;
+        let active = trace_value(trace, layout.active_column(), row)?;
         let row_tag =
             NativeField::from_u64(u64::try_from(row).map_err(|_| ContinuityError::Shape)?);
-        let after = state_token_from_trace(
+        let after = state_token_from_layout_trace(
             trace,
-            TRACE_AFTER_STATE_START,
+            layout,
+            true,
             row,
             row_tag + NativeField::from_u64(1),
-            challenges.state_mix,
+            &powers,
         )?;
-        let before = state_token_from_trace(
-            trace,
-            TRACE_BEFORE_STATE_START,
-            row,
-            row_tag,
-            challenges.state_mix,
-        )?;
+        let before = state_token_from_layout_trace(trace, layout, false, row, row_tag, &powers)?;
         push_inverse(
             &mut columns,
             0,
@@ -332,6 +429,21 @@ fn inverse_columns(
             2,
             selected_inverse(active, before, challenges)?,
         )?;
+        let instruction = trace_value(trace, crate::block_metadata::INSTRUCTION_BLOCK, row)?;
+        let lane_count = (0..BASIC_BLOCK_INSTRUCTION_BOUND).try_fold(0_u64, |count, lane| {
+            let column = crate::block_metadata::lane_column(lane).ok_or(ContinuityError::Shape)?;
+            count
+                .checked_add(trace_value(trace, column, row)?)
+                .ok_or(ContinuityError::Shape)
+        })?;
+        let transition = active
+            .checked_sub(instruction)
+            .and_then(|count| count.checked_add(lane_count))
+            .ok_or(ContinuityError::Shape)?;
+        columns
+            .get_mut(4)
+            .ok_or(ContinuityError::Shape)?
+            .push(transition);
     }
     Ok(columns)
 }
@@ -367,32 +479,35 @@ fn push_inverse(
 
 fn prove_sum(
     protocol: NativeProtocolVersion,
+    layout: ContinuityLayout,
     inverses: &CommittedWitness,
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
 ) -> Result<ContinuitySumProof, ContinuityError> {
-    let descriptor = sum_descriptor(protocol, full_descriptor)?;
+    let descriptor = sum_descriptor(protocol, layout, full_descriptor)?;
     let point = half_point()?;
-    let values = inverses
-        .field_columns()
+    let columns = inverses.field_columns()?;
+    let values = columns
+        .as_slice()
         .iter()
         .map(|column| evaluate_field_column(column, &point))
         .collect::<Result<Vec<_>, _>>()?;
-    check_sum(&values, claim, challenges)?;
+    check_sum(layout, &values, claim, challenges)?;
     let opening = prove_witness_opening(inverses, &point, &values, &descriptor)?;
     Ok(ContinuitySumProof { values, opening })
 }
 
 fn verify_sum(
     protocol: NativeProtocolVersion,
+    layout: ContinuityLayout,
     proof: &ContinuitySumProof,
     inverses: &WitnessCommitments,
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
 ) -> Result<(), ContinuityError> {
-    let descriptor = sum_descriptor(protocol, full_descriptor)?;
+    let descriptor = sum_descriptor(protocol, layout, full_descriptor)?;
     let point = half_point()?;
     verify_witness_opening_for_protocol(
         protocol,
@@ -402,15 +517,16 @@ fn verify_sum(
         &descriptor,
         &proof.opening,
     )?;
-    check_sum(&proof.values, claim, challenges)
+    check_sum(layout, &proof.values, claim, challenges)
 }
 
 fn check_sum(
+    layout: ContinuityLayout,
     values: &[NativeField],
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
 ) -> Result<(), ContinuityError> {
-    if values.len() != INVERSE_COLUMN_COUNT {
+    if values.len() != layout.inverse_column_count() {
         return Err(ContinuityError::Shape);
     }
     let after = join_limbs(value(values, 0)?, value(values, 1)?);
@@ -433,6 +549,10 @@ fn check_sum(
     if rows * (after - before) + initial_inverse - final_inverse != NativeField::from_u64(0) {
         return Err(ContinuityError::Unsatisfied);
     }
+    let proved_transitions = rows * value(values, 4)?;
+    if proved_transitions != NativeField::from_u64(claim.transition_count()) {
+        return Err(ContinuityError::Unsatisfied);
+    }
     Ok(())
 }
 
@@ -451,47 +571,64 @@ fn state_token_from_boundary(
         .0
 }
 
-fn state_token_from_row(
+fn state_token_from_layout_row(
     row: &[NativeField],
-    start: usize,
+    layout: ContinuityLayout,
+    after: bool,
     tag: NativeField,
-    mix: NativeField,
+    powers: &[NativeField; STATE_SCALAR_COUNT],
 ) -> Result<NativeField, UniformError> {
     let mut token = tag;
-    let mut power = mix;
-    for offset in 0..STATE_SCALAR_COUNT {
-        token += power * value(row, start + offset)?;
-        power *= mix;
+    for (scalar, power) in powers.iter().copied().enumerate() {
+        let column = layout
+            .state_column(after, scalar)
+            .ok_or(UniformError::Shape)?;
+        token += power * value(row, column)?;
     }
     Ok(token)
 }
 
-fn state_token_from_trace(
+fn state_token_from_layout_trace(
     trace: &[Vec<u64>],
-    start: usize,
+    layout: ContinuityLayout,
+    after: bool,
     row: usize,
     tag: NativeField,
-    mix: NativeField,
+    powers: &[NativeField; STATE_SCALAR_COUNT],
 ) -> Result<NativeField, ContinuityError> {
     let mut token = tag;
-    let mut power = mix;
-    for offset in 0..STATE_SCALAR_COUNT {
-        token += power * NativeField::from_u64(trace_value(trace, start + offset, row)?);
-        power *= mix;
+    for (scalar, power) in powers.iter().copied().enumerate() {
+        let column = layout
+            .state_column(after, scalar)
+            .ok_or(ContinuityError::Shape)?;
+        token += power * NativeField::from_u64(trace_value(trace, column, row)?);
     }
     Ok(token)
+}
+
+fn state_mix_powers(mix: NativeField) -> [NativeField; STATE_SCALAR_COUNT] {
+    let mut power = NativeField::from_u64(1);
+    std::array::from_fn(|_| {
+        power *= mix;
+        power
+    })
 }
 
 fn phase_one_descriptor(
     protocol: NativeProtocolVersion,
+    _layout: ContinuityLayout,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
 ) -> Result<Vec<u8>, ContinuityError> {
     let mut descriptor = Vec::new();
     push_bytes(&mut descriptor, protocol.protocol_id().as_bytes())?;
-    push_bytes(&mut descriptor, protocol.trace_schedule_sha256().as_bytes())?;
+    push_bytes(
+        &mut descriptor,
+        crate::AKITA_AUXILIARY_SCHEDULE_SHA256.as_bytes(),
+    )?;
     push_bytes(&mut descriptor, &trace.canonical_bytes_for(protocol)?)?;
     push_bytes(&mut descriptor, &claim.canonical_bytes_for(protocol))?;
+    push_bytes(&mut descriptor, PACKED_LAYOUT_DOMAIN)?;
     Ok(descriptor)
 }
 
@@ -507,14 +644,11 @@ fn full_descriptor(
 }
 
 fn challenges(
-    protocol: NativeProtocolVersion,
+    _protocol: NativeProtocolVersion,
+    _layout: ContinuityLayout,
     descriptor: &[u8],
 ) -> Result<ContinuityChallenges, ContinuityError> {
-    let domain = match protocol {
-        NativeProtocolVersion::V1 => CHALLENGE_DOMAIN,
-        NativeProtocolVersion::V2 => CHALLENGE_DOMAIN_V2,
-    };
-    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(domain);
+    let mut transcript = AkitaTranscript::<NativeField>::unbound_verifier(PACKED_CHALLENGE_DOMAIN);
     transcript.bind_instance_bytes(descriptor);
     let state_mix = transcript.challenge_scalar(b"state-mix");
     let inverse_point = transcript.challenge_scalar(b"inverse-point");
@@ -528,15 +662,12 @@ fn challenges(
 }
 
 fn sum_descriptor(
-    protocol: NativeProtocolVersion,
+    _protocol: NativeProtocolVersion,
+    _layout: ContinuityLayout,
     full: &[u8],
 ) -> Result<Vec<u8>, ContinuityError> {
     let mut descriptor = Vec::new();
-    let domain = match protocol {
-        NativeProtocolVersion::V1 => SUM_DOMAIN,
-        NativeProtocolVersion::V2 => SUM_DOMAIN_V2,
-    };
-    push_bytes(&mut descriptor, domain)?;
+    push_bytes(&mut descriptor, PACKED_SUM_DOMAIN)?;
     push_bytes(&mut descriptor, full)?;
     Ok(descriptor)
 }
@@ -557,13 +688,8 @@ fn evaluate_field_column(
     }
     let mut folded = values.to_vec();
     for coordinate in point {
-        let mut next = Vec::with_capacity(folded.len() / 2);
-        for pair in folded.chunks_exact(2) {
-            let zero = pair.first().copied().ok_or(ContinuityError::Shape)?;
-            let one = pair.get(1).copied().ok_or(ContinuityError::Shape)?;
-            next.push(zero + *coordinate * (one - zero));
-        }
-        folded = next;
+        crate::field_fold::fold_binary_layer(&mut folded, *coordinate)
+            .map_err(|_| ContinuityError::Shape)?;
     }
     folded.first().copied().ok_or(ContinuityError::Shape)
 }

@@ -8,35 +8,26 @@ use akita_pcs::AkitaCommitmentScheme;
 #[cfg(test)]
 use crate::pcs::scheme as pcs_scheme;
 use crate::{
-    NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion,
+    BLOCK_CPU_COLUMN_COUNT, NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion,
     pcs::{
-        ColumnCommitments, CommittedColumns, OpeningProof as PcsOpeningProof, PcsError, PcsLayout,
-        commit_columns as commit_pcs_columns, prove_opening as prove_pcs_opening,
-        verify_opening as verify_pcs_opening,
+        ColumnCommitments, CommittedColumns, FieldColumnView, OpeningProof as PcsOpeningProof,
+        PcsError, PcsLayout, commit_columns as commit_pcs_columns,
+        prove_opening as prove_pcs_opening, verify_opening as verify_pcs_opening,
     },
 };
 
 use super::{COMMITMENT_GROUP_COLUMNS, NativeField, UNIFORM_NUM_VARIABLES, UniformError};
 
-const PCS_TRANSCRIPT_DOMAIN_V1: &[u8] = b"zksm83-native-shared-opening/v1";
-const COMMITMENT_ENCODING_DOMAIN_V1: &[u8] = b"zksm83/native-witness-commitments/v1";
 const PCS_TRANSCRIPT_DOMAIN_V2: &[u8] = b"zksm83-native-shared-opening/v2";
 const COMMITMENT_ENCODING_DOMAIN_V2: &[u8] = b"zksm83/native-witness-commitments/v2";
-pub(super) const LEGACY_SCHEDULE_ARTIFACT: &[u8] =
+pub(super) const AUXILIARY_SCHEDULE_ARTIFACT: &[u8] =
     include_bytes!("../../protocol/akita/fp128_dense_bounded_nv14_p128.aks");
 pub(super) const SCHEDULE_ARTIFACT: &[u8] =
     include_bytes!("../../protocol/akita/fp128_dense_bounded_nv14_p128_pair.aks");
-const LEGACY_LAYOUT: PcsLayout = PcsLayout::new(
-    UNIFORM_NUM_VARIABLES,
-    COMMITMENT_GROUP_COLUMNS,
-    LEGACY_SCHEDULE_ARTIFACT,
-    COMMITMENT_ENCODING_DOMAIN_V1,
-    PCS_TRANSCRIPT_DOMAIN_V1,
-);
 const V2_SINGLE_LAYOUT: PcsLayout = PcsLayout::new(
     UNIFORM_NUM_VARIABLES,
     COMMITMENT_GROUP_COLUMNS,
-    LEGACY_SCHEDULE_ARTIFACT,
+    AUXILIARY_SCHEDULE_ARTIFACT,
     COMMITMENT_ENCODING_DOMAIN_V2,
     PCS_TRANSCRIPT_DOMAIN_V2,
 );
@@ -50,8 +41,8 @@ const V2_TRACE_LAYOUT: PcsLayout = PcsLayout::paired(
 
 /// Prover-owned committed witness plane.
 ///
-/// The field columns and Akita hints never enter a receipt. Multiple relation
-/// provers borrow this value so every claim opens the same commitments.
+/// The dense polynomials and Akita hints never enter a receipt. Multiple
+/// relation provers borrow this value so every claim opens the same commitments.
 pub struct CommittedWitness {
     inner: CommittedColumns,
     commitments: WitnessCommitments,
@@ -78,8 +69,8 @@ impl CommittedWitness {
         self.commitments
     }
 
-    pub(crate) fn field_columns(&self) -> &[Vec<NativeField>] {
-        self.inner.field_columns()
+    pub(crate) fn field_columns(&self) -> Result<FieldColumnView<'_>, UniformError> {
+        self.inner.field_columns().map_err(map_pcs_error)
     }
 }
 
@@ -191,8 +182,12 @@ pub(super) fn scheme() -> Result<AkitaCommitmentScheme<fp128::DenseBounded>, Uni
 
 const fn layout_for(protocol: NativeProtocolVersion, column_count: usize) -> PcsLayout {
     match protocol {
-        NativeProtocolVersion::V1 => LEGACY_LAYOUT,
-        NativeProtocolVersion::V2 if column_count == NATIVE_TRACE_COLUMN_COUNT => V2_TRACE_LAYOUT,
+        NativeProtocolVersion::V2
+            if column_count == BLOCK_CPU_COLUMN_COUNT
+                || column_count == NATIVE_TRACE_COLUMN_COUNT =>
+        {
+            V2_TRACE_LAYOUT
+        }
         NativeProtocolVersion::V2 => V2_SINGLE_LAYOUT,
     }
 }

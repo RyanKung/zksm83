@@ -3,7 +3,7 @@
 use thiserror::Error;
 use zksm83_core::{
     BusEvent, BusWitness, MachineProfile, RunState, StepError, StepInput, StepRelation, VmState,
-    WitnessRequest, blue_dma_wait_candidate,
+    WitnessRequest,
 };
 use zksm83_memory::{
     LogAccumulator, LogError, LogKind, MemoryImage, MemoryImageError, RomImage, RomImageError,
@@ -110,7 +110,7 @@ impl TraceBuilder {
     /// Constructs, validates, and applies one trace row.
     pub fn step(&mut self) -> Result<TraceRow, TraceBuilderError> {
         let before = self.state;
-        let mut plan = self.suggested_summary_plan()?;
+        let mut plan = Vec::with_capacity(MAX_WITNESSES_PER_STEP);
         loop {
             let input = self.materialize(&plan)?;
             match StepRelation::apply(before, input) {
@@ -130,21 +130,6 @@ impl TraceBuilder {
                 Err(error) => return Err(TraceBuilderError::Step(error)),
             }
         }
-    }
-
-    fn suggested_summary_plan(&self) -> Result<Vec<PlannedWitness>, TraceBuilderError> {
-        if !blue_dma_wait_candidate(self.state) {
-            return Ok(Vec::new());
-        }
-        let mut plan = Vec::with_capacity(3);
-        for (address, expected) in [(0xff86, 0x3d), (0xff87, 0x20), (0xff88, 0xfd)] {
-            let read = self.memory.read(address)?;
-            if read.value != expected {
-                return Ok(Vec::new());
-            }
-            plan.push(PlannedWitness::MemoryRead(address, u32::from(address)));
-        }
-        Ok(plan)
     }
 
     /// Executes until HALT or STOP, rejecting a still-running exact step bound.

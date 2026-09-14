@@ -2,7 +2,10 @@
 
 use akita_pcs::Ring;
 
-use super::{ConstraintSink, RowView, bit_selector, boolean, bus_kind_bits, packed_bits};
+use super::{
+    ConstraintSink, HALT_IDLE_MODE, HALT_UNTIL_VBLANK_MODE, INSTRUCTION_MODE, INTERRUPT_MODE,
+    RowView, bit_selector, boolean, bus_kind_bits, packed_bits,
+};
 use crate::{
     NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START,
     TRACE_CYCLE_INCREMENT, TRACE_INTERRUPT_START, UniformError,
@@ -27,14 +30,6 @@ const STATE_PPU_LINE: usize = 25;
 const STATE_PPU_DOT: usize = 26;
 const FRAME_T_CYCLES: u64 = 70_224;
 const VBLANK_T_CYCLE: u64 = 65_664;
-const INSTRUCTION_MODE: usize = 0;
-const HALT_IDLE_MODE: usize = 1;
-const HALT_UNTIL_VBLANK_MODE: usize = 2;
-const BLUE_SOUND_WAIT_MODE: usize = 3;
-const BLUE_DELAY_LOOP_MODE: usize = 4;
-const BLUE_DMA_WAIT_MODE: usize = 5;
-const INTERRUPT_MODE: usize = 8;
-
 #[derive(Clone, Copy)]
 struct StatColumns {
     register_start: usize,
@@ -227,7 +222,7 @@ fn constrain_halt_vblank_guard(
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
-    let selected = view.mode(HALT_UNTIL_VBLANK_MODE)? + view.mode(BLUE_SOUND_WAIT_MODE)?;
+    let selected = view.mode(HALT_UNTIL_VBLANK_MODE)?;
     sink.push(selected * (view.value(TRACE_BEFORE_DMG_LOW_BITS_START + 39)? - one))?;
     sink.push(selected * (view.value(TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START)? - one))?;
     sink.push(selected * view.value(TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START + 4)?)
@@ -447,10 +442,7 @@ fn constrain_long_stat_quiet(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    let long = view.mode(HALT_UNTIL_VBLANK_MODE)?
-        + view.mode(BLUE_SOUND_WAIT_MODE)?
-        + view.mode(BLUE_DELAY_LOOP_MODE)?
-        + view.mode(BLUE_DMA_WAIT_MODE)?;
+    let long = view.mode(HALT_UNTIL_VBLANK_MODE)?;
     let enabled = view.value(TRACE_AFTER_DMG_LOW_BITS_START + 39)?;
     for bit in 3..=6 {
         sink.push(long * enabled * view.value(TRACE_AFTER_DMG_LOW_BITS_START + 40 + bit)?)?;

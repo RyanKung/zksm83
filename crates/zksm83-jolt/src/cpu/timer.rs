@@ -3,19 +3,22 @@
 use akita_pcs::Ring;
 
 use super::{
-    BUS_VALUE_OFFSET, ConstraintSink, RowView, bit_selector, boolean, bus_field, bus_kind_bits,
-    packed_bits, zero_from_bits,
+    BUS_VALUE_OFFSET, ConstraintSink, HALT_IDLE_MODE, HALT_UNTIL_SERIAL_MODE,
+    HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, INSTRUCTION_MODE, INTERRUPT_MODE, RowView,
+    bit_selector, boolean, bus_field, bus_kind_bits, packed_bits, zero_from_bits,
 };
 use crate::{
     NativeField, TRACE_BUS_ADDRESS_BITS_START, TRACE_BUS_SLOTS, TRACE_BUS_VALUE_BITS_START,
     TRACE_CYCLE_INCREMENT, TRACE_INTERRUPT_START, UniformError,
     trace::device::{
         TRACE_AFTER_DMG_LOW_BITS_START, TRACE_AFTER_INTERRUPT_REQUEST_BITS_START,
+        TRACE_BEFORE_DMG_LOW_BITS_START, TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START,
         TRACE_BEFORE_INTERRUPT_REQUEST_BITS_START, TRACE_BEFORE_TIMER_COUNTER_BITS_START,
         TRACE_BEFORE_TIMER_DIV_BITS_START, TRACE_BEFORE_TIMER_PHASE_BITS_START,
-        TRACE_TIMER_AFTER_FF05_BITS_START, TRACE_TIMER_LONG_QUOTIENT_BITS_START,
-        TRACE_TIMER_M_CYCLE_ACTIVE_START, TRACE_TIMER_PHASE_FIVE, TRACE_TIMER_POST_STATE_START,
-        TRACE_TIMER_STAGE_START, TRACE_TIMER_STAGE_WIDTH,
+        TRACE_TIMER_AFTER_FF05_BITS_START, TRACE_TIMER_INTERRUPT_GAP_BITS_START,
+        TRACE_TIMER_LONG_QUOTIENT_BITS_START, TRACE_TIMER_M_CYCLE_ACTIVE_START,
+        TRACE_TIMER_PHASE_FIVE, TRACE_TIMER_POST_STATE_START, TRACE_TIMER_STAGE_START,
+        TRACE_TIMER_STAGE_WIDTH,
     },
 };
 
@@ -23,14 +26,6 @@ const STATE_TIMER_DIV: usize = 27;
 const STATE_TIMER_COUNTER: usize = 28;
 const STATE_TIMER_PHASE: usize = 29;
 const STATE_TIMER_LATCH: usize = 30;
-const INSTRUCTION_MODE: usize = 0;
-const HALT_IDLE_MODE: usize = 1;
-const HALT_UNTIL_VBLANK_MODE: usize = 2;
-const BLUE_SOUND_WAIT_MODE: usize = 3;
-const BLUE_DELAY_LOOP_MODE: usize = 4;
-const BLUE_DMA_WAIT_MODE: usize = 5;
-const INTERRUPT_MODE: usize = 8;
-
 pub(super) fn constrain_timer(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
@@ -57,6 +52,11 @@ fn constrain_ranges(view: &RowView<'_>, sink: &mut ConstraintSink<'_>) -> Result
     for bit in 0..5 {
         sink.push(boolean(
             view.value(TRACE_TIMER_LONG_QUOTIENT_BITS_START + bit)?,
+        ))?;
+    }
+    for bit in 0..2 {
+        sink.push(boolean(
+            view.value(TRACE_TIMER_INTERRUPT_GAP_BITS_START + bit)?,
         ))?;
     }
     Ok(())
@@ -297,10 +297,9 @@ fn constrain_final_state(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    let long = view.mode(HALT_UNTIL_VBLANK_MODE)?
-        + view.mode(BLUE_SOUND_WAIT_MODE)?
-        + view.mode(BLUE_DELAY_LOOP_MODE)?
-        + view.mode(BLUE_DMA_WAIT_MODE)?;
+    let quiet_long = view.mode(HALT_UNTIL_VBLANK_MODE)? + view.mode(HALT_UNTIL_SERIAL_MODE)?;
+    let timer_long = view.mode(HALT_UNTIL_TIMER_MODE)?;
+    let long = quiet_long + timer_long;
     let nonlong = NativeField::from_u64(1) - long;
     let last = stage_start(23);
     for (state, offset, width) in [
@@ -316,19 +315,19 @@ fn constrain_final_state(
             * (view.value(TRACE_AFTER_INTERRUPT_REQUEST_BITS_START + 2)?
                 - view.value(last + 28)?),
     )?;
-    constrain_long_transition(view, sink, long)
+    constrain_long_transition(view, sink, long, quiet_long, timer_long)
 }
 
 fn constrain_long_transition(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
     long: NativeField,
+    quiet_long: NativeField,
+    timer_long: NativeField,
 ) -> Result<(), UniformError> {
     let quotient = packed_bits(view, TRACE_TIMER_LONG_QUOTIENT_BITS_START, 5)?;
     sink.push((NativeField::from_u64(1) - long) * quotient)?;
-    sink.push(long * view.value(TRACE_AFTER_DMG_LOW_BITS_START + 26)?)?;
     sink.push(long * packed_bits(view, TRACE_TIMER_POST_STATE_START + 24, 3)?)?;
-    sink.push(long * view.value(TRACE_TIMER_POST_STATE_START + 27)?)?;
     let post_div = packed_bits(view, TRACE_TIMER_POST_STATE_START, 16)?;
     sink.push(
         long * (view.after(STATE_TIMER_DIV)?
@@ -336,16 +335,85 @@ fn constrain_long_transition(
             - NativeField::from_u64(4) * view.value(TRACE_CYCLE_INCREMENT)?
             + NativeField::from_u64(65_536) * quotient),
     )?;
-    sink.push(
-        long * (view.after(STATE_TIMER_COUNTER)?
-            - packed_bits(view, TRACE_TIMER_POST_STATE_START + 16, 8)?),
-    )?;
     sink.push(long * view.after(STATE_TIMER_PHASE)?)?;
-    sink.push(long * view.after(STATE_TIMER_LATCH)?)?;
+    constrain_quiet_long_transition(view, sink, quiet_long)?;
+    constrain_timer_interrupt_transition(view, sink, timer_long)
+}
+
+fn constrain_quiet_long_transition(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+    selected: NativeField,
+) -> Result<(), UniformError> {
+    sink.push(selected * view.value(TRACE_AFTER_DMG_LOW_BITS_START + 26)?)?;
+    sink.push(selected * view.value(TRACE_TIMER_POST_STATE_START + 27)?)?;
     sink.push(
-        long * (view.value(TRACE_AFTER_INTERRUPT_REQUEST_BITS_START + 2)?
-            - view.value(TRACE_TIMER_POST_STATE_START + 28)?),
+        selected
+            * (view.after(STATE_TIMER_COUNTER)?
+                - packed_bits(view, TRACE_TIMER_POST_STATE_START + 16, 8)?),
+    )?;
+    sink.push(selected * view.after(STATE_TIMER_LATCH)?)?;
+    sink.push(
+        selected
+            * (view.value(TRACE_AFTER_INTERRUPT_REQUEST_BITS_START + 2)?
+                - view.value(TRACE_TIMER_POST_STATE_START + 28)?),
     )
+}
+
+fn constrain_timer_interrupt_transition(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+    selected: NativeField,
+) -> Result<(), UniformError> {
+    let one = NativeField::from_u64(1);
+    let gap = packed_bits(view, TRACE_TIMER_INTERRUPT_GAP_BITS_START, 2)?;
+    sink.push((one - selected) * gap)?;
+    sink.push(selected * (view.value(TRACE_AFTER_DMG_LOW_BITS_START + 26)? - one))?;
+    sink.push(selected * (view.value(TRACE_BEFORE_INTERRUPT_ENABLE_BITS_START + 2)? - one))?;
+    sink.push(selected * view.value(TRACE_BEFORE_DMG_LOW_BITS_START + 39)?)?;
+    let post_latch = view.value(TRACE_TIMER_POST_STATE_START + 27)?;
+    sink.push(selected * (post_latch - detector_input(view, TRACE_TIMER_POST_STATE_START)?))?;
+    let (period, remainder, fastest) = timer_period_and_remainder(view)?;
+    let post_counter = packed_bits(view, TRACE_TIMER_POST_STATE_START + 16, 8)?;
+    let interrupt_t_cycles = period - remainder
+        + (NativeField::from_u64(255) - post_counter) * period
+        + NativeField::from_u64(5);
+    sink.push(
+        selected
+            * (NativeField::from_u64(4) * view.value(TRACE_CYCLE_INCREMENT)?
+                - interrupt_t_cycles
+                - gap),
+    )?;
+    let modulo = packed_bits(view, TRACE_AFTER_DMG_LOW_BITS_START + 16, 8)?;
+    sink.push(selected * (view.after(STATE_TIMER_COUNTER)? - modulo))?;
+    let gap_three = view.value(TRACE_TIMER_INTERRUPT_GAP_BITS_START)?
+        * view.value(TRACE_TIMER_INTERRUPT_GAP_BITS_START + 1)?;
+    sink.push(selected * (view.after(STATE_TIMER_LATCH)? - fastest * gap_three))?;
+    sink.push(selected * (view.value(TRACE_AFTER_INTERRUPT_REQUEST_BITS_START + 2)? - one))?;
+    Ok(())
+}
+
+fn timer_period_and_remainder(
+    view: &RowView<'_>,
+) -> Result<(NativeField, NativeField, NativeField), UniformError> {
+    let one = NativeField::from_u64(1);
+    let control = TRACE_AFTER_DMG_LOW_BITS_START + 24;
+    let bit_zero = view.value(control)?;
+    let bit_one = view.value(control + 1)?;
+    let slow = (one - bit_zero) * (one - bit_one);
+    let fastest = bit_zero * (one - bit_one);
+    let medium = (one - bit_zero) * bit_one;
+    let fast = bit_zero * bit_one;
+    let period = NativeField::from_u64(1024) * slow
+        + NativeField::from_u64(16) * fastest
+        + NativeField::from_u64(64) * medium
+        + NativeField::from_u64(256) * fast;
+    let start = TRACE_TIMER_POST_STATE_START;
+    let remainder = slow * packed_bits(view, start, 10)?
+        + fastest * packed_bits(view, start, 4)?
+        + medium * packed_bits(view, start, 6)?
+        + fast * packed_bits(view, start, 8)?;
+    Ok((period, remainder, fastest))
 }
 
 const fn stage_start(tick: usize) -> usize {

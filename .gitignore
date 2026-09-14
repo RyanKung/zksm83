@@ -16,8 +16,8 @@ coverage/
 *.sav
 *.srm
 
-# Long-running Blue input schedules are local research data
-/examples/blue-*
+# Local cartridge inputs and endpoint schedules
+/examples/
 
 # Generated proofs, traces, checkpoints, and benchmarks
 /artifacts/*
@@ -39,6 +39,8 @@ coverage/
 *.verification.json
 *.evidence.json
 *.metrics.json
+*.profile.json
+*.profile.csv
 *.proof
 *.srs
 *.aks
@@ -58,10 +60,12 @@ coverage/
 /tmp/
 *.tmp
 *.partial
+*.partial.*
 *.ips
 *.dSYM/
 *.folded
 *.pprof
+*.flamegraph.svg
 .env
 .env.*
 !.env.example

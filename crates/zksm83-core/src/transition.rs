@@ -9,8 +9,8 @@ use zksm83_memory::{
 };
 
 use crate::{
-    BusRole, DmgInterrupt, Flags, ImeState, MachineProfile, RunState, StepEffects, StepInput,
-    StepKind, VmState, VmStateError, WitnessKind, WitnessRequest,
+    BusRole, DmgInterrupt, ImeState, MachineProfile, RunState, StepEffects, StepInput, StepKind,
+    VmState, VmStateError, WitnessKind, WitnessRequest,
     bus::{BusAuthentication, Executor},
     execute::{ImmediateBytes, execute},
 };
@@ -59,19 +59,16 @@ fn apply(
             Some(DmgMachineEvent::HaltUntilVBlank(increment)) => {
                 return halt_until_vblank(state, input, increment, authentication);
             }
+            Some(DmgMachineEvent::HaltUntilSerial(increment)) => {
+                return halt_until_serial(state, input, increment, authentication);
+            }
+            Some(DmgMachineEvent::HaltUntilTimer(increment)) => {
+                return halt_until_timer(state, input, increment, authentication);
+            }
             Some(DmgMachineEvent::HaltIdle) => {
                 return halt_idle(state, input, authentication);
             }
             None => {}
-        }
-        if let Some(remaining) = classify_blue_sound_wait(state) {
-            return blue_sound_wait(state, input, remaining, authentication);
-        }
-        if let Some(plan) = classify_blue_delay_loop(state) {
-            return blue_delay_loop(state, input, plan, authentication);
-        }
-        if blue_dma_wait_candidate(state) && input.len() == 3 {
-            return blue_dma_wait(state, input, authentication);
         }
     }
     if !state.cpu().run_state().can_execute_instruction() {
@@ -287,16 +284,6 @@ pub enum StepError {
     /// A fixed synthetic instruction used to label a machine event was absent.
     #[error("internal DMG machine-event instruction marker is unavailable")]
     MachineEventMarkerInvariant,
-    /// A requested ROM-bound summary authenticated different code bytes.
-    #[error("summary code byte at 0x{address:04x} must be 0x{expected:02x}, got 0x{actual:02x}")]
-    SummaryCodeMismatch {
-        /// Authenticated CPU address.
-        address: u16,
-        /// Required byte.
-        expected: u8,
-        /// Authenticated byte.
-        actual: u8,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,81 +291,9 @@ enum DmgMachineEvent {
     Interrupt(DmgInterrupt),
     HaltWake,
     HaltUntilVBlank(u16),
+    HaltUntilSerial(u16),
+    HaltUntilTimer(u32),
     HaltIdle,
-}
-
-const BLUE_SOUND_WAIT_PC: u16 = 0x374f;
-const BLUE_SOUND_WAIT_EXIT_PC: u16 = 0x375b;
-const BLUE_SOUND_WAIT_LOOP_M_CYCLES: u16 = 19;
-const BLUE_SOUND_WAIT_EXIT_M_CYCLES: u16 = 18;
-const BLUE_DELAY_LOOP_PC: u16 = 0x614d;
-const BLUE_DELAY_LOOP_EXIT_PC: u16 = 0x6155;
-const BLUE_DELAY_LOOP_ROM_BANK: u8 = 28;
-const BLUE_DELAY_LOOP_M_CYCLES: u32 = 10;
-const BLUE_DMA_WAIT_PC: u16 = 0xff86;
-const BLUE_DMA_WAIT_EXIT_PC: u16 = 0xff89;
-const BLUE_DMA_WAIT_M_CYCLES: u32 = 159;
-/// Witness-authentication ROM root that enables the Pokémon Blue sound-wait summary.
-pub const BLUE_SOUND_WAIT_ROM_ROOT: [u8; 32] = [
-    0xff, 0x45, 0x34, 0x35, 0x44, 0x1a, 0x97, 0x5f, 0xb1, 0xd1, 0xdf, 0x3a, 0x74, 0xcf, 0x30, 0x64,
-    0x77, 0xa0, 0xe0, 0x10, 0x85, 0x06, 0x89, 0x2b, 0xd8, 0xb5, 0xa8, 0x27, 0x44, 0x38, 0x61, 0x74,
-];
-
-fn classify_blue_sound_wait(state: VmState) -> Option<u16> {
-    if state.cpu().pc() != BLUE_SOUND_WAIT_PC
-        || state.cpu().run_state() != RunState::Running
-        || state.cpu().ime() != ImeState::Enabled
-        || state.rom_root().to_bytes() != BLUE_SOUND_WAIT_ROM_ROOT
-    {
-        return None;
-    }
-    let remaining = state.dmg_devices().halt_until_vblank_m_cycles()?;
-    (remaining >= BLUE_SOUND_WAIT_LOOP_M_CYCLES).then_some(remaining)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlueDelayLoopPlan {
-    Complete(u16),
-    UntilVBlank { iterations: u16 },
-}
-
-fn classify_blue_delay_loop(state: VmState) -> Option<BlueDelayLoopPlan> {
-    let registers = state.cpu().registers();
-    let iterations = u16::from_be_bytes([registers.d, registers.e]);
-    if state.cpu().pc() != BLUE_DELAY_LOOP_PC
-        || state.cpu().run_state() != RunState::Running
-        || state.mbc3().rom_bank() != BLUE_DELAY_LOOP_ROM_BANK
-        || state.rom_root().to_bytes() != BLUE_SOUND_WAIT_ROM_ROOT
-        || !state.dmg_devices().can_advance_quiet_long()
-        || iterations == 0
-    {
-        return None;
-    }
-    match state.cpu().ime() {
-        ImeState::Disabled => Some(BlueDelayLoopPlan::Complete(iterations)),
-        ImeState::Enabled => {
-            let remaining = state.dmg_devices().halt_until_vblank_m_cycles()?;
-            let iterations = u16::try_from(
-                (u32::from(remaining) / BLUE_DELAY_LOOP_M_CYCLES)
-                    .min(u32::from(iterations.saturating_sub(1))),
-            )
-            .ok()?;
-            (iterations != 0).then_some(BlueDelayLoopPlan::UntilVBlank { iterations })
-        }
-        ImeState::EnablePending => None,
-    }
-}
-
-/// Returns whether the state can request the authenticated Blue HRAM DMA-wait summary.
-#[must_use]
-pub fn blue_dma_wait_candidate(state: VmState) -> bool {
-    state.cpu().pc() == BLUE_DMA_WAIT_PC
-        && state.cpu().registers().a == 0x28
-        && state.cpu().run_state() == RunState::Running
-        && state.cpu().ime() == ImeState::Disabled
-        && state.rom_root().to_bytes() == BLUE_SOUND_WAIT_ROM_ROOT
-        && state.dmg_devices().dma_index() == 2
-        && state.dmg_devices().can_advance_quiet_dma_wait()
 }
 
 fn classify_dmg_machine_event(state: VmState) -> Result<Option<DmgMachineEvent>, StepError> {
@@ -396,12 +311,19 @@ fn classify_dmg_machine_event(state: VmState) -> Result<Option<DmgMachineEvent>,
                 Ok(Some(DmgMachineEvent::Interrupt(interrupt)))
             }
             Some(_) => Ok(Some(DmgMachineEvent::HaltWake)),
-            None => Ok(Some(
-                state
-                    .dmg_devices()
-                    .halt_until_vblank_m_cycles()
-                    .map_or(DmgMachineEvent::HaltIdle, DmgMachineEvent::HaltUntilVBlank),
-            )),
+            None => {
+                let devices = state.dmg_devices();
+                let event = if let Some(increment) = devices.halt_until_vblank_m_cycles() {
+                    DmgMachineEvent::HaltUntilVBlank(increment)
+                } else if let Some(increment) = devices.halt_until_serial_m_cycles() {
+                    DmgMachineEvent::HaltUntilSerial(increment)
+                } else if let Some(increment) = devices.halt_until_timer_m_cycles() {
+                    DmgMachineEvent::HaltUntilTimer(increment)
+                } else {
+                    DmgMachineEvent::HaltIdle
+                };
+                Ok(Some(event))
+            }
         },
     }
 }
@@ -466,6 +388,48 @@ fn halt_until_vblank(
     executor.finish_machine(StepKind::HaltUntilVBlank, machine_event_marker(0x76)?)
 }
 
+fn halt_until_serial(
+    state: VmState,
+    input: StepInput,
+    increment: u16,
+    authentication: BusAuthentication,
+) -> Result<(VmState, StepEffects), StepError> {
+    let mut executor = Executor::new(state, input, authentication);
+    let next = executor
+        .state()
+        .cpu()
+        .m_cycles()
+        .checked_add(u64::from(increment))
+        .ok_or(StepError::CycleCountOverflow)?;
+    executor.state_mut().cpu_mut().set_m_cycles(next);
+    executor
+        .state_mut()
+        .dmg_devices_mut()
+        .advance_halt_until_serial(increment);
+    executor.finish_machine(StepKind::HaltUntilSerial, machine_event_marker(0x76)?)
+}
+
+fn halt_until_timer(
+    state: VmState,
+    input: StepInput,
+    increment: u32,
+    authentication: BusAuthentication,
+) -> Result<(VmState, StepEffects), StepError> {
+    let mut executor = Executor::new(state, input, authentication);
+    let next = executor
+        .state()
+        .cpu()
+        .m_cycles()
+        .checked_add(u64::from(increment))
+        .ok_or(StepError::CycleCountOverflow)?;
+    executor.state_mut().cpu_mut().set_m_cycles(next);
+    executor
+        .state_mut()
+        .dmg_devices_mut()
+        .advance_halt_until_timer(increment);
+    executor.finish_machine(StepKind::HaltUntilTimer, machine_event_marker(0x76)?)
+}
+
 fn halt_idle(
     state: VmState,
     input: StepInput,
@@ -475,134 +439,6 @@ fn halt_idle(
     let mut executor = Executor::new(state, input, authentication);
     add_machine_timing(&mut executor, increment)?;
     executor.finish_machine(StepKind::HaltIdle, machine_event_marker(0x76)?)
-}
-
-fn blue_sound_wait(
-    state: VmState,
-    input: StepInput,
-    remaining: u16,
-    authentication: BusAuthentication,
-) -> Result<(VmState, StepEffects), StepError> {
-    let mut executor = Executor::new(state, input, authentication);
-    let channel_five = executor.read_data(0xc02a)?;
-    let channel_six = executor.read_data(0xc02b)?;
-    let channel_eight = executor.read_data(0xc02d)?;
-    let sound = channel_five | channel_six | channel_eight;
-    let increment = if sound == 0 {
-        BLUE_SOUND_WAIT_EXIT_M_CYCLES
-    } else {
-        remaining / BLUE_SOUND_WAIT_LOOP_M_CYCLES * BLUE_SOUND_WAIT_LOOP_M_CYCLES
-    };
-    let next = executor
-        .state()
-        .cpu()
-        .m_cycles()
-        .checked_add(u64::from(increment))
-        .ok_or(StepError::CycleCountOverflow)?;
-    let cpu = executor.state_mut().cpu_mut();
-    cpu.registers_mut().a = sound;
-    cpu.registers_mut().h = 0xc0;
-    cpu.registers_mut().l = 0x2d;
-    cpu.set_flags(Flags::from_bits(sound == 0, false, false, false));
-    cpu.set_pc(if sound == 0 {
-        BLUE_SOUND_WAIT_EXIT_PC
-    } else {
-        BLUE_SOUND_WAIT_PC
-    });
-    cpu.set_m_cycles(next);
-    executor
-        .state_mut()
-        .dmg_devices_mut()
-        .advance_halt_until_vblank(increment);
-    executor.finish_machine(StepKind::BlueSoundWait, machine_event_marker(0x00)?)
-}
-
-fn blue_delay_loop(
-    state: VmState,
-    input: StepInput,
-    plan: BlueDelayLoopPlan,
-    authentication: BusAuthentication,
-) -> Result<(VmState, StepEffects), StepError> {
-    let (iterations, increment, complete) = match plan {
-        BlueDelayLoopPlan::Complete(iterations) => (
-            iterations,
-            u32::from(iterations)
-                .checked_mul(BLUE_DELAY_LOOP_M_CYCLES)
-                .and_then(|cycles| cycles.checked_sub(1))
-                .ok_or(StepError::CycleCountOverflow)?,
-            true,
-        ),
-        BlueDelayLoopPlan::UntilVBlank { iterations } => (
-            iterations,
-            u32::from(iterations)
-                .checked_mul(BLUE_DELAY_LOOP_M_CYCLES)
-                .ok_or(StepError::CycleCountOverflow)?,
-            false,
-        ),
-    };
-    let mut executor = Executor::new(state, input, authentication);
-    let next = executor
-        .state()
-        .cpu()
-        .m_cycles()
-        .checked_add(u64::from(increment))
-        .ok_or(StepError::CycleCountOverflow)?;
-    let cpu = executor.state_mut().cpu_mut();
-    let remaining = u16::from_be_bytes([cpu.registers().d, cpu.registers().e])
-        .checked_sub(iterations)
-        .ok_or(StepError::CycleCountOverflow)?;
-    [cpu.registers_mut().d, cpu.registers_mut().e] = remaining.to_be_bytes();
-    cpu.registers_mut().a = cpu.registers().d | cpu.registers().e;
-    cpu.set_flags(Flags::from_bits(complete, false, false, false));
-    cpu.set_pc(if complete {
-        BLUE_DELAY_LOOP_EXIT_PC
-    } else {
-        BLUE_DELAY_LOOP_PC
-    });
-    cpu.set_m_cycles(next);
-    executor
-        .state_mut()
-        .dmg_devices_mut()
-        .advance_quiet_long(increment);
-    executor.finish_machine(StepKind::BlueDelayLoop, machine_event_marker(0x00)?)
-}
-
-fn blue_dma_wait(
-    state: VmState,
-    input: StepInput,
-    authentication: BusAuthentication,
-) -> Result<(VmState, StepEffects), StepError> {
-    let mut executor = Executor::new(state, input, authentication);
-    for (address, role, expected) in [
-        (0xff86, BusRole::OpcodeFetch, 0x3d),
-        (0xff87, BusRole::OpcodeFetch, 0x20),
-        (0xff88, BusRole::ImmediateRead, 0xfd),
-    ] {
-        let actual = executor.fetch_instruction(address, role)?;
-        if actual != expected {
-            return Err(StepError::SummaryCodeMismatch {
-                address,
-                expected,
-                actual,
-            });
-        }
-    }
-    let next = executor
-        .state()
-        .cpu()
-        .m_cycles()
-        .checked_add(u64::from(BLUE_DMA_WAIT_M_CYCLES))
-        .ok_or(StepError::CycleCountOverflow)?;
-    let carry = executor.state().cpu().flags().carry();
-    let cpu = executor.state_mut().cpu_mut();
-    cpu.registers_mut().a = 0;
-    cpu.set_flags(Flags::from_bits(true, true, false, carry));
-    cpu.set_pc(BLUE_DMA_WAIT_EXIT_PC);
-    cpu.set_m_cycles(next);
-    let devices = executor.state_mut().dmg_devices_mut();
-    devices.advance_quiet_long(BLUE_DMA_WAIT_M_CYCLES);
-    devices.schedule_dma_wait_remaining();
-    executor.finish_machine(StepKind::BlueDmaWait, machine_event_marker(0x00)?)
 }
 
 fn dma_byte(

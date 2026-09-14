@@ -1,8 +1,9 @@
 # Native receipt v2
 
-This document freezes the protocol model for the second native SM83 receipt
-format. Version 2 changes the shared trace PCS topology. It does not change the
-SM83 transition relation, public machine profile, or privacy claim.
+This document freezes the canonical native-SM83 receipt model. Version 2 uses
+the generic packed-block relation and a transparent Akita lattice PCS. It does
+not change the public DMG/MBC3 machine profile and does not claim witness
+hiding.
 
 ## Protocol identity
 
@@ -10,74 +11,121 @@ SM83 transition relation, public machine profile, or privacy claim.
 - Receipt magic: `ZKSM83R2`.
 - Statement magic: `ZKSM83S2`.
 - Protocol identifier: `zksm83-native-jolt-akita-v2`.
+- Proof composition revision:
+  `packed-block-transition-count-derived-cpu-scalars-v2`.
+- Main relation: `BlockCpuRelation`.
+- Logical relation width: 4,505 columns.
+- Constraint slots: 13,004.
+- Conservative maximum degree: 41.
 - Trace schedule: `fp128_dense_bounded_nv14_p128_pair.aks`.
 - Trace schedule SHA-256:
   `1cd339f09114c2a941abbfb434ab795868866cb15485f83300d81cee7bf46e71`.
-- Auxiliary single-group trace schedule SHA-256:
+- Auxiliary single-group schedule SHA-256:
   `e601bc0bd9d4501220c367b3012901aac09467f145899c8e907b282d30e96646`.
 - Trace opening domain: `zksm83-native-shared-opening/v2`.
-- Trace commitment identity domain:
-  `zksm83/native-witness-commitments/v2`.
-- PCS batch descriptor domain: `zksm83/native-pcs-pair/v2`.
+- Trace commitment domain: `zksm83/native-witness-commitments/v2`.
+- PCS pair descriptor domain: `zksm83/native-pcs-pair/v2`.
 
-The backend digest binds the v2 protocol identifier, pair schedule digest, and
-auxiliary single-group schedule digest.
-The statement digest binds that backend digest. A v1 statement cannot be
-relabelled as v2, and a v2 segment proof cannot be decoded through the v1
-receipt branch.
+The backend digest binds these values together with the pinned Jolt, Akita,
+and `jolt-field` revisions, fixed ISA identity, ROM/memory/log schedules,
+field, transcript, row geometry, privacy mode, and absence of an RV64 guest.
+The statement digest binds the backend digest.
 
-## Trace PCS object
+## Main PCS object
 
-The trace is an ordered vector of 3,292 logical multilinear polynomials over
-14 Boolean variables. The vector is padded canonically to 3,328 polynomials and
-partitioned into 26 ordered groups of 128 polynomials.
+The packed CPU witness is an ordered vector of 4,505 multilinear polynomials
+over 14 Boolean row variables. It is padded with 103 canonical zero polynomials
+to 4,608 columns and split into 36 ordered groups of 128 columns.
 
-Version 2 partitions those groups into 13 adjacent pairs:
+Version 2 opens adjacent pairs:
 
 ```text
-pair(i) = (group(2i), group(2i + 1)), 0 <= i < 13
+pair(i) = (group(2i), group(2i + 1)), 0 <= i < 18
 ```
 
-For each pair, the first group is committed with the exact precommitted profile
-frozen by the pinned schedule. The second group is committed as the final group
-against that ordered precommitment. One Akita batched opening proves both groups
-at the same sumcheck point. Pair order, group order, commitment identity,
-opening values, opening point, schedule-row digest, and pair index are
-transcript-bound.
+For each pair, the first group uses the precommitted profile frozen by the
+pinned schedule. The second is committed as the final group against that
+ordered precommitment. One Akita batched proof opens both groups at the shared
+sumcheck point. Pair index, group order, commitments, opening values, point,
+and schedule-row digest are transcript-bound.
 
-No schedule is selected from proof-controlled geometry. The compiled layout
-requires exactly 26 groups, exactly 13 pair openings, and the one pinned
-schedule row. The final 36 padding polynomials are zero and their claimed
-openings must also be zero.
+The layout is selected from the compiled protocol and logical column count,
+not from proof-controlled geometry. The v2 main plane must have exactly 36
+groups and 18 pair openings. Auxiliary inverse and table planes continue to
+use their explicit single-group or component-specific schedules.
+
+## Segment proof
+
+One `NativeSegmentReceipt` carries a `PackedBlockProof` over the shared main
+commitments. The proof contains:
+
+- the 4,505-column `BlockCpuRelation` opening;
+- four lane-specific fixed-ISA lookup proofs;
+- one immutable-ROM lookup proof;
+- packed mutable-memory event, clock, boundary, and multiset proofs;
+- packed state-continuity inverse and sum proofs; and
+- packed protocol-log trace/table inverse and sum proofs.
+
+The segment also carries its exact initial/final public boundaries, initial and
+final memory commitments, protocol-log commitments and counts, active packed
+row count, padding count, and M-cycle delta. Verification reconstructs the
+claims from those public values and never replays an emulator.
 
 ## Compatibility rule
 
-New provers and the prover CLI emit only v2 receipts and statements. Verifiers
-select a decoder and transcript model from the outer receipt or statement
-magic before decoding nested proofs:
+The canonical high-level format is v2-only:
 
-- v2 is the canonical generation format;
-- v1 remains verification-only for existing canonical receipts;
-- unknown versions, mixed-version statements, and cross-version proof
-  substitution fail closed;
-- v1 bytes and v1 transcript construction remain unchanged.
+- provers and encoders emit only `ZKSM83R2`/`ZKSM83S2`;
+- receipt and statement decoders reject `ZKSM83R1`/`ZKSM83S1` as unsupported;
+- mixed numeric versions, magic values, statements, or proof layouts fail
+  closed; and
+- there is no legacy decoder, negotiation, or dual-format fallback.
 
-## Bounded selection evidence
+The former `NativeCpuStructuralProof`, `NativeRomCpuProof`,
+`NativeMemoryCpuProof`, `ContinuityProof`, `MutableMemoryProof`, and
+`ProtocolLogProof` types, their prove/verify functions, and their wire layouts
+are absent. `NativeTraceWitness` and `CpuStructuralRelation` remain only as a
+one-transition semantic reference for constructing and auditing packed CPU
+lanes; they cannot be encoded or accepted as a receipt.
 
-The two-group `nv9/p128` micro-gate passed exact verification and all required
-tamper cases. It reduced framed proof payload by 47.20 percent, reduced opening
-time by 12.57 percent, and increased sampled peak RSS by 5.11 percent.
+`ZKSM83R1` and `ZKSM83S1` remain only as decoder rejection sentinels. Some
+lower-level PCS components retain `/v1` domain suffixes because those suffixes
+identify independently frozen component schemas, not a selectable receipt
+protocol. Renaming them would change the V2 cryptographic statement and is not
+part of deleting the V1 receipt route.
 
-Three- and four-group candidates reduced time and bytes further but increased
-sampled peak RSS by 28.58 and 31.50 percent, exceeding the frozen 25 percent
-memory gate. Version 2 therefore uses pair batching rather than an unbounded
-26-group opening.
+## Recovery identity
 
-These measurements are PCS micro-gates. They are not an SM83 receipt benchmark
-and do not establish complete Pokémon Blue proving performance.
+The resumable prover uses progress schema
+`zksm83-native-prover-progress/v5`. It records raw `completed_steps` separately
+from authenticated `relation_row_count`, because up to four instructions now
+share one relation row. Inspection emits
+`zksm83-native-progress-evidence/v5`.
 
-## Privacy and execution boundary
+Resume first compares the exact protocol/backend/schedule and input identities,
+then verifies the declared spool prefix. It checks the recovered segment count,
+source transition count, packed row count, spool length, final state, and final
+memory commitment against the checkpoint before rebuilding the trace builder.
+The packed continuity proof commits a fifth auxiliary column equal to one for a
+machine row or to the number of active instruction lanes; its authenticated sum
+therefore binds `completed_steps` without trusting the JSON checkpoint. The
+checkpoint and inspection evidence carry the proof-composition revision as an
+explicit field in addition to the compiled backend digest. A relation-width,
+constraint-count, degree, transcript, proof-composition or wire revision,
+privacy, or schedule change invalidates the checkpoint. Older progress schemas
+are not accepted. Progress v5 also rejects unknown JSON fields and counters
+outside the fixed segment count, segment row capacity, four-transition row
+density, or spool byte bounds before it decodes a proof frame.
 
-Version 2 remains a transparent Module-SIS proof. It does not claim witness
-hiding. Execution is native SM83 and does not use an RV64 guest. Full 611-segment
-Pokémon Blue proving is outside the migration validation path.
+## Validation boundary
+
+The earlier two-group PCS micro-gate established the chosen pair schedule and
+its bounded memory policy. It did not test the current 36-group packed CPU
+plane. During the current no-long-run phase, the new receipt composition and
+wire layout have only been subjected to formatting, strict linting, and
+bounded compilation. No packed proof or cartridge-scale receipt benchmark has
+been run.
+
+Version 2 is transparent Module-SIS proof infrastructure. A separate
+witness-hiding construction and review are required before the system can
+claim zero knowledge.

@@ -5,15 +5,9 @@ use zksm83_core::{
 use zksm83_memory::{LogAccumulator, LogKind, MemoryImage, RomImage};
 use zksm83_trace::TraceRow;
 
+use super::CpuStructuralRelation;
 use super::test_fixtures::*;
-use super::{
-    CpuStructuralRelation, prove_native_cpu_structural, prove_native_rom_cpu,
-    verify_native_cpu_structural, verify_native_rom_cpu,
-};
-use crate::{
-    NativeTraceWitness, ROM_IMAGE_BYTES, TRACE_INTERRUPT_START, UniformError, commit_rom,
-    commit_witness,
-};
+use crate::{NativeTraceWitness, TRACE_INTERRUPT_START, UniformError};
 
 #[test]
 fn word_and_signed_sp_operations_are_bound() -> Result<(), Box<dyn std::error::Error>> {
@@ -208,47 +202,5 @@ fn interrupt_dispatch_cpu_and_stack_relations_are_bound() -> Result<(), Box<dyn 
         .get_mut(TRACE_INTERRUPT_START + 4)
         .ok_or(UniformError::Shape)? = 1;
     assert_native_row_rejected(&CpuStructuralRelation, &wrong_priority)?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "expensive twenty-six-group CPU relation plus shared ISA Shout gate"]
-fn shared_cpu_and_isa_claims_verify_and_reject_commitment_substitution()
--> Result<(), Box<dyn std::error::Error>> {
-    let trace = single_opcode_trace(0x00)?;
-    let proof = prove_native_cpu_structural(&trace)?;
-    verify_native_cpu_structural(&proof)?;
-    assert_eq!(proof.commitments().column_count(), trace.columns().len());
-    assert_eq!(proof.commitments().group_count(), 26);
-
-    let other_trace = single_opcode_trace(0x04)?;
-    let other = commit_witness(other_trace.columns())?;
-    let mut substituted = proof;
-    substituted.commitments = other.into_commitments();
-    assert!(verify_native_cpu_structural(&substituted).is_err());
-    Ok(())
-}
-
-#[test]
-#[ignore = "expensive twenty-six-group CPU, ISA, and one-MiB ROM Akita gate"]
-fn shared_cpu_isa_and_rom_claims_reject_rom_substitution() -> Result<(), Box<dyn std::error::Error>>
-{
-    let image = vec![0_u8; ROM_IMAGE_BYTES];
-    let rom_image = RomImage::new(image.clone())?;
-    let memory = MemoryImage::zeroed()?;
-    let before = VmState::profile_initial(rom_image.root(), memory.root());
-    let row = TraceRow::execute(
-        before,
-        StepInput::new(vec![BusWitness::Rom(rom_image.read(0)?)]),
-    )?;
-    let trace = NativeTraceWitness::from_rows(&[&row])?;
-    let rom = commit_rom(&image)?;
-    let proof = prove_native_rom_cpu(&trace, &rom)?;
-    verify_native_rom_cpu(&proof, rom.commitment())?;
-
-    let mut substitute_image = image;
-    *substitute_image.last_mut().ok_or(UniformError::Shape)? = 1;
-    let substitute = commit_rom(&substitute_image)?;
-    assert!(verify_native_rom_cpu(&proof, substitute.commitment()).is_err());
     Ok(())
 }

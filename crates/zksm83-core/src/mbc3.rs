@@ -10,8 +10,8 @@ const SRAM_BANK_BYTES: u32 = 0x2000;
 
 /// MBC3 register state carried by every VM transition.
 ///
-/// This first cartridge profile matches Pokémon Blue: one MiB of ROM, four
-/// 8-KiB SRAM banks, battery-backed RAM, and no real-time clock.
+/// The current cartridge profile supports one MiB of ROM, four 8-KiB SRAM
+/// banks, battery-backed RAM, and no real-time clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Mbc3State {
     ram_enabled: bool,

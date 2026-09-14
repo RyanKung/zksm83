@@ -5,17 +5,14 @@ use zksm83_trace::{TraceBuilder, TraceRow};
 
 use super::{
     MEMORY_IMAGE_BYTES, MEMORY_LAYOUT, MEMORY_SCHEDULE_ARTIFACT, MEMORY_TABLE_NUM_VARIABLES,
-    MemoryCommitment, MutableMemoryError, commit_memory, prove_mutable_memory,
-    verify_mutable_memory,
+    MemoryCommitment, MutableMemoryError, commit_memory,
 };
 use crate::{
     AKITA_MEMORY_SCHEDULE_SHA256, CPU_STRUCTURAL_CONSTRAINT_COUNT, CpuStructuralRelation,
-    NativeExecutionClaim, NativeField, NativeTraceWitness, TRACE_BUS_SLOTS,
-    TRACE_MEMORY_DELTA_BITS_OFFSET, TRACE_MEMORY_PREDECESSOR_BITS_OFFSET, TRACE_MEMORY_SLOT_WIDTH,
-    TRACE_MEMORY_START, TRACE_MEMORY_TIMESTAMP_BITS, UniformRelation, commit_protocol_logs,
-    commit_rom, commit_witness,
+    NativeField, NativeTraceWitness, TRACE_BUS_SLOTS, TRACE_MEMORY_DELTA_BITS_OFFSET,
+    TRACE_MEMORY_PREDECESSOR_BITS_OFFSET, TRACE_MEMORY_SLOT_WIDTH, TRACE_MEMORY_START,
+    TRACE_MEMORY_TIMESTAMP_BITS, UniformRelation,
     pcs::scheme,
-    prove_native_memory_cpu, verify_native_memory_cpu,
     wire::{Wire, WireReader, WireWriter},
 };
 
@@ -109,62 +106,6 @@ fn trace_orders_write_then_latest_read_and_binds_timestamp_delta()
         .ok_or(MutableMemoryError::Shape)?;
     *bit = NativeField::from_u64(0);
     assert_row_rejected(&relation, &tampered)?;
-    Ok(())
-}
-
-#[test]
-#[ignore = "expensive twenty-six-group trace plus five 128-KiB memory commitments and openings"]
-fn committed_latest_value_proof_rejects_final_memory_substitution()
--> Result<(), Box<dyn std::error::Error>> {
-    let (trace, initial_bytes, final_bytes) = memory_trace()?;
-    let trace_witness = commit_witness(trace.columns())?;
-    let initial = commit_memory(&initial_bytes)?;
-    let final_memory = commit_memory(&final_bytes)?;
-    let proof = prove_mutable_memory(&trace, &trace_witness, &initial, &final_memory)?;
-    verify_mutable_memory(
-        &proof,
-        trace_witness.commitments(),
-        initial.commitment(),
-        final_memory.commitment(),
-    )?;
-
-    let mut alternative = final_bytes;
-    let last = alternative.last_mut().ok_or(MutableMemoryError::Shape)?;
-    *last ^= 1;
-    let alternative = commit_memory(&alternative)?;
-    assert!(
-        verify_mutable_memory(
-            &proof,
-            trace_witness.commitments(),
-            initial.commitment(),
-            alternative.commitment(),
-        )
-        .is_err()
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "expensive complete CPU, ISA, ROM, and ordered-memory composite gate"]
-fn composite_cpu_isa_rom_and_memory_claims_share_trace_commitments()
--> Result<(), Box<dyn std::error::Error>> {
-    let (trace, initial_bytes, final_bytes) = memory_trace()?;
-    let mut rom_bytes = memory_program();
-    rom_bytes.resize(crate::ROM_IMAGE_BYTES, 0);
-    let rom = commit_rom(&rom_bytes)?;
-    let initial = commit_memory(&initial_bytes)?;
-    let final_memory = commit_memory(&final_bytes)?;
-    let claim = NativeExecutionClaim::from_trace(&trace)?;
-    let logs = commit_protocol_logs(&trace)?;
-    let proof = prove_native_memory_cpu(&trace, &claim, &logs, &rom, &initial, &final_memory)?;
-    verify_native_memory_cpu(
-        &proof,
-        &claim,
-        logs.commitment(),
-        rom.commitment(),
-        initial.commitment(),
-        final_memory.commitment(),
-    )?;
     Ok(())
 }
 

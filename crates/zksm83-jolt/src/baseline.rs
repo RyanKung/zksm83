@@ -13,7 +13,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::AkitaWorkerError;
+use crate::{AkitaWorkerError, field_fold::fold_binary_layer};
 
 type Config = fp128::DenseBounded;
 type Field = fp128::Field;
@@ -183,17 +183,12 @@ fn evaluate_multilinear(evaluations: &[Field], point: &[Field]) -> Result<Field,
     }
     let mut layer = evaluations.to_vec();
     for &coordinate in point {
-        let mut next_layer = Vec::with_capacity(layer.len() / 2);
-        for pair in layer.chunks_exact(2) {
-            let [low, high] = pair else {
-                return Err(BaselineError::InvalidEvaluationShape {
-                    evaluations: evaluations.len(),
-                    coordinates: point.len(),
-                });
-            };
-            next_layer.push(*low + (*high - *low) * coordinate);
-        }
-        layer = next_layer;
+        fold_binary_layer(&mut layer, coordinate).map_err(|_| {
+            BaselineError::InvalidEvaluationShape {
+                evaluations: evaluations.len(),
+                coordinates: point.len(),
+            }
+        })?;
     }
     match layer.as_slice() {
         [evaluation] => Ok(*evaluation),
