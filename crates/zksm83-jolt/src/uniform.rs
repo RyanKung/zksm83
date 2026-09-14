@@ -439,6 +439,7 @@ fn ensure_relation_holds<C>(
 where
     C: AsRef<[NativeField]> + Sync,
 {
+    let _phase = crate::metrics::start(crate::metrics::Phase::PackedRelationEvaluation);
     let chunks = validation_chunk_count(row_count)?;
     let rows_per_chunk = row_count.div_ceil(chunks);
     let results = (0..chunks)
@@ -453,6 +454,7 @@ fn ensure_u64_relation_holds(
     columns: &[Vec<u64>],
     row_count: usize,
 ) -> Result<(), UniformError> {
+    let _phase = crate::metrics::start(crate::metrics::Phase::PackedRelationEvaluation);
     let chunks = validation_chunk_count(row_count)?;
     let rows_per_chunk = row_count.div_ceil(chunks);
     let results = (0..chunks)

@@ -401,6 +401,10 @@ Akita is a transparent lattice PCS whose binding target is stated under Module-S
  0\ne z\in R^m,\quad Az=0\pmod q,\quad\|z\|\le\beta.
  \label{eq:msis}
 \end{equation}
+Nightstream \citep{nightstream} is relevant as an implementation reference for lattice-based
+CCS folding architecture, a separated paper-exact versus optimized oracle/sumcheck path, and
+seeded Ajtai commitment engineering.  It is not used here as a production backend and is not
+evidence of end-to-end SM83 or Game Boy proving throughput.
 
 The transcript binds
 \begin{equation}
@@ -423,6 +427,12 @@ One segment proof is
              \pi_{\rm mem},\pi_{\rm cont},\pi_{\rm log}).
  \label{eq:segment-proof}
 \end{equation}
+Before any folding layer is introduced, the implementation types each obligation by family and
+evaluation binding: CPU and device row relations use the packed-row sumcheck terminal point; ISA
+and execution lookups use shared witness openings; ROM uses a table opening; mutable memory uses
+the shared witness plane; continuity uses segment-boundary challenges; and logs use ordered-log
+challenges.  Accumulation may only combine claims with the same family and evaluation binding.
+
 For $0\le k<L$:
 \begin{align}
  B_{k}^{+}&=B_{k+1}^{-},&
@@ -486,6 +496,20 @@ The logical witness sizes are exact source-level quantities:
 $N_{\rm slot}$ counts constraint-slot evaluations in the main sumcheck model, not native CPU
 instructions or measured field operations.
 
+A benchmark report must separate at least the following buckets before making a performance
+claim:
+\begin{equation}
+\begin{gathered}
+\mathsf{WitnessBuild},\mathsf{RelEval},\mathsf{Commit},\mathsf{ROM},
+\mathsf{Mem},\mathsf{Cont},\mathsf{Log},\\
+\mathsf{Sumcheck},\mathsf{Open},\mathsf{Encode},\mathsf{Verify},|\pi|.
+\end{gathered}
+\label{eq:benchmark-buckets}
+\end{equation}
+The current implementation exposes process-local diagnostics for the proof components in
+Equation~\eqref{eq:benchmark-buckets}, except that witness construction and proof-byte attribution
+still require a dedicated benchmark harness.
+
 For $T$ source transitions and average packing density $1\le\bar\rho\le4$,
 \begin{equation}
  A\approx\left\lceil\frac{T}{\bar\rho}\right\rceil,\qquad
@@ -520,6 +544,7 @@ T_{\rm ISA},T_{\rm exec},R & \code{isa\_lookup}, \code{execution\_lookup}, \code
 \Rel_{\rm mem},\Rel_{\rm log} & \code{memory}, \code{logs} \\
 \Rel_{\rm cont},\Rel_{\rm chain} & \code{continuity}, \code{receipt} \\
 \mathsf{SC},\Com,\Open & \code{uniform::sumcheck}, \code{uniform::commitment}, \code{pcs} \\
+\mathsf{Bench},\mathsf{Obligation} & \code{optimization}, \code{metrics}, \code{BlockCpuRelation::evaluation\_profile} \\
 \bottomrule
 \end{tabular}
 \caption{Equation-to-source map in \code{crates/zksm83-jolt/src}.}

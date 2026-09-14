@@ -10,7 +10,8 @@ use crate::{
     NativeExecutionClaim, NativeProtocolVersion, PackedContinuityProof, PackedMutableMemoryProof,
     PackedProtocolLogClaim, PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError,
     RomCommitment, RomLookupError, RomLookupProof, UniformError, UniformRelationProof,
-    WitnessCommitments, commit_witness, prove_rom_lookup, prove_uniform_committed,
+    WitnessCommitments, commit_witness, packed_block_obligation_metadata, prove_rom_lookup,
+    prove_uniform_committed,
 };
 use crate::{
     continuity::{
@@ -105,6 +106,12 @@ impl PackedBlockProof {
     pub const fn commitments(&self) -> &WitnessCommitments {
         &self.commitments
     }
+
+    /// Returns the typed obligation families carried by a packed-block proof.
+    #[must_use]
+    pub const fn obligation_metadata() -> &'static [crate::ProofObligationMetadata] {
+        packed_block_obligation_metadata()
+    }
 }
 
 /// Proves all currently authenticated packed-block components on one commitment plane.
@@ -127,15 +134,23 @@ pub fn prove_packed_block_components(
     let prepared_continuity = prepare_packed_continuity(&trace, &witness, claim)?;
     let prepared_logs = prepare_packed_protocol_logs(&trace, &witness, logs, claim, log_claim)?;
     drop(trace);
-    let memory = prove_prepared_packed_mutable_memory(
-        prepared_memory,
-        &witness,
-        initial_memory,
-        final_memory,
-    )?;
-    let continuity = prove_prepared_packed_continuity(prepared_continuity, &witness, claim)?;
-    let logs =
-        prove_prepared_packed_protocol_logs(prepared_logs, &witness, logs, claim, log_claim)?;
+    let memory = {
+        let _phase = crate::metrics::start(crate::metrics::Phase::MutableMemoryProof);
+        prove_prepared_packed_mutable_memory(
+            prepared_memory,
+            &witness,
+            initial_memory,
+            final_memory,
+        )?
+    };
+    let continuity = {
+        let _phase = crate::metrics::start(crate::metrics::Phase::ContinuityProof);
+        prove_prepared_packed_continuity(prepared_continuity, &witness, claim)?
+    };
+    let logs = {
+        let _phase = crate::metrics::start(crate::metrics::Phase::ProtocolLogProof);
+        prove_prepared_packed_protocol_logs(prepared_logs, &witness, logs, claim, log_claim)?
+    };
     let relation = prove_uniform_committed(&BlockCpuRelation, &witness)?;
     let isa_layouts: [IsaLookupColumns; PACKED_BLOCK_ISA_LOOKUP_COUNT] = PACKED_LANES
         .map(BlockCpuWitness::lane_isa_lookup_columns)
@@ -145,7 +160,10 @@ pub fn prove_packed_block_components(
         .map_err(|_| BlockFrontendError::Shape)?;
     let isa_lookup = prove_isa_lookups(isa_layouts, &witness)?;
     let execution_lookup = prove_execution_lookups(&witness)?;
-    let rom_lookup = prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?;
+    let rom_lookup = {
+        let _phase = crate::metrics::start(crate::metrics::Phase::RomLookup);
+        prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?
+    };
     Ok(PackedBlockProof {
         commitments: witness.into_commitments(),
         relation,

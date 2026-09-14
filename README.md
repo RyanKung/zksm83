@@ -100,6 +100,15 @@ The main CPU sumcheck performs
 about 4.69 billion constraint-slot evaluations before the extra relation
 validation, lookup, commitment, opening, and encoding work.
 
+Benchmark reports must break out component buckets before any protocol-level
+performance claim: witness construction, packed relation evaluation, witness
+commitment, ROM lookup, mutable-memory proof, continuity proof, protocol-log
+proof, sumcheck, opening, encoding, verifier time, and proof bytes. Current
+process-local diagnostics time relation evaluation, commitment, ROM lookup,
+mutable memory, continuity, logs, sumcheck, opening, encoding, and verifier
+work; witness construction and proof-byte attribution still need dedicated
+benchmark harness output.
+
 For ten seconds of DMG time, the hardware budget is:
 
 ```text
@@ -125,6 +134,15 @@ The current code has no CUDA prover. Merely running it on a machine containing
 an NVIDIA V100 does not provide a GPU speedup; field arithmetic, sumcheck,
 folding, and Akita commitment/opening kernels would first need a real CUDA
 implementation and separate measurement.
+
+Nightstream is tracked only as an implementation reference for lattice CCS
+folding architecture, optimized oracle/sumcheck code shape, and Ajtai
+commitment engineering. It is not treated as a replacement backend or evidence
+that end-to-end Game Boy proving is fast. The analogous Akita work is split as:
+chunked commitment construction can be evaluated as a prover-side improvement
+inside the fixed group layout; seeded public parameters require a new
+verifier-relevant schedule/protocol revision; binary-column fast paths require
+upstream Akita support and separate security review.
 
 ## Project status
 

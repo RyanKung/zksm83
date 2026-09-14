@@ -43,6 +43,7 @@ mod isa_lookup;
 mod logs;
 mod memory;
 mod metrics;
+mod optimization;
 mod pcs;
 mod pcs_batch_gate;
 mod receipt;
@@ -110,7 +111,8 @@ pub use block_control::{
 };
 pub use block_cpu::{
     BLOCK_CPU_COLUMN_COUNT, BLOCK_CPU_CONSTRAINT_COUNT, BLOCK_CPU_MAX_DEGREE, BlockCpuError,
-    BlockCpuRelation, BlockCpuWitness,
+    BlockCpuRelation, BlockCpuWitness, PackedCpuCachedValue, PackedCpuEvaluationHotspot,
+    PackedCpuEvaluationProfile,
 };
 pub use block_device::{
     BLOCK_DEVICE_ENVELOPE_COLUMN_COUNT, BLOCK_DEVICE_ENVELOPE_CONSTRAINT_COUNT,
@@ -241,6 +243,12 @@ pub use memory::{
     verify_packed_mutable_memory,
 };
 pub use metrics::{NativeProofPhaseMetrics, native_proof_phase_metrics};
+pub use optimization::{
+    AkitaOptimizationAssessment, AkitaOptimizationDecision, AkitaOptimizationTrack,
+    BenchmarkInstrumentation, EvaluationPointBinding, NativeBenchmarkBucket,
+    NativeBenchmarkPlanItem, NativeBenchmarkUnit, ProofObligationFamily, ProofObligationMetadata,
+    akita_optimization_assessment, native_benchmark_plan, packed_block_obligation_metadata,
+};
 pub use pcs_batch_gate::{
     PcsBatchGateError, PcsBatchGateMode, PcsBatchPathReport, PcsBatchTamperReport,
     run_pcs_batch_gate_worker,

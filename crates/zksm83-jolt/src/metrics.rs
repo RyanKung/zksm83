@@ -8,7 +8,12 @@ use std::{
 #[derive(Clone, Copy)]
 pub(crate) enum Phase {
     Setup,
+    PackedRelationEvaluation,
     Commit,
+    RomLookup,
+    MutableMemoryProof,
+    ContinuityProof,
+    ProtocolLogProof,
     Sumcheck,
     Opening,
     Encode,
@@ -18,7 +23,12 @@ pub(crate) enum Phase {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PhaseTotals {
     pub(crate) setup_nanos: u64,
+    pub(crate) packed_relation_evaluation_nanos: u64,
     pub(crate) commit_nanos: u64,
+    pub(crate) rom_lookup_nanos: u64,
+    pub(crate) mutable_memory_nanos: u64,
+    pub(crate) continuity_nanos: u64,
+    pub(crate) protocol_log_nanos: u64,
     pub(crate) sumcheck_nanos: u64,
     pub(crate) opening_nanos: u64,
     pub(crate) encode_nanos: u64,
@@ -32,7 +42,12 @@ pub(crate) struct PhaseTimer {
 
 struct AtomicPhaseTotals {
     setup_nanos: AtomicU64,
+    packed_relation_evaluation_nanos: AtomicU64,
     commit_nanos: AtomicU64,
+    rom_lookup_nanos: AtomicU64,
+    mutable_memory_nanos: AtomicU64,
+    continuity_nanos: AtomicU64,
+    protocol_log_nanos: AtomicU64,
     sumcheck_nanos: AtomicU64,
     opening_nanos: AtomicU64,
     encode_nanos: AtomicU64,
@@ -41,7 +56,12 @@ struct AtomicPhaseTotals {
 
 static TOTALS: AtomicPhaseTotals = AtomicPhaseTotals {
     setup_nanos: AtomicU64::new(0),
+    packed_relation_evaluation_nanos: AtomicU64::new(0),
     commit_nanos: AtomicU64::new(0),
+    rom_lookup_nanos: AtomicU64::new(0),
+    mutable_memory_nanos: AtomicU64::new(0),
+    continuity_nanos: AtomicU64::new(0),
+    protocol_log_nanos: AtomicU64::new(0),
     sumcheck_nanos: AtomicU64::new(0),
     opening_nanos: AtomicU64::new(0),
     encode_nanos: AtomicU64::new(0),
@@ -50,12 +70,18 @@ static TOTALS: AtomicPhaseTotals = AtomicPhaseTotals {
 
 /// Process-local cumulative wall times for diagnostic proof phases.
 ///
-/// Counters are not part of a receipt or its consensus identity. Concurrent
-/// proof work in the same process contributes to the same totals.
+/// Counters are not part of a receipt or its consensus identity. Component
+/// buckets can overlap nested setup, commitment, sumcheck, and opening work.
+/// Concurrent proof work in the same process contributes to the same totals.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NativeProofPhaseMetrics {
     setup: Duration,
+    packed_relation_evaluation: Duration,
     commit: Duration,
+    rom_lookup: Duration,
+    mutable_memory: Duration,
+    continuity: Duration,
+    protocol_log: Duration,
     sumcheck: Duration,
     opening: Duration,
     encode: Duration,
@@ -68,7 +94,14 @@ impl NativeProofPhaseMetrics {
     pub fn since(self, earlier: Self) -> Self {
         Self {
             setup: self.setup.saturating_sub(earlier.setup),
+            packed_relation_evaluation: self
+                .packed_relation_evaluation
+                .saturating_sub(earlier.packed_relation_evaluation),
             commit: self.commit.saturating_sub(earlier.commit),
+            rom_lookup: self.rom_lookup.saturating_sub(earlier.rom_lookup),
+            mutable_memory: self.mutable_memory.saturating_sub(earlier.mutable_memory),
+            continuity: self.continuity.saturating_sub(earlier.continuity),
+            protocol_log: self.protocol_log.saturating_sub(earlier.protocol_log),
             sumcheck: self.sumcheck.saturating_sub(earlier.sumcheck),
             opening: self.opening.saturating_sub(earlier.opening),
             encode: self.encode.saturating_sub(earlier.encode),
@@ -82,10 +115,40 @@ impl NativeProofPhaseMetrics {
         self.setup
     }
 
+    /// Returns time spent evaluating native relations outside sumcheck.
+    #[must_use]
+    pub const fn packed_relation_evaluation(self) -> Duration {
+        self.packed_relation_evaluation
+    }
+
     /// Returns time spent committing polynomial groups.
     #[must_use]
     pub const fn commit(self) -> Duration {
         self.commit
+    }
+
+    /// Returns time spent proving immutable-ROM lookup claims.
+    #[must_use]
+    pub const fn rom_lookup(self) -> Duration {
+        self.rom_lookup
+    }
+
+    /// Returns time spent proving mutable-memory chronology claims.
+    #[must_use]
+    pub const fn mutable_memory(self) -> Duration {
+        self.mutable_memory
+    }
+
+    /// Returns time spent proving cross-row state-continuity claims.
+    #[must_use]
+    pub const fn continuity(self) -> Duration {
+        self.continuity
+    }
+
+    /// Returns time spent proving ordered protocol-log claims.
+    #[must_use]
+    pub const fn protocol_log(self) -> Duration {
+        self.protocol_log
     }
 
     /// Returns time spent constructing algebraic sumcheck proofs.
@@ -119,7 +182,12 @@ pub fn native_proof_phase_metrics() -> NativeProofPhaseMetrics {
     let totals = snapshot();
     NativeProofPhaseMetrics {
         setup: duration(totals.setup_nanos),
+        packed_relation_evaluation: duration(totals.packed_relation_evaluation_nanos),
         commit: duration(totals.commit_nanos),
+        rom_lookup: duration(totals.rom_lookup_nanos),
+        mutable_memory: duration(totals.mutable_memory_nanos),
+        continuity: duration(totals.continuity_nanos),
+        protocol_log: duration(totals.protocol_log_nanos),
         sumcheck: duration(totals.sumcheck_nanos),
         opening: duration(totals.opening_nanos),
         encode: duration(totals.encode_nanos),
@@ -137,7 +205,14 @@ pub(crate) fn start(phase: Phase) -> PhaseTimer {
 pub(crate) fn snapshot() -> PhaseTotals {
     PhaseTotals {
         setup_nanos: TOTALS.setup_nanos.load(Ordering::Relaxed),
+        packed_relation_evaluation_nanos: TOTALS
+            .packed_relation_evaluation_nanos
+            .load(Ordering::Relaxed),
         commit_nanos: TOTALS.commit_nanos.load(Ordering::Relaxed),
+        rom_lookup_nanos: TOTALS.rom_lookup_nanos.load(Ordering::Relaxed),
+        mutable_memory_nanos: TOTALS.mutable_memory_nanos.load(Ordering::Relaxed),
+        continuity_nanos: TOTALS.continuity_nanos.load(Ordering::Relaxed),
+        protocol_log_nanos: TOTALS.protocol_log_nanos.load(Ordering::Relaxed),
         sumcheck_nanos: TOTALS.sumcheck_nanos.load(Ordering::Relaxed),
         opening_nanos: TOTALS.opening_nanos.load(Ordering::Relaxed),
         encode_nanos: TOTALS.encode_nanos.load(Ordering::Relaxed),
@@ -150,7 +225,12 @@ impl Drop for PhaseTimer {
         let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let counter = match self.phase {
             Phase::Setup => &TOTALS.setup_nanos,
+            Phase::PackedRelationEvaluation => &TOTALS.packed_relation_evaluation_nanos,
             Phase::Commit => &TOTALS.commit_nanos,
+            Phase::RomLookup => &TOTALS.rom_lookup_nanos,
+            Phase::MutableMemoryProof => &TOTALS.mutable_memory_nanos,
+            Phase::ContinuityProof => &TOTALS.continuity_nanos,
+            Phase::ProtocolLogProof => &TOTALS.protocol_log_nanos,
             Phase::Sumcheck => &TOTALS.sumcheck_nanos,
             Phase::Opening => &TOTALS.opening_nanos,
             Phase::Encode => &TOTALS.encode_nanos,
@@ -176,16 +256,19 @@ mod tests {
     fn metric_deltas_saturate_instead_of_wrapping() {
         let later = NativeProofPhaseMetrics {
             setup: Duration::from_nanos(9),
+            mutable_memory: Duration::from_nanos(7),
             verify: Duration::from_nanos(2),
             ..NativeProofPhaseMetrics::default()
         };
         let earlier = NativeProofPhaseMetrics {
             setup: Duration::from_nanos(4),
+            mutable_memory: Duration::from_nanos(5),
             verify: Duration::from_nanos(3),
             ..NativeProofPhaseMetrics::default()
         };
         let delta = later.since(earlier);
         assert_eq!(delta.setup(), Duration::from_nanos(5));
+        assert_eq!(delta.mutable_memory(), Duration::from_nanos(2));
         assert_eq!(delta.verify(), Duration::ZERO);
     }
 }
