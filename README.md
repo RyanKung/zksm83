@@ -4,6 +4,10 @@
 
 # zksm83
 
+<p align="center">
+  <strong><a href="output/pdf/zksm83.pdf">Read the ZKSM83 implementation paper (PDF)</a></strong>
+</p>
+
 `zksm83` is an experimental proof system for the SM83 CPU core used by the
 original Nintendo Game Boy (DMG).
 
