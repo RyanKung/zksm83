@@ -18,12 +18,13 @@ use thiserror::Error;
 use crate::{AkitaWorkerError, FieldFoldError, NativeProtocolVersion, NativeProverBackend};
 pub use commitment::{CommittedWitness, WitnessCommitments};
 use commitment::{
-    OpeningProof, commit_columns, prove_opening, prove_selected_opening,
-    verify_opening_for_protocol, verify_selected_opening_for_protocol,
+    OpeningProof, commit_columns_with_backend, prove_opening_with_backend,
+    prove_selected_opening_with_backend, verify_opening_for_protocol_with_backend,
+    verify_selected_opening_for_protocol_with_backend,
 };
 pub(crate) use composite::{
     CompositeUniformRelationProof, ProjectedRelation, prove_uniform_composite_with_backend,
-    verify_uniform_composite_for_protocol,
+    verify_uniform_composite_for_protocol_with_backend,
 };
 pub use relation::ConstraintOutput;
 use relation::initialize_constraint_output;
@@ -194,8 +195,17 @@ pub fn validate_uniform_witness(
     relation: &impl UniformRelation,
     columns: &[Vec<u64>],
 ) -> Result<(), UniformError> {
+    validate_uniform_witness_with_backend(relation, columns, &NativeProverBackend::cpu())
+}
+
+/// Checks a fixed-row witness through an explicitly selected backend boundary.
+pub fn validate_uniform_witness_with_backend(
+    relation: &impl UniformRelation,
+    columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<(), UniformError> {
     let row_count = validate_witness_shape(relation, columns)?;
-    ensure_u64_relation_holds(relation, columns, row_count)
+    backend.run_relation_evaluation(|| ensure_u64_relation_holds(relation, columns, row_count))
 }
 
 /// Commits `u64` witness columns and proves one uniform low-degree relation.
@@ -219,8 +229,8 @@ pub fn prove_uniform_with_backend(
     backend: &NativeProverBackend,
 ) -> Result<UniformProof, UniformError> {
     on_worker(|| {
-        validate_uniform_witness(relation, columns)?;
-        let witness = commit_columns(columns)?;
+        validate_uniform_witness_with_backend(relation, columns, backend)?;
+        let witness = commit_columns_with_backend(columns, backend)?;
         let relation_proof = prove_satisfied_uniform_on_worker(relation, &witness, backend)?;
         Ok(UniformProof {
             commitments: witness.into_commitments(),
@@ -239,7 +249,15 @@ pub fn verify_uniform(
 
 /// Commits one fixed-row witness plane for reuse by several native claims.
 pub fn commit_witness(columns: &[Vec<u64>]) -> Result<CommittedWitness, UniformError> {
-    on_worker(|| commit_columns(columns))
+    commit_witness_with_backend(columns, &NativeProverBackend::cpu())
+}
+
+/// Commits one fixed-row witness plane through the selected backend boundary.
+pub fn commit_witness_with_backend(
+    columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<CommittedWitness, UniformError> {
+    on_worker(|| commit_columns_with_backend(columns, backend))
 }
 
 /// Proves a uniform relation against an already committed witness plane.
@@ -250,7 +268,8 @@ pub fn prove_uniform_committed(
     prove_uniform_committed_with_backend(relation, witness, &NativeProverBackend::cpu())
 }
 
-pub(crate) fn prove_uniform_committed_with_backend(
+/// Proves a committed uniform relation through the selected backend boundary.
+pub fn prove_uniform_committed_with_backend(
     relation: &impl UniformRelation,
     witness: &CommittedWitness,
     backend: &NativeProverBackend,
@@ -264,11 +283,22 @@ pub fn verify_uniform_committed(
     commitments: &WitnessCommitments,
     proof: &UniformRelationProof,
 ) -> Result<(), UniformError> {
+    verify_uniform_committed_with_backend(relation, commitments, proof, &NativeProverBackend::cpu())
+}
+
+/// Verifies a committed uniform relation through the selected backend boundary.
+pub fn verify_uniform_committed_with_backend(
+    relation: &impl UniformRelation,
+    commitments: &WitnessCommitments,
+    proof: &UniformRelationProof,
+    backend: &NativeProverBackend,
+) -> Result<(), UniformError> {
     verify_uniform_committed_for_protocol(
         NativeProtocolVersion::current(),
         relation,
         commitments,
         proof,
+        backend,
     )
 }
 
@@ -277,40 +307,70 @@ pub(crate) fn verify_uniform_committed_for_protocol(
     relation: &impl UniformRelation,
     commitments: &WitnessCommitments,
     proof: &UniformRelationProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    on_worker(|| verify_uniform_committed_on_worker(protocol, relation, commitments, proof))
+    verify_uniform_committed_for_protocol_with_backend(
+        protocol,
+        relation,
+        commitments,
+        proof,
+        backend,
+    )
 }
 
-pub(crate) fn prove_witness_opening(
+pub(crate) fn verify_uniform_committed_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    relation: &impl UniformRelation,
+    commitments: &WitnessCommitments,
+    proof: &UniformRelationProof,
+    backend: &NativeProverBackend,
+) -> Result<(), UniformError> {
+    on_worker(|| {
+        verify_uniform_committed_on_worker(protocol, relation, commitments, proof, backend)
+    })
+}
+
+pub(crate) fn prove_witness_opening_with_backend(
     witness: &CommittedWitness,
     point: &[NativeField],
     values: &[NativeField],
     descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<crate::pcs::OpeningProof, UniformError> {
-    prove_opening(witness, point, values, descriptor)
+    prove_opening_with_backend(witness, point, values, descriptor, backend)
 }
 
-pub(crate) fn verify_witness_opening_for_protocol(
+pub(crate) fn verify_witness_opening_for_protocol_with_backend(
     protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     values: &[NativeField],
     descriptor: &[u8],
     opening: &crate::pcs::OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    verify_opening_for_protocol(protocol, commitments, point, values, descriptor, opening)
+    verify_opening_for_protocol_with_backend(
+        protocol,
+        commitments,
+        point,
+        values,
+        descriptor,
+        opening,
+        backend,
+    )
 }
 
-pub(crate) fn prove_witness_selected_opening(
+pub(crate) fn prove_witness_selected_opening_with_backend(
     witness: &CommittedWitness,
     point: &[NativeField],
     selected_columns: &[usize],
     descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<(Vec<NativeField>, crate::pcs::OpeningProof), UniformError> {
-    prove_selected_opening(witness, point, selected_columns, descriptor)
+    prove_selected_opening_with_backend(witness, point, selected_columns, descriptor, backend)
 }
 
-pub(crate) fn verify_witness_selected_opening_for_protocol(
+pub(crate) fn verify_witness_selected_opening_for_protocol_with_backend(
     protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
@@ -318,8 +378,9 @@ pub(crate) fn verify_witness_selected_opening_for_protocol(
     selected_columns: &[usize],
     descriptor: &[u8],
     opening: &crate::pcs::OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    verify_selected_opening_for_protocol(
+    verify_selected_opening_for_protocol_with_backend(
         protocol,
         commitments,
         point,
@@ -327,6 +388,7 @@ pub(crate) fn verify_witness_selected_opening_for_protocol(
         selected_columns,
         descriptor,
         opening,
+        backend,
     )
 }
 
@@ -338,7 +400,9 @@ fn prove_uniform_committed_on_worker(
     let protocol = NativeProtocolVersion::current();
     validate_committed_relation(protocol, relation, witness.commitments())?;
     let field_columns = witness.field_columns()?;
-    ensure_relation_holds(relation, field_columns.as_slice(), UNIFORM_ROW_COUNT)?;
+    backend.run_relation_evaluation(|| {
+        ensure_relation_holds(relation, field_columns.as_slice(), UNIFORM_ROW_COUNT)
+    })?;
     prove_satisfied_uniform_on_worker(relation, witness, backend)
 }
 
@@ -366,7 +430,13 @@ fn prove_satisfied_uniform_on_worker(
         backend,
         &mut transcript,
     )?;
-    let opening = prove_opening(witness, &opening_point, &opened_values, &descriptor)?;
+    let opening = prove_opening_with_backend(
+        witness,
+        &opening_point,
+        &opened_values,
+        &descriptor,
+        backend,
+    )?;
     Ok(UniformRelationProof {
         logical_column_count: relation.column_count(),
         sumcheck_rounds,
@@ -380,6 +450,7 @@ fn verify_uniform_committed_on_worker(
     relation: &impl UniformRelation,
     commitments: &WitnessCommitments,
     proof: &UniformRelationProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
     validate_committed_relation(protocol, relation, commitments)?;
     if proof.logical_column_count != relation.column_count()
@@ -403,13 +474,14 @@ fn verify_uniform_committed_on_worker(
         constraint_mix,
         &mut transcript,
     )?;
-    verify_opening_for_protocol(
+    verify_opening_for_protocol_with_backend(
         protocol,
         commitments,
         &opening_point,
         &proof.opened_values,
         &descriptor,
         &proof.opening,
+        backend,
     )
 }
 

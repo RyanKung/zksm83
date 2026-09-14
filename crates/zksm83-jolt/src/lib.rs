@@ -237,13 +237,13 @@ pub use isa_lookup::{
 };
 pub use logs::{
     CommittedProtocolLogs, PackedProtocolLogClaim, PackedProtocolLogProof, ProtocolLogCommitments,
-    ProtocolLogError, commit_packed_protocol_logs, prove_packed_protocol_logs,
-    verify_packed_protocol_logs,
+    ProtocolLogError, commit_packed_protocol_logs, commit_packed_protocol_logs_with_backend,
+    prove_packed_protocol_logs, verify_packed_protocol_logs,
 };
 pub use memory::{
     CommittedMemory, MEMORY_IMAGE_BYTES, MEMORY_TABLE_NUM_VARIABLES, MemoryCommitment,
-    MutableMemoryError, PackedMutableMemoryProof, commit_memory, prove_packed_mutable_memory,
-    verify_packed_mutable_memory,
+    MutableMemoryError, PackedMutableMemoryProof, commit_memory, commit_memory_with_backend,
+    prove_packed_mutable_memory, verify_packed_mutable_memory,
 };
 pub use metrics::{NativeProofPhaseMetrics, native_proof_phase_metrics};
 pub use optimization::{
@@ -256,7 +256,10 @@ pub use pcs_batch_gate::{
     PcsBatchGateError, PcsBatchGateMode, PcsBatchPathReport, PcsBatchTamperReport,
     run_pcs_batch_gate_worker,
 };
-pub use prover_backend::{NativeProverBackend, NativeProverBackendError, NativeProverBackendKind};
+pub use prover_backend::{
+    NATIVE_BACKEND_PHASES, NativeBackendPhase, NativeProverBackend, NativeProverBackendError,
+    NativeProverBackendKind,
+};
 pub use receipt::{
     CommitmentIdentity, CommitmentKind, MAX_NATIVE_RECEIPT_BYTES, MAX_NATIVE_ROM_COMMITMENT_BYTES,
     MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT, MAX_NATIVE_STATEMENT_BYTES,
@@ -264,12 +267,15 @@ pub use receipt::{
     NativeReceiptError, NativeReceiptStreamProver, NativeSegmentReceipt, NativeSegmentWitness,
     NativeStatement, ProtocolLogCounts, ProtocolLogIdentities, ProtocolLogKind,
     VerifiedNativeReceipt, VerifiedNativeSpool, native_backend_digest, verify_native_receipt,
-    verify_native_receipt_bytes, verify_native_receipt_reader, verify_native_spool_reader,
+    verify_native_receipt_bytes, verify_native_receipt_bytes_with_backend,
+    verify_native_receipt_reader, verify_native_receipt_reader_with_backend,
+    verify_native_receipt_with_backend, verify_native_spool_reader,
+    verify_native_spool_reader_with_backend,
 };
 pub use rom_lookup::{
     CommittedRom, ROM_256KIB_IMAGE_BYTES, ROM_ADDRESS_BIT_COUNT, ROM_IMAGE_BYTES, RomCommitment,
-    RomLookupColumns, RomLookupError, RomLookupProof, commit_rom, prove_rom_lookup,
-    verify_rom_lookup,
+    RomLookupColumns, RomLookupError, RomLookupProof, commit_rom, commit_rom_with_backend,
+    prove_rom_lookup, verify_rom_lookup,
 };
 use serde::Serialize;
 pub use state::{
@@ -320,8 +326,10 @@ pub use uniform::{
     NATIVE_TRACE_COMMITMENT_GROUP_COUNT, NATIVE_TRACE_OPENING_COUNT,
     NATIVE_TRACE_PADDED_COLUMN_COUNT, NATIVE_TRACE_PADDING_COLUMN_COUNT, NativeField,
     UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT, UniformError, UniformProof, UniformRelation,
-    UniformRelationProof, WitnessCommitments, commit_witness, prove_uniform,
-    prove_uniform_committed, validate_uniform_witness, verify_uniform, verify_uniform_committed,
+    UniformRelationProof, WitnessCommitments, commit_witness, commit_witness_with_backend,
+    prove_uniform, prove_uniform_committed, prove_uniform_committed_with_backend,
+    prove_uniform_with_backend, validate_uniform_witness, validate_uniform_witness_with_backend,
+    verify_uniform, verify_uniform_committed, verify_uniform_committed_with_backend,
 };
 
 /// Exact Jolt protocol revision used as the native-SM83 integration reference.

@@ -5,9 +5,9 @@ use akita_pcs::{Ring, Transcript};
 use super::{
     CommittedWitness, ConstraintOutput, NativeField, OpeningProof, UNIFORM_NUM_VARIABLES,
     UNIFORM_ROW_COUNT, UniformError, UniformRelation, WitnessCommitments, ensure_relation_holds,
-    outer_transcript, prove_opening, prove_selected_opening, prove_sumcheck, push_bytes,
-    push_usize, replay_sumcheck, sample_point, validate_relation, verify_opening_for_protocol,
-    verify_selected_opening_for_protocol,
+    outer_transcript, prove_opening_with_backend, prove_selected_opening_with_backend,
+    prove_sumcheck, push_bytes, push_usize, replay_sumcheck, sample_point, validate_relation,
+    verify_opening_for_protocol_with_backend, verify_selected_opening_for_protocol_with_backend,
 };
 use crate::{NativeProtocolVersion, NativeProverBackend};
 
@@ -234,14 +234,15 @@ pub(crate) fn prove_uniform_composite_with_backend<R: UniformRelation>(
     })
 }
 
-pub(crate) fn verify_uniform_composite_for_protocol<R: UniformRelation>(
+pub(crate) fn verify_uniform_composite_for_protocol_with_backend<R: UniformRelation>(
     protocol: NativeProtocolVersion,
     relation: &ProjectedRelation<R>,
     left: &WitnessCommitments,
     right: &WitnessCommitments,
     proof: &CompositeUniformRelationProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    super::on_worker(|| verify_on_worker(protocol, relation, left, right, proof))
+    super::on_worker(|| verify_on_worker(protocol, relation, left, right, proof, backend))
 }
 
 fn prove_on_worker<R: UniformRelation>(
@@ -265,7 +266,8 @@ fn prove_on_worker<R: UniformRelation>(
         );
     }
     columns.extend_from_slice(right_columns.as_slice());
-    ensure_relation_holds(relation, &columns, UNIFORM_ROW_COUNT)?;
+    backend
+        .run_relation_evaluation(|| ensure_relation_holds(relation, &columns, UNIFORM_ROW_COUNT))?;
     let descriptor = descriptor(protocol, relation, left.commitments(), right.commitments())?;
     let mut transcript = outer_transcript(protocol, &descriptor, super::TranscriptSide::Prover);
     let row_point = sample_point(&mut transcript, UNIFORM_NUM_VARIABLES);
@@ -288,10 +290,16 @@ fn prove_on_worker<R: UniformRelation>(
         .get(split..)
         .ok_or(UniformError::Shape)?
         .to_vec();
-    let (left_values, left_opening) =
-        prove_selected_opening(left, &opening_point, relation.trace_columns(), &descriptor)?;
+    let (left_values, left_opening) = prove_selected_opening_with_backend(
+        left,
+        &opening_point,
+        relation.trace_columns(),
+        &descriptor,
+        backend,
+    )?;
     ensure_selected_values_match(relation.trace_columns(), selected_values, &left_values)?;
-    let right_opening = prove_opening(right, &opening_point, &right_values, &descriptor)?;
+    let right_opening =
+        prove_opening_with_backend(right, &opening_point, &right_values, &descriptor, backend)?;
     Ok(CompositeUniformRelationProof {
         rounds,
         left_values,
@@ -307,6 +315,7 @@ fn verify_on_worker<R: UniformRelation>(
     left: &WitnessCommitments,
     right: &WitnessCommitments,
     proof: &CompositeUniformRelationProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
     validate_shapes(protocol, relation, left, right)?;
     if proof.rounds.len() != UNIFORM_NUM_VARIABLES
@@ -332,7 +341,7 @@ fn verify_on_worker<R: UniformRelation>(
         constraint_mix,
         &mut transcript,
     )?;
-    verify_selected_opening_for_protocol(
+    verify_selected_opening_for_protocol_with_backend(
         protocol,
         left,
         &opening_point,
@@ -340,14 +349,16 @@ fn verify_on_worker<R: UniformRelation>(
         relation.trace_columns(),
         &descriptor,
         &proof.left_opening,
+        backend,
     )?;
-    verify_opening_for_protocol(
+    verify_opening_for_protocol_with_backend(
         protocol,
         right,
         &opening_point,
         &proof.right_values,
         &descriptor,
         &proof.right_opening,
+        backend,
     )
 }
 

@@ -8,15 +8,15 @@ use crate::{
     AKITA_ROM_SCHEDULE_SHA256, AkitaWorkerError, FieldFoldError, NativeField,
     NativeProtocolVersion, NativeProverBackend, TRACE_BUS_SLOTS, UNIFORM_NUM_VARIABLES,
     pcs::{
-        ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
-        prove_opening, verify_opening,
+        ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout,
+        commit_columns_with_backend, prove_opening_with_backend, verify_opening_with_backend,
     },
     sumcheck::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_selected_opening,
-        verify_witness_selected_opening_for_protocol,
+        CommittedWitness, WitnessCommitments, prove_witness_selected_opening_with_backend,
+        verify_witness_selected_opening_for_protocol_with_backend,
     },
 };
 
@@ -238,6 +238,14 @@ impl RomCommitment {
 
 /// Commits a supported logical cartridge ROM, padded to the one-MiB lookup table.
 pub fn commit_rom(image: &[u8]) -> Result<CommittedRom, RomLookupError> {
+    commit_rom_with_backend(image, &NativeProverBackend::cpu())
+}
+
+/// Commits a supported logical cartridge ROM through a backend boundary.
+pub fn commit_rom_with_backend(
+    image: &[u8],
+    backend: &NativeProverBackend,
+) -> Result<CommittedRom, RomLookupError> {
     validate_rom_length(image.len())?;
     on_worker(|| {
         let logical_byte_length =
@@ -248,7 +256,7 @@ pub fn commit_rom(image: &[u8]) -> Result<CommittedRom, RomLookupError> {
         padded.extend_from_slice(image);
         padded.resize(ROM_IMAGE_BYTES, 0);
         let column = padded.iter().copied().map(u64::from).collect::<Vec<_>>();
-        let inner = commit_columns(ROM_LAYOUT, &[column])?;
+        let inner = commit_columns_with_backend(ROM_LAYOUT, &[column], backend)?;
         let commitment = RomCommitment {
             logical_byte_length,
             inner: inner.commitments().clone(),
@@ -312,7 +320,25 @@ pub(crate) fn verify_rom_lookup_for_protocol(
     trace_commitments: &WitnessCommitments,
     proof: &RomLookupProof,
 ) -> Result<(), RomLookupError> {
-    on_worker(|| verify_on_worker(protocol, layout, rom, trace_commitments, proof))
+    verify_rom_lookup_for_protocol_with_backend(
+        protocol,
+        layout,
+        rom,
+        trace_commitments,
+        proof,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_rom_lookup_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    layout: RomLookupColumns,
+    rom: &RomCommitment,
+    trace_commitments: &WitnessCommitments,
+    proof: &RomLookupProof,
+    backend: &NativeProverBackend,
+) -> Result<(), RomLookupError> {
+    on_worker(|| verify_on_worker(protocol, layout, rom, trace_commitments, proof, backend))
 }
 
 fn prove_on_worker(
@@ -368,8 +394,13 @@ fn prove_on_worker(
     if address_claim != table_sumcheck.final_left() {
         return Err(RomLookupError::AddressBindingMismatch);
     }
-    let (trace_cycle_values, trace_cycle_opening) =
-        prove_witness_selected_opening(witness, &cycle_point, &layout.values, &descriptor)?;
+    let (trace_cycle_values, trace_cycle_opening) = prove_witness_selected_opening_with_backend(
+        witness,
+        &cycle_point,
+        &layout.values,
+        &descriptor,
+        backend,
+    )?;
     require_mixed_value(
         &trace_cycle_values,
         &layout.values,
@@ -377,12 +408,14 @@ fn prove_on_worker(
         claimed_output,
     )?;
     let address_opening_columns = address_opening_columns(layout);
-    let (trace_address_values, trace_address_opening) = prove_witness_selected_opening(
-        witness,
-        &address_point,
-        &address_opening_columns,
-        &descriptor,
-    )?;
+    let (trace_address_values, trace_address_opening) =
+        prove_witness_selected_opening_with_backend(
+            witness,
+            &address_point,
+            &address_opening_columns,
+            &descriptor,
+            backend,
+        )?;
     verify_address_terminal(
         &address_sumcheck,
         layout,
@@ -392,12 +425,13 @@ fn prove_on_worker(
         &address_point,
         &trace_address_values,
     )?;
-    let table_opening = prove_opening(
+    let table_opening = prove_opening_with_backend(
         ROM_LAYOUT,
         &rom.inner,
         &table_point,
         &table_values,
         &descriptor,
+        backend,
     )?;
     Ok(RomLookupProof {
         claimed_output,
@@ -418,6 +452,7 @@ fn verify_on_worker(
     rom: &RomCommitment,
     trace_commitments: &WitnessCommitments,
     proof: &RomLookupProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), RomLookupError> {
     layout.validate(trace_commitments.column_count())?;
     rom.validate()?;
@@ -431,13 +466,14 @@ fn verify_on_worker(
         ROM_TABLE_NUM_VARIABLES,
         &mut transcript,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         ROM_LAYOUT,
         &rom.inner,
         &table_point,
         &proof.table_values,
         &descriptor,
         &proof.table_opening,
+        backend,
     )?;
     require_table_value(&proof.table_values, proof.table_sumcheck.final_right())?;
     let address_point = proof.address_sumcheck.verify(
@@ -447,7 +483,7 @@ fn verify_on_worker(
         ROM_LOOKUP_FACTOR_COUNT,
         &mut transcript,
     )?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &cycle_point,
@@ -455,6 +491,7 @@ fn verify_on_worker(
         &layout.values,
         &descriptor,
         &proof.trace_cycle_opening,
+        backend,
     )?;
     require_mixed_value(
         &proof.trace_cycle_values,
@@ -463,7 +500,7 @@ fn verify_on_worker(
         proof.claimed_output,
     )?;
     let address_opening_columns = address_opening_columns(layout);
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &address_point,
@@ -471,6 +508,7 @@ fn verify_on_worker(
         &address_opening_columns,
         &descriptor,
         &proof.trace_address_opening,
+        backend,
     )?;
     verify_address_terminal(
         &proof.address_sumcheck,

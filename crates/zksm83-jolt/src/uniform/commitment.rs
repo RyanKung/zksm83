@@ -10,13 +10,14 @@ use rayon::prelude::*;
 #[cfg(test)]
 use crate::pcs::scheme as pcs_scheme;
 use crate::{
-    BLOCK_CPU_COLUMN_COUNT, NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion,
+    BLOCK_CPU_COLUMN_COUNT, NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion, NativeProverBackend,
     pcs::{
         ColumnCommitments, CommittedColumns, FieldColumnView, OpeningProof as PcsOpeningProof,
-        PcsError, PcsLayout, commit_columns as commit_pcs_columns,
-        prove_opening as prove_pcs_opening, prove_selected_opening as prove_pcs_selected_opening,
-        selected_logical_columns, verify_opening as verify_pcs_opening,
-        verify_selected_opening as verify_pcs_selected_opening,
+        PcsError, PcsLayout, commit_columns_with_backend as commit_pcs_columns_with_backend,
+        prove_opening_with_backend as prove_pcs_opening_with_backend,
+        prove_selected_opening_with_backend as prove_pcs_selected_opening_with_backend,
+        selected_logical_columns, verify_opening_with_backend as verify_pcs_opening_with_backend,
+        verify_selected_opening_with_backend as verify_pcs_selected_opening_with_backend,
     },
 };
 
@@ -126,15 +127,19 @@ impl WitnessCommitments {
     }
 }
 
-pub(super) fn commit_columns(columns: &[Vec<u64>]) -> Result<CommittedWitness, UniformError> {
-    commit_columns_for(NativeProtocolVersion::current(), columns)
+pub(super) fn commit_columns_with_backend(
+    columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<CommittedWitness, UniformError> {
+    commit_columns_for_with_backend(NativeProtocolVersion::current(), columns, backend)
 }
 
-pub(super) fn commit_columns_for(
+pub(super) fn commit_columns_for_with_backend(
     protocol: NativeProtocolVersion,
     columns: &[Vec<u64>],
+    backend: &NativeProverBackend,
 ) -> Result<CommittedWitness, UniformError> {
-    commit_pcs_columns(layout_for(protocol, columns.len()), columns)
+    commit_pcs_columns_with_backend(layout_for(protocol, columns.len()), columns, backend)
         .map(|inner| CommittedWitness {
             commitments: WitnessCommitments {
                 inner: inner.commitments().clone(),
@@ -144,46 +149,51 @@ pub(super) fn commit_columns_for(
         .map_err(map_pcs_error)
 }
 
-pub(super) fn prove_opening(
+pub(super) fn prove_opening_with_backend(
     witness: &CommittedWitness,
     point: &[NativeField],
     logical_values: &[NativeField],
     instance_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<OpeningProof, UniformError> {
-    prove_pcs_opening(
+    prove_pcs_opening_with_backend(
         witness.inner.layout(),
         &witness.inner,
         point,
         logical_values,
         instance_descriptor,
+        backend,
     )
     .map_err(map_pcs_error)
 }
 
-pub(super) fn verify_opening_for_protocol(
+pub(super) fn verify_opening_for_protocol_with_backend(
     protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     logical_values: &[NativeField],
     instance_descriptor: &[u8],
     opening: &OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    verify_pcs_opening(
+    verify_pcs_opening_with_backend(
         layout_for(protocol, commitments.column_count()),
         &commitments.inner,
         point,
         logical_values,
         instance_descriptor,
         opening,
+        backend,
     )
     .map_err(map_pcs_error)
 }
 
-pub(super) fn prove_selected_opening(
+pub(super) fn prove_selected_opening_with_backend(
     witness: &CommittedWitness,
     point: &[NativeField],
     selected_columns: &[usize],
     instance_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<(Vec<NativeField>, OpeningProof), UniformError> {
     let layout = witness.inner.layout();
     let columns = witness.field_columns()?;
@@ -207,19 +217,20 @@ pub(super) fn prove_selected_opening(
     for (index, value) in evaluated {
         *values.get_mut(index).ok_or(UniformError::Shape)? = value;
     }
-    let opening = prove_pcs_selected_opening(
+    let opening = prove_pcs_selected_opening_with_backend(
         layout,
         &witness.inner,
         point,
         &values,
         selected_columns,
         instance_descriptor,
+        backend,
     )
     .map_err(map_pcs_error)?;
     Ok((values, opening))
 }
 
-pub(super) fn verify_selected_opening_for_protocol(
+pub(super) fn verify_selected_opening_for_protocol_with_backend(
     protocol: NativeProtocolVersion,
     commitments: &WitnessCommitments,
     point: &[NativeField],
@@ -227,8 +238,9 @@ pub(super) fn verify_selected_opening_for_protocol(
     selected_columns: &[usize],
     instance_descriptor: &[u8],
     opening: &OpeningProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
-    verify_pcs_selected_opening(
+    verify_pcs_selected_opening_with_backend(
         layout_for(protocol, commitments.column_count()),
         &commitments.inner,
         point,
@@ -236,6 +248,7 @@ pub(super) fn verify_selected_opening_for_protocol(
         selected_columns,
         instance_descriptor,
         opening,
+        backend,
     )
     .map_err(map_pcs_error)
 }

@@ -16,11 +16,12 @@ use crate::{
     FieldFoldError, NativeField, NativeProtocolVersion, NativeProverBackend,
     TRACE_MEMORY_TIMESTAMP_BITS, UniformError, WitnessCommitments,
     block_memory::BLOCK_MEMORY_ROW_BITS_START,
-    pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns},
+    commit_witness_with_backend,
+    pcs::{ColumnCommitments, CommittedColumns, PcsError, PcsLayout, commit_columns_with_backend},
     sumcheck::ProductSumcheckError,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
-        prove_uniform_composite_with_backend, verify_uniform_composite_for_protocol,
+        prove_uniform_composite_with_backend, verify_uniform_composite_for_protocol_with_backend,
     },
 };
 
@@ -174,6 +175,14 @@ impl MemoryCommitment {
 
 /// Commits one exact 128-KiB mutable-memory checkpoint image.
 pub fn commit_memory(image: &[u8]) -> Result<CommittedMemory, MutableMemoryError> {
+    commit_memory_with_backend(image, &NativeProverBackend::cpu())
+}
+
+/// Commits one exact 128-KiB mutable-memory checkpoint image through a backend boundary.
+pub fn commit_memory_with_backend(
+    image: &[u8],
+    backend: &NativeProverBackend,
+) -> Result<CommittedMemory, MutableMemoryError> {
     if image.len() != MEMORY_IMAGE_BYTES {
         return Err(MutableMemoryError::InvalidMemoryLength {
             actual: image.len(),
@@ -182,7 +191,7 @@ pub fn commit_memory(image: &[u8]) -> Result<CommittedMemory, MutableMemoryError
     }
     let column = image.iter().copied().map(u64::from).collect::<Vec<_>>();
     on_worker(|| {
-        let inner = commit_columns(MEMORY_LAYOUT, &[column])?;
+        let inner = commit_columns_with_backend(MEMORY_LAYOUT, &[column], backend)?;
         let commitment = MemoryCommitment {
             inner: inner.commitments().clone(),
         };
@@ -197,13 +206,15 @@ pub fn prove_packed_mutable_memory(
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
 ) -> Result<PackedMutableMemoryProof, MutableMemoryError> {
-    let prepared = prepare_packed_mutable_memory(trace, trace_witness, initial, final_memory)?;
+    let backend = NativeProverBackend::cpu();
+    let prepared =
+        prepare_packed_mutable_memory(trace, trace_witness, initial, final_memory, &backend)?;
     prove_prepared_packed_mutable_memory_with_backend(
         prepared,
         trace_witness,
         initial,
         final_memory,
-        &NativeProverBackend::cpu(),
+        &backend,
     )
 }
 
@@ -212,6 +223,7 @@ pub(crate) fn prepare_packed_mutable_memory(
     trace_witness: &CommittedWitness,
     initial: &CommittedMemory,
     final_memory: &CommittedMemory,
+    backend: &NativeProverBackend,
 ) -> Result<PreparedPackedMutableMemory, MutableMemoryError> {
     let protocol = NativeProtocolVersion::current();
     if trace.columns().len() != BLOCK_CPU_COLUMN_COUNT {
@@ -219,7 +231,7 @@ pub(crate) fn prepare_packed_mutable_memory(
     }
     initial.commitment.validate()?;
     final_memory.commitment.validate()?;
-    let final_timestamps = commit_u64_column(trace.final_memory_timestamps())?;
+    let final_timestamps = commit_u64_column(trace.final_memory_timestamps(), backend)?;
     let phase_one = phase_one_descriptor(
         protocol,
         trace_witness.commitments(),
@@ -229,11 +241,11 @@ pub(crate) fn prepare_packed_mutable_memory(
     )?;
     let challenges = challenges(&phase_one)?;
     let trace_inverse_columns = block_event::inverse_columns(trace, challenges)?;
-    let trace_inverses = crate::commit_witness(&trace_inverse_columns)?;
+    let trace_inverses = commit_witness_with_backend(&trace_inverse_columns, backend)?;
     let (initial_inverse_values, final_inverse_values) =
         boundary::inverse_columns(initial, final_memory, &final_timestamps, challenges)?;
-    let initial_inverses = commit_u64_columns(&initial_inverse_values)?;
-    let final_inverses = commit_u64_columns(&final_inverse_values)?;
+    let initial_inverses = commit_u64_columns(&initial_inverse_values, backend)?;
+    let final_inverses = commit_u64_columns(&final_inverse_values, backend)?;
     Ok(PreparedPackedMutableMemory {
         final_timestamps,
         trace_inverses,
@@ -267,7 +279,12 @@ pub(crate) fn prove_prepared_packed_mutable_memory_with_backend(
     )?;
     let event_relation =
         prove_uniform_composite_with_backend(&relation, trace_witness, &trace_inverses, backend)?;
-    let clock = clock::prove_at(trace_witness, &phase_one, BLOCK_MEMORY_ROW_BITS_START)?;
+    let clock = clock::prove_at(
+        trace_witness,
+        &phase_one,
+        BLOCK_MEMORY_ROW_BITS_START,
+        backend,
+    )?;
     let full = full_descriptor(
         protocol,
         &phase_one,
@@ -285,7 +302,13 @@ pub(crate) fn prove_prepared_packed_mutable_memory_with_backend(
         &full,
         backend,
     )?;
-    let multiset_sum = sum::prove(&trace_inverses, &initial_inverses, &final_inverses, &full)?;
+    let multiset_sum = sum::prove(
+        &trace_inverses,
+        &initial_inverses,
+        &final_inverses,
+        &full,
+        backend,
+    )?;
     Ok(PackedMutableMemoryProof {
         final_timestamps: final_timestamps.into_commitments(),
         trace_inverses: trace_inverses.into_commitments(),
@@ -321,6 +344,24 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
     initial: &MemoryCommitment,
     final_memory: &MemoryCommitment,
 ) -> Result<(), MutableMemoryError> {
+    verify_packed_mutable_memory_for_protocol_with_backend(
+        protocol,
+        proof,
+        trace,
+        initial,
+        final_memory,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_packed_mutable_memory_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    proof: &PackedMutableMemoryProof,
+    trace: &WitnessCommitments,
+    initial: &MemoryCommitment,
+    final_memory: &MemoryCommitment,
+    backend: &NativeProverBackend,
+) -> Result<(), MutableMemoryError> {
     initial.validate()?;
     final_memory.validate()?;
     proof.final_timestamps.validate(MEMORY_LAYOUT)?;
@@ -339,12 +380,13 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
         BLOCK_CPU_COLUMN_COUNT,
         block_event::trace_columns()?,
     )?;
-    verify_uniform_composite_for_protocol(
+    verify_uniform_composite_for_protocol_with_backend(
         protocol,
         &relation,
         trace,
         &proof.trace_inverses,
         &proof.event_relation,
+        backend,
     )?;
     clock::verify_at(
         protocol,
@@ -352,6 +394,7 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
         &phase_one,
         &proof.clock,
         BLOCK_MEMORY_ROW_BITS_START,
+        backend,
     )?;
     let full = full_descriptor(
         protocol,
@@ -369,6 +412,7 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
         challenges,
         &full,
         &proof.boundary,
+        backend,
     )?;
     sum::verify(
         protocol,
@@ -377,6 +421,7 @@ pub(crate) fn verify_packed_mutable_memory_for_protocol(
         &proof.final_inverses,
         &full,
         &proof.multiset_sum,
+        backend,
     )
 }
 
@@ -390,7 +435,10 @@ impl CommittedMemoryColumns {
     }
 }
 
-fn commit_u64_columns(values: &[Vec<u64>]) -> Result<CommittedMemoryColumns, MutableMemoryError> {
+fn commit_u64_columns(
+    values: &[Vec<u64>],
+    backend: &NativeProverBackend,
+) -> Result<CommittedMemoryColumns, MutableMemoryError> {
     if values.is_empty()
         || values
             .iter()
@@ -400,18 +448,21 @@ fn commit_u64_columns(values: &[Vec<u64>]) -> Result<CommittedMemoryColumns, Mut
     }
     on_worker(|| {
         Ok(CommittedMemoryColumns {
-            inner: commit_columns(MEMORY_LAYOUT, values)?,
+            inner: commit_columns_with_backend(MEMORY_LAYOUT, values, backend)?,
         })
     })
 }
 
-fn commit_u64_column(value: &[u64]) -> Result<CommittedMemoryColumns, MutableMemoryError> {
+fn commit_u64_column(
+    value: &[u64],
+    backend: &NativeProverBackend,
+) -> Result<CommittedMemoryColumns, MutableMemoryError> {
     if value.len() != MEMORY_IMAGE_BYTES {
         return Err(MutableMemoryError::Shape);
     }
     on_worker(|| {
         Ok(CommittedMemoryColumns {
-            inner: commit_columns(MEMORY_LAYOUT, &[value])?,
+            inner: commit_columns_with_backend(MEMORY_LAYOUT, &[value], backend)?,
         })
     })
 }

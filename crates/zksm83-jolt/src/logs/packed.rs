@@ -5,8 +5,8 @@ use akita_pcs::AkitaTranscript;
 use crate::{
     AKITA_AUXILIARY_SCHEDULE_SHA256, AKITA_LOG_SCHEDULE_SHA256, BlockCpuWitness,
     NativeExecutionClaim, NativeField, NativeProtocolVersion, NativeProverBackend, TRACE_BUS_SLOTS,
-    WitnessCommitments,
-    pcs::{ColumnCommitments, commit_columns},
+    WitnessCommitments, commit_witness_with_backend,
+    pcs::{ColumnCommitments, commit_columns_with_backend},
     uniform::{CommittedWitness, CompositeUniformRelationProof},
 };
 
@@ -168,9 +168,17 @@ impl PackedProtocolLogClaim {
 pub fn commit_packed_protocol_logs(
     trace: &BlockCpuWitness,
 ) -> Result<CommittedProtocolLogs, ProtocolLogError> {
+    commit_packed_protocol_logs_with_backend(trace, &NativeProverBackend::cpu())
+}
+
+/// Commits canonical-position protocol logs through a backend boundary.
+pub fn commit_packed_protocol_logs_with_backend(
+    trace: &BlockCpuWitness,
+    backend: &NativeProverBackend,
+) -> Result<CommittedProtocolLogs, ProtocolLogError> {
     let columns = packed_trace_relation::log_columns(trace)?;
     on_worker(|| {
-        let inner = commit_columns(LOG_LAYOUT, &columns)?;
+        let inner = commit_columns_with_backend(LOG_LAYOUT, &columns, backend)?;
         let commitment = ProtocolLogCommitments {
             inner: inner.commitments().clone(),
         };
@@ -190,14 +198,16 @@ pub fn prove_packed_protocol_logs(
     execution: &NativeExecutionClaim,
     claim: PackedProtocolLogClaim,
 ) -> Result<PackedProtocolLogProof, ProtocolLogError> {
-    let prepared = prepare_packed_protocol_logs(trace, trace_witness, logs, execution, claim)?;
+    let backend = NativeProverBackend::cpu();
+    let prepared =
+        prepare_packed_protocol_logs(trace, trace_witness, logs, execution, claim, &backend)?;
     prove_prepared_packed_protocol_logs_with_backend(
         prepared,
         trace_witness,
         logs,
         execution,
         claim,
-        &NativeProverBackend::cpu(),
+        &backend,
     )
 }
 
@@ -207,6 +217,7 @@ pub(crate) fn prepare_packed_protocol_logs(
     logs: &CommittedProtocolLogs,
     execution: &NativeExecutionClaim,
     claim: PackedProtocolLogClaim,
+    backend: &NativeProverBackend,
 ) -> Result<PreparedPackedProtocolLogs, ProtocolLogError> {
     if PackedProtocolLogClaim::from_trace(trace, execution)? != claim {
         return Err(ProtocolLogError::Shape);
@@ -222,9 +233,9 @@ pub(crate) fn prepare_packed_protocol_logs(
     )?;
     let challenges = challenges(&phase_one)?;
     let trace_inverse_values = packed_trace_relation::inverse_columns(trace, challenges)?;
-    let trace_inverses = crate::commit_witness(&trace_inverse_values)?;
+    let trace_inverses = commit_witness_with_backend(&trace_inverse_values, backend)?;
     let table_inverse_values = table_relation::inverse_columns(&logs.inner, challenges)?;
-    let table_inverses = commit_log_columns(&table_inverse_values)?;
+    let table_inverses = commit_log_columns(&table_inverse_values, backend)?;
     Ok(PreparedPackedProtocolLogs {
         trace_inverses,
         table_inverses,
@@ -267,6 +278,7 @@ pub(crate) fn prove_prepared_packed_protocol_logs_with_backend(
             &table_inverses,
             counts,
             &full,
+            backend,
         )
     })?;
     Ok(PackedProtocolLogProof {
@@ -304,6 +316,26 @@ pub(crate) fn verify_packed_protocol_logs_for_protocol(
     execution: &NativeExecutionClaim,
     claim: PackedProtocolLogClaim,
 ) -> Result<(), ProtocolLogError> {
+    verify_packed_protocol_logs_for_protocol_with_backend(
+        protocol,
+        proof,
+        trace,
+        logs,
+        execution,
+        claim,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_packed_protocol_logs_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    proof: &PackedProtocolLogProof,
+    trace: &WitnessCommitments,
+    logs: &ProtocolLogCommitments,
+    execution: &NativeExecutionClaim,
+    claim: PackedProtocolLogClaim,
+    backend: &NativeProverBackend,
+) -> Result<(), ProtocolLogError> {
     let counts = claim.counts(execution)?;
     logs.validate()?;
     proof.table_inverses.validate(LOG_LAYOUT)?;
@@ -315,6 +347,7 @@ pub(crate) fn verify_packed_protocol_logs_for_protocol(
         &proof.trace_inverses,
         challenges,
         &proof.trace_relation,
+        backend,
     )?;
     let full = full_descriptor(
         protocol,
@@ -328,6 +361,7 @@ pub(crate) fn verify_packed_protocol_logs_for_protocol(
         challenges,
         &full,
         &proof.table_relation,
+        backend,
     )?;
     on_worker(|| {
         sum::verify(
@@ -341,6 +375,7 @@ pub(crate) fn verify_packed_protocol_logs_for_protocol(
                 table_inverses: &proof.table_inverses,
                 full_descriptor: &full,
             },
+            backend,
         )
     })
 }

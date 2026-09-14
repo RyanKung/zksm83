@@ -2,10 +2,16 @@ use akita_pcs::Ring;
 use jolt_field::Field;
 
 use crate::{
-    NativeField, NativeProtocolVersion, UNIFORM_NUM_VARIABLES, UNIFORM_ROW_COUNT,
-    WitnessCommitments,
-    pcs::{ColumnCommitments, CommittedColumns, OpeningProof, prove_opening, verify_opening},
-    uniform::{CommittedWitness, prove_witness_opening, verify_witness_opening_for_protocol},
+    NativeField, NativeProtocolVersion, NativeProverBackend, UNIFORM_NUM_VARIABLES,
+    UNIFORM_ROW_COUNT, WitnessCommitments,
+    pcs::{
+        ColumnCommitments, CommittedColumns, OpeningProof, prove_opening_with_backend,
+        verify_opening_with_backend,
+    },
+    uniform::{
+        CommittedWitness, prove_witness_opening_with_backend,
+        verify_witness_opening_for_protocol_with_backend,
+    },
 };
 
 use super::{
@@ -38,6 +44,7 @@ pub(super) fn prove(
     table_inverses: &CommittedLogColumns,
     counts: [u64; LOG_KIND_COUNT],
     full_descriptor: &[u8],
+    backend: &NativeProverBackend,
 ) -> Result<ProtocolLogSumProof, ProtocolLogError> {
     let descriptor = descriptor(layout, full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
@@ -55,15 +62,28 @@ pub(super) fn prove(
         &table_inverse_values,
         counts,
     )?;
-    let trace_opening =
-        prove_witness_opening(trace_inverses, &trace_point, &trace_values, &descriptor)?;
-    let log_opening = prove_opening(LOG_LAYOUT, logs, &log_point, &log_values, &descriptor)?;
-    let table_inverse_opening = prove_opening(
+    let trace_opening = prove_witness_opening_with_backend(
+        trace_inverses,
+        &trace_point,
+        &trace_values,
+        &descriptor,
+        backend,
+    )?;
+    let log_opening = prove_opening_with_backend(
+        LOG_LAYOUT,
+        logs,
+        &log_point,
+        &log_values,
+        &descriptor,
+        backend,
+    )?;
+    let table_inverse_opening = prove_opening_with_backend(
         LOG_LAYOUT,
         &table_inverses.inner,
         &log_point,
         &table_inverse_values,
         &descriptor,
+        backend,
     )?;
     Ok(ProtocolLogSumProof {
         trace_values,
@@ -81,33 +101,37 @@ pub(super) fn verify(
     proof: &ProtocolLogSumProof,
     counts: [u64; LOG_KIND_COUNT],
     inputs: ProtocolLogSumInputs<'_>,
+    backend: &NativeProverBackend,
 ) -> Result<(), ProtocolLogError> {
     let descriptor = descriptor(layout, inputs.full_descriptor)?;
     let trace_point = half_point(UNIFORM_NUM_VARIABLES)?;
     let log_point = half_point(PROTOCOL_LOG_NUM_VARIABLES)?;
-    verify_witness_opening_for_protocol(
+    verify_witness_opening_for_protocol_with_backend(
         protocol,
         inputs.trace_inverses,
         &trace_point,
         &proof.trace_values,
         &descriptor,
         &proof.trace_opening,
+        backend,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         LOG_LAYOUT,
         inputs.logs,
         &log_point,
         &proof.log_values,
         &descriptor,
         &proof.log_opening,
+        backend,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         LOG_LAYOUT,
         inputs.table_inverses,
         &log_point,
         &proof.table_inverse_values,
         &descriptor,
         &proof.table_inverse_opening,
+        backend,
     )?;
     check(
         layout,

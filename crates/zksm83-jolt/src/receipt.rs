@@ -12,7 +12,7 @@ use crate::{
     BlockCpuWitness, CommittedMemory, CommittedRom, MemoryCommitment, NativeExecutionClaim,
     NativeProtocolVersion, NativeProverBackend, NativeStateBoundary, PackedBlockProof,
     PackedBlockProofError, PackedProtocolLogClaim, ProtocolLogCommitments, ProtocolLogError,
-    RomCommitment, UNIFORM_ROW_COUNT, commit_packed_protocol_logs,
+    RomCommitment, UNIFORM_ROW_COUNT, commit_packed_protocol_logs_with_backend,
     prove_packed_block_components_with_backend,
 };
 
@@ -44,7 +44,8 @@ pub const MAX_NATIVE_SEGMENT_COUNT: usize = 4096;
 
 pub use stream::{
     NativeReceiptStreamProver, VerifiedNativeSpool, verify_native_receipt_reader,
-    verify_native_spool_reader,
+    verify_native_receipt_reader_with_backend, verify_native_spool_reader,
+    verify_native_spool_reader_with_backend,
 };
 
 /// Returns the digest of every consensus-relevant current proof-backend parameter.
@@ -458,7 +459,7 @@ fn prove_segment(
             "prover witness does not start at the expected boundary",
         ));
     }
-    let logs = commit_packed_protocol_logs(&trace)?;
+    let logs = commit_packed_protocol_logs_with_backend(&trace, backend)?;
     let log_claim = PackedProtocolLogClaim::from_trace(&trace, &claim)?;
     let segment_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
     let final_state = NativeStateBoundary::from_vm_state(trace.final_state());
@@ -519,12 +520,21 @@ pub fn verify_native_receipt(
     receipt: &NativeReceipt,
     expected: &NativeStatement,
 ) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
+    verify_native_receipt_with_backend(receipt, expected, &NativeProverBackend::cpu())
+}
+
+/// Verifies a parsed receipt through an explicitly selected backend boundary.
+pub fn verify_native_receipt_with_backend(
+    receipt: &NativeReceipt,
+    expected: &NativeStatement,
+    backend: &NativeProverBackend,
+) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
     expected.validate()?;
     receipt.statement.validate()?;
     if receipt.version != expected.protocol || receipt.statement != *expected {
         return Err(NativeReceiptError::StatementMismatch);
     }
-    verify_receipt_structure(receipt)?;
+    verify_receipt_structure(receipt, backend)?;
     Ok(VerifiedNativeReceipt {
         statement_id: expected.statement_id,
         segment_count: expected.segment_count,
@@ -536,11 +546,23 @@ pub fn verify_native_receipt_bytes(
     bytes: &[u8],
     expected: &NativeStatement,
 ) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
-    let receipt = NativeReceipt::from_bytes(bytes)?;
-    verify_native_receipt(&receipt, expected)
+    verify_native_receipt_bytes_with_backend(bytes, expected, &NativeProverBackend::cpu())
 }
 
-fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceiptError> {
+/// Canonically decodes and verifies a receipt through the selected backend boundary.
+pub fn verify_native_receipt_bytes_with_backend(
+    bytes: &[u8],
+    expected: &NativeStatement,
+    backend: &NativeProverBackend,
+) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
+    let receipt = backend.run_encoding(|| NativeReceipt::from_bytes(bytes))?;
+    verify_native_receipt_with_backend(&receipt, expected, backend)
+}
+
+fn verify_receipt_structure(
+    receipt: &NativeReceipt,
+    backend: &NativeProverBackend,
+) -> Result<(), NativeReceiptError> {
     let statement = &receipt.statement;
     if direct_rom_identity_for(receipt.version, &receipt.rom)? != statement.rom
         || receipt.segments.len()
@@ -556,7 +578,14 @@ fn verify_receipt_structure(receipt: &NativeReceipt) -> Result<(), NativeReceipt
         if let Some(memory) = previous_memory {
             ensure_same_memory(memory, &segment.initial_memory, receipt.version)?;
         }
-        verify_segment(index, segment, &boundary, &receipt.rom, receipt.version)?;
+        verify_segment(
+            index,
+            segment,
+            &boundary,
+            &receipt.rom,
+            receipt.version,
+            backend,
+        )?;
         transitions = transitions
             .checked_add(segment.transition_count)
             .ok_or(NativeReceiptError::Counter)?;
@@ -596,6 +625,20 @@ fn verify_segment(
     expected_initial: &NativeBoundary,
     rom: &RomCommitment,
     protocol: NativeProtocolVersion,
+    backend: &NativeProverBackend,
+) -> Result<(), NativeReceiptError> {
+    backend.run_verification(|| {
+        verify_segment_inner(index, segment, expected_initial, rom, protocol, backend)
+    })
+}
+
+fn verify_segment_inner(
+    index: usize,
+    segment: &NativeSegmentReceipt,
+    expected_initial: &NativeBoundary,
+    rom: &RomCommitment,
+    protocol: NativeProtocolVersion,
+    backend: &NativeProverBackend,
 ) -> Result<(), NativeReceiptError> {
     let _phase = crate::metrics::start(crate::metrics::Phase::Verify);
     let expected_index = u64::try_from(index).map_err(|_| NativeReceiptError::Counter)?;
@@ -658,7 +701,7 @@ fn verify_segment(
     let log_claim =
         PackedProtocolLogClaim::new(segment.log_counts.bus, segment.log_counts.isa, &claim)
             .map_err(PackedBlockProofError::ProtocolLog)?;
-    crate::block_proof::verify_packed_block_components_for_protocol(
+    crate::block_proof::verify_packed_block_components_for_protocol_with_backend(
         protocol,
         &segment.proof,
         crate::block_proof::PackedBlockVerificationInputs {
@@ -669,6 +712,7 @@ fn verify_segment(
             initial_memory: &segment.initial_memory,
             final_memory: &segment.final_memory,
         },
+        backend,
     )?;
     Ok(())
 }

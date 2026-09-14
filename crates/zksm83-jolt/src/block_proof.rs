@@ -10,28 +10,30 @@ use crate::{
     NativeExecutionClaim, NativeProtocolVersion, NativeProverBackend, PackedContinuityProof,
     PackedMutableMemoryProof, PackedProtocolLogClaim, PackedProtocolLogProof,
     ProtocolLogCommitments, ProtocolLogError, RomCommitment, RomLookupError, RomLookupProof,
-    UniformError, UniformRelationProof, WitnessCommitments, commit_witness,
+    UniformError, UniformRelationProof, WitnessCommitments, commit_witness_with_backend,
     packed_block_obligation_metadata,
 };
 use crate::{
     continuity::{
         prepare_packed_continuity, prove_prepared_packed_continuity_with_backend,
-        verify_packed_continuity_for_protocol,
+        verify_packed_continuity_for_protocol_with_backend,
     },
     execution_lookup::proof::{
-        prove_execution_lookups_with_backend, verify_execution_lookups_for_protocol,
+        prove_execution_lookups_with_backend, verify_execution_lookups_for_protocol_with_backend,
     },
-    isa_lookup::{prove_isa_lookups_with_backend, verify_isa_lookups_for_protocol},
+    isa_lookup::{prove_isa_lookups_with_backend, verify_isa_lookups_for_protocol_with_backend},
     logs::{
         prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs_with_backend,
-        verify_packed_protocol_logs_for_protocol,
+        verify_packed_protocol_logs_for_protocol_with_backend,
     },
     memory::{
         prepare_packed_mutable_memory, prove_prepared_packed_mutable_memory_with_backend,
-        verify_packed_mutable_memory_for_protocol,
+        verify_packed_mutable_memory_for_protocol_with_backend,
     },
-    rom_lookup::{prove_rom_lookup_with_backend, verify_rom_lookup_for_protocol},
-    uniform::{prove_uniform_committed_with_backend, verify_uniform_committed_for_protocol},
+    rom_lookup::{prove_rom_lookup_with_backend, verify_rom_lookup_for_protocol_with_backend},
+    uniform::{
+        prove_uniform_committed_with_backend, verify_uniform_committed_for_protocol_with_backend,
+    },
 };
 
 /// Number of independent fixed-ISA queries carried by one packed block row.
@@ -157,11 +159,12 @@ pub fn prove_packed_block_components_with_backend(
     final_memory: &CommittedMemory,
     backend: &NativeProverBackend,
 ) -> Result<PackedBlockProof, PackedBlockProofError> {
-    let witness = commit_witness(trace.columns())?;
+    let witness = commit_witness_with_backend(trace.columns(), backend)?;
     let prepared_memory =
-        prepare_packed_mutable_memory(&trace, &witness, initial_memory, final_memory)?;
-    let prepared_continuity = prepare_packed_continuity(&trace, &witness, claim)?;
-    let prepared_logs = prepare_packed_protocol_logs(&trace, &witness, logs, claim, log_claim)?;
+        prepare_packed_mutable_memory(&trace, &witness, initial_memory, final_memory, backend)?;
+    let prepared_continuity = prepare_packed_continuity(&trace, &witness, claim, backend)?;
+    let prepared_logs =
+        prepare_packed_protocol_logs(&trace, &witness, logs, claim, log_claim, backend)?;
     drop(trace);
     let memory = {
         let _phase = crate::metrics::start(crate::metrics::Phase::MutableMemoryProof);
@@ -252,11 +255,26 @@ pub(crate) fn verify_packed_block_components_for_protocol(
     proof: &PackedBlockProof,
     inputs: PackedBlockVerificationInputs<'_>,
 ) -> Result<(), PackedBlockProofError> {
-    verify_uniform_committed_for_protocol(
+    verify_packed_block_components_for_protocol_with_backend(
+        protocol,
+        proof,
+        inputs,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_packed_block_components_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    proof: &PackedBlockProof,
+    inputs: PackedBlockVerificationInputs<'_>,
+    backend: &NativeProverBackend,
+) -> Result<(), PackedBlockProofError> {
+    verify_uniform_committed_for_protocol_with_backend(
         protocol,
         &BlockCpuRelation,
         &proof.commitments,
         &proof.relation,
+        backend,
     )?;
     let isa_layouts: [IsaLookupColumns; PACKED_BLOCK_ISA_LOOKUP_COUNT] = PACKED_LANES
         .map(BlockCpuWitness::lane_isa_lookup_columns)
@@ -264,35 +282,50 @@ pub(crate) fn verify_packed_block_components_for_protocol(
         .collect::<Result<Vec<_>, _>>()?
         .try_into()
         .map_err(|_| BlockFrontendError::Shape)?;
-    verify_isa_lookups_for_protocol(protocol, isa_layouts, &proof.commitments, &proof.isa_lookup)?;
-    verify_execution_lookups_for_protocol(protocol, &proof.commitments, &proof.execution_lookup)?;
-    verify_rom_lookup_for_protocol(
+    verify_isa_lookups_for_protocol_with_backend(
+        protocol,
+        isa_layouts,
+        &proof.commitments,
+        &proof.isa_lookup,
+        backend,
+    )?;
+    verify_execution_lookups_for_protocol_with_backend(
+        protocol,
+        &proof.commitments,
+        &proof.execution_lookup,
+        backend,
+    )?;
+    verify_rom_lookup_for_protocol_with_backend(
         protocol,
         BlockCpuWitness::rom_lookup_columns()?,
         inputs.rom,
         &proof.commitments,
         &proof.rom_lookup,
+        backend,
     )?;
-    verify_packed_mutable_memory_for_protocol(
+    verify_packed_mutable_memory_for_protocol_with_backend(
         protocol,
         &proof.memory,
         &proof.commitments,
         inputs.initial_memory,
         inputs.final_memory,
+        backend,
     )?;
-    verify_packed_continuity_for_protocol(
+    verify_packed_continuity_for_protocol_with_backend(
         protocol,
         &proof.continuity,
         &proof.commitments,
         inputs.claim,
+        backend,
     )?;
-    verify_packed_protocol_logs_for_protocol(
+    verify_packed_protocol_logs_for_protocol_with_backend(
         protocol,
         &proof.logs,
         &proof.commitments,
         inputs.logs,
         inputs.claim,
         inputs.log_claim,
+        backend,
     )?;
     Ok(())
 }

@@ -6,9 +6,10 @@ use std::{
 };
 
 use crate::{
-    CommittedRom, MemoryCommitment, NativeProtocolVersion, NativeProverBackend,
-    NativeProverBackendKind, NativeStateBoundary,
+    BlockCpuError, BlockCpuWitness, CommittedRom, MemoryCommitment, NativeProtocolVersion,
+    NativeProverBackend, NativeProverBackendKind, NativeStateBoundary,
 };
+use zksm83_trace::BasicBlock;
 
 use super::{
     MAX_NATIVE_ROM_COMMITMENT_BYTES, MAX_NATIVE_SEGMENT_BYTES, MAX_NATIVE_SEGMENT_COUNT,
@@ -147,7 +148,12 @@ where
                 "segment spool length is invalid".to_owned(),
             ));
         }
-        let progress = verify_native_spool_reader(&mut spool, spool_bytes, rom.commitment())?;
+        let progress = verify_native_spool_reader_with_backend(
+            &mut spool,
+            spool_bytes,
+            rom.commitment(),
+            &backend,
+        )?;
         spool.seek(SeekFrom::Start(spool_bytes))?;
         Ok(Self {
             rom,
@@ -191,6 +197,20 @@ where
     #[must_use]
     pub const fn backend_kind(&self) -> NativeProverBackendKind {
         self.backend.kind()
+    }
+
+    /// Returns the initialized backend used by this stream prover.
+    #[must_use]
+    pub const fn backend(&self) -> &NativeProverBackend {
+        &self.backend
+    }
+
+    /// Constructs packed proof columns through the selected backend boundary.
+    pub fn construct_block_witness(
+        &self,
+        blocks: &[BasicBlock],
+    ) -> Result<BlockCpuWitness, BlockCpuError> {
+        self.backend.construct_block_witness(blocks)
     }
 
     /// Returns the last verifier-checked public boundary, if any frame exists.
@@ -285,8 +305,10 @@ where
             self.transition_count,
             self.relation_row_count,
         )?;
-        let statement_bytes = encode_statement(&statement)?;
-        let rom_bytes = encode_rom(self.rom.commitment())?;
+        let statement_bytes = self.backend.run_encoding(|| encode_statement(&statement))?;
+        let rom_bytes = self
+            .backend
+            .run_encoding(|| encode_rom(self.rom.commitment()))?;
         let header_bytes = header_length(statement_bytes.len(), rom_bytes.len())?;
         let total_bytes = header_bytes
             .checked_add(self.spool_bytes)
@@ -336,7 +358,7 @@ fn prove_frame(
         let (receipt, final_boundary) = prove_segment(index, initial, witness, rom, backend)?;
         let encoded = {
             let _phase = crate::metrics::start(crate::metrics::Phase::Encode);
-            encode_segment(&receipt)?
+            backend.run_encoding(|| encode_segment(&receipt))?
         };
         Ok(ProvedFrame {
             encoded,
@@ -366,6 +388,15 @@ pub fn verify_native_receipt_reader<R: Read>(
     reader: R,
     expected: &NativeStatement,
 ) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
+    verify_native_receipt_reader_with_backend(reader, expected, &NativeProverBackend::cpu())
+}
+
+/// Incrementally verifies a canonical receipt through the selected backend boundary.
+pub fn verify_native_receipt_reader_with_backend<R: Read>(
+    reader: R,
+    expected: &NativeStatement,
+    backend: &NativeProverBackend,
+) -> Result<VerifiedNativeReceipt, NativeReceiptError> {
     expected.validate()?;
     let mut reader = BoundedReader::new(reader);
     let protocol = protocol_from_receipt_magic(reader.fixed()?)?;
@@ -374,11 +405,13 @@ pub fn verify_native_receipt_reader<R: Read>(
     if protocol != encoded_protocol || protocol != expected.protocol {
         return Err(NativeReceiptError::UnsupportedBackend);
     }
-    let statement = NativeStatement::from_bytes(&reader.blob(MAX_NATIVE_STATEMENT_BYTES)?)?;
+    let statement_bytes = reader.blob(MAX_NATIVE_STATEMENT_BYTES)?;
+    let statement = backend.run_encoding(|| NativeStatement::from_bytes(&statement_bytes))?;
     if statement != *expected {
         return Err(NativeReceiptError::StatementMismatch);
     }
-    let rom = decode_rom(&reader.blob(MAX_NATIVE_ROM_COMMITMENT_BYTES)?)?;
+    let rom_bytes = reader.blob(MAX_NATIVE_ROM_COMMITMENT_BYTES)?;
+    let rom = backend.run_encoding(|| decode_rom(&rom_bytes))?;
     if direct_rom_identity_for(protocol, &rom)? != statement.rom {
         return Err(NativeReceiptError::StatementMismatch);
     }
@@ -386,7 +419,7 @@ pub fn verify_native_receipt_reader<R: Read>(
     if u64::try_from(count).map_err(|_| NativeReceiptError::Counter)? != statement.segment_count {
         return Err(NativeReceiptError::StatementMismatch);
     }
-    verify_frames(&mut reader, count, &statement, &rom, protocol)?;
+    verify_frames(&mut reader, count, &statement, &rom, protocol, backend)?;
     reader.finish()?;
     Ok(VerifiedNativeReceipt {
         statement_id: expected.statement_id,
@@ -400,10 +433,25 @@ pub fn verify_native_spool_reader<R: Read + Seek>(
     declared_spool_bytes: u64,
     rom: &crate::RomCommitment,
 ) -> Result<VerifiedNativeSpool, NativeReceiptError> {
+    verify_native_spool_reader_with_backend(
+        &mut spool,
+        declared_spool_bytes,
+        rom,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+/// Verifies every spool frame through the selected backend boundary.
+pub fn verify_native_spool_reader_with_backend<R: Read + Seek>(
+    mut spool: R,
+    declared_spool_bytes: u64,
+    rom: &crate::RomCommitment,
+    backend: &NativeProverBackend,
+) -> Result<VerifiedNativeSpool, NativeReceiptError> {
     let actual_spool_bytes = spool.seek(SeekFrom::End(0))?;
     validate_spool_length(actual_spool_bytes, declared_spool_bytes)?;
     spool.seek(SeekFrom::Start(0))?;
-    verify_spool(&mut spool, declared_spool_bytes, rom)
+    verify_spool(&mut spool, declared_spool_bytes, rom, backend)
 }
 
 fn validate_spool_length(actual: u64, declared: u64) -> Result<(), NativeReceiptError> {
@@ -426,17 +474,19 @@ fn verify_frames<R: Read>(
     statement: &NativeStatement,
     rom: &crate::RomCommitment,
     protocol: NativeProtocolVersion,
+    backend: &NativeProverBackend,
 ) -> Result<(), NativeReceiptError> {
     let mut boundary = statement.initial.clone();
     let mut previous_memory: Option<MemoryCommitment> = None;
     let mut transitions = 0_u64;
     let mut rows = 0_u64;
     for index in 0..count {
-        let segment = decode_segment(&reader.blob(MAX_NATIVE_SEGMENT_BYTES)?)?;
+        let segment_bytes = reader.blob(MAX_NATIVE_SEGMENT_BYTES)?;
+        let segment = backend.run_encoding(|| decode_segment(&segment_bytes))?;
         if let Some(memory) = previous_memory.as_ref() {
             ensure_same_memory(memory, &segment.initial_memory, protocol)?;
         }
-        verify_segment(index, &segment, &boundary, rom, protocol)?;
+        verify_segment(index, &segment, &boundary, rom, protocol, backend)?;
         transitions = transitions
             .checked_add(segment.transition_count)
             .ok_or(NativeReceiptError::Counter)?;
@@ -461,6 +511,7 @@ fn verify_spool<S: Read + Seek>(
     spool: &mut S,
     spool_bytes: u64,
     rom: &crate::RomCommitment,
+    backend: &NativeProverBackend,
 ) -> Result<VerifiedNativeSpool, NativeReceiptError> {
     let mut initial: Option<NativeBoundary> = None;
     let mut boundary: Option<NativeBoundary> = None;
@@ -473,7 +524,8 @@ fn verify_spool<S: Read + Seek>(
         if index >= MAX_NATIVE_SEGMENT_COUNT {
             return Err(NativeReceiptError::InvalidStatement);
         }
-        let segment = decode_segment(&read_spool_frame(spool, spool_bytes)?)?;
+        let segment_bytes = read_spool_frame(spool, spool_bytes)?;
+        let segment = backend.run_encoding(|| decode_segment(&segment_bytes))?;
         let expected_initial = match &boundary {
             Some(current) => current.clone(),
             None => NativeBoundary::initial(segment.initial.state, &segment.initial_memory)?,
@@ -491,6 +543,7 @@ fn verify_spool<S: Read + Seek>(
             &expected_initial,
             rom,
             NativeProtocolVersion::current(),
+            backend,
         )?;
         transition_count = transition_count
             .checked_add(segment.transition_count)

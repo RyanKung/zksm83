@@ -9,15 +9,15 @@ use crate::{
     NativeProverBackend, UNIFORM_NUM_VARIABLES, UniformError, fixed_isa_table,
     fixed_isa_table_digest,
     pcs::{
-        ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout, commit_columns,
-        prove_opening, verify_opening,
+        ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout,
+        commit_columns_with_backend, prove_opening_with_backend, verify_opening_with_backend,
     },
     sumcheck::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
     uniform::{
-        CommittedWitness, WitnessCommitments, prove_witness_selected_opening,
-        verify_witness_selected_opening_for_protocol,
+        CommittedWitness, WitnessCommitments, prove_witness_selected_opening_with_backend,
+        verify_witness_selected_opening_for_protocol_with_backend,
     },
 };
 
@@ -283,7 +283,7 @@ pub(crate) fn prove_isa_lookup_with_backend(
     backend: &NativeProverBackend,
 ) -> Result<IsaLookupProof, IsaLookupError> {
     on_worker(|| {
-        let table = commit_fixed_table()?;
+        let table = commit_fixed_table_with_backend(backend)?;
         prove_isa_lookups_on_worker(std::slice::from_ref(&layout), witness, &table, backend)
     })
 }
@@ -294,7 +294,7 @@ pub(crate) fn prove_isa_lookups_with_backend<const N: usize>(
     backend: &NativeProverBackend,
 ) -> Result<IsaLookupProof, IsaLookupError> {
     on_worker(|| {
-        let table = commit_fixed_table()?;
+        let table = commit_fixed_table_with_backend(backend)?;
         prove_isa_lookups_on_worker(&layouts, witness, &table, backend)
     })
 }
@@ -319,23 +319,43 @@ pub(crate) fn verify_isa_lookup_for_protocol(
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
 ) -> Result<(), IsaLookupError> {
+    verify_isa_lookup_for_protocol_with_backend(
+        protocol,
+        layout,
+        trace_commitments,
+        proof,
+        &NativeProverBackend::cpu(),
+    )
+}
+
+pub(crate) fn verify_isa_lookup_for_protocol_with_backend(
+    protocol: NativeProtocolVersion,
+    layout: IsaLookupColumns,
+    trace_commitments: &WitnessCommitments,
+    proof: &IsaLookupProof,
+    backend: &NativeProverBackend,
+) -> Result<(), IsaLookupError> {
     on_worker(|| {
         verify_isa_lookups_on_worker(
             protocol,
             std::slice::from_ref(&layout),
             trace_commitments,
             proof,
+            backend,
         )
     })
 }
 
-pub(crate) fn verify_isa_lookups_for_protocol<const N: usize>(
+pub(crate) fn verify_isa_lookups_for_protocol_with_backend<const N: usize>(
     protocol: NativeProtocolVersion,
     layouts: [IsaLookupColumns; N],
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), IsaLookupError> {
-    on_worker(|| verify_isa_lookups_on_worker(protocol, &layouts, trace_commitments, proof))
+    on_worker(|| {
+        verify_isa_lookups_on_worker(protocol, &layouts, trace_commitments, proof, backend)
+    })
 }
 
 fn prove_isa_lookups_on_worker(
@@ -405,8 +425,13 @@ fn prove_isa_lookups_on_worker(
         return Err(IsaLookupError::AddressBindingMismatch);
     }
     let cycle_columns = selected_output_columns(layouts)?;
-    let (trace_cycle_values, trace_cycle_opening) =
-        prove_witness_selected_opening(witness, &cycle_point, &cycle_columns, &descriptor)?;
+    let (trace_cycle_values, trace_cycle_opening) = prove_witness_selected_opening_with_backend(
+        witness,
+        &cycle_point,
+        &cycle_columns,
+        &descriptor,
+        backend,
+    )?;
     require_batched_mixed_value(
         &trace_cycle_values,
         layouts,
@@ -416,7 +441,13 @@ fn prove_isa_lookups_on_worker(
     )?;
     let address_columns = selected_address_columns(layouts)?;
     let (trace_address_values, trace_address_opening) =
-        prove_witness_selected_opening(witness, &address_point, &address_columns, &descriptor)?;
+        prove_witness_selected_opening_with_backend(
+            witness,
+            &address_point,
+            &address_columns,
+            &descriptor,
+            backend,
+        )?;
     verify_address_terminal(
         &address_sumcheck,
         layouts,
@@ -426,12 +457,13 @@ fn prove_isa_lookups_on_worker(
         &address_point,
         &trace_address_values,
     )?;
-    let table_opening = prove_opening(
+    let table_opening = prove_opening_with_backend(
         ISA_TABLE_LAYOUT,
         table,
         &table_point,
         &table_values,
         &descriptor,
+        backend,
     )?;
     Ok(IsaLookupProof {
         table_commitments,
@@ -452,6 +484,7 @@ fn verify_isa_lookups_on_worker(
     layouts: &[IsaLookupColumns],
     trace_commitments: &WitnessCommitments,
     proof: &IsaLookupProof,
+    backend: &NativeProverBackend,
 ) -> Result<(), IsaLookupError> {
     validate_layouts(layouts, trace_commitments.column_count())?;
     validate_fixed_commitments(&proof.table_commitments)?;
@@ -473,13 +506,14 @@ fn verify_isa_lookups_on_worker(
         ISA_TABLE_NUM_VARIABLES,
         &mut transcript,
     )?;
-    verify_opening(
+    verify_opening_with_backend(
         ISA_TABLE_LAYOUT,
         &proof.table_commitments.inner,
         &table_point,
         &proof.table_values,
         &descriptor,
         &proof.table_opening,
+        backend,
     )?;
     require_mixed_value(
         &proof.table_values,
@@ -496,7 +530,7 @@ fn verify_isa_lookups_on_worker(
         &mut transcript,
     )?;
     let cycle_columns = selected_output_columns(layouts)?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &cycle_point,
@@ -504,6 +538,7 @@ fn verify_isa_lookups_on_worker(
         &cycle_columns,
         &descriptor,
         &proof.trace_cycle_opening,
+        backend,
     )?;
     require_batched_mixed_value(
         &proof.trace_cycle_values,
@@ -513,7 +548,7 @@ fn verify_isa_lookups_on_worker(
         proof.claimed_output,
     )?;
     let address_columns = selected_address_columns(layouts)?;
-    verify_witness_selected_opening_for_protocol(
+    verify_witness_selected_opening_for_protocol_with_backend(
         protocol,
         trace_commitments,
         &address_point,
@@ -521,6 +556,7 @@ fn verify_isa_lookups_on_worker(
         &address_columns,
         &descriptor,
         &proof.trace_address_opening,
+        backend,
     )?;
     verify_address_terminal(
         &proof.address_sumcheck,
@@ -533,8 +569,11 @@ fn verify_isa_lookups_on_worker(
     )
 }
 
-fn commit_fixed_table() -> Result<CommittedColumns, IsaLookupError> {
-    commit_columns(ISA_TABLE_LAYOUT, &fixed_table_columns()?).map_err(Into::into)
+fn commit_fixed_table_with_backend(
+    backend: &NativeProverBackend,
+) -> Result<CommittedColumns, IsaLookupError> {
+    commit_columns_with_backend(ISA_TABLE_LAYOUT, &fixed_table_columns()?, backend)
+        .map_err(Into::into)
 }
 
 fn validate_fixed_commitments(commitments: &FixedIsaCommitments) -> Result<(), IsaLookupError> {

@@ -2,11 +2,14 @@
 
 Experimental CUDA primitives for the native SM83 prover.
 
-This crate currently implements one protocol-neutral operation: binary folding
-over Akita's `Prime128OffsetA7F7` base field. `zksm83-jolt` can select it for
-dense uniform and product-sumcheck folds, but the rest of the proving pipeline
-remains on the CPU. The transcript, proof format, receipt format, and verifier
-remain unchanged.
+This crate currently implements one device operation: binary folding over
+Akita's `Prime128OffsetA7F7` base field. `zksm83-jolt` routes the native backend
+selection across witness construction, relation evaluation, field folding,
+Akita commitment/opening, canonical encoding, and receipt verification. Field
+folding dispatches to this CUDA kernel when `--proof-backend cuda` is selected.
+The other phases run through the same backend boundary with byte-equivalent CPU
+implementations until dedicated CUDA or Akita GPU kernels land. The transcript,
+proof format, receipt format, and backend digest remain unchanged.
 
 The cuda-oxide revision is pinned for compiler reproducibility. The GPU target
 is not pinned: `cargo oxide run` may detect the selected device, while `--arch`
@@ -38,6 +41,14 @@ cd crates/zksm83-jolt
 cargo +nightly-2026-08-28 oxide run --features cuda \
   --bin zksm83-native-prover -- \
   <normal prover arguments> --proof-backend cuda --cuda-device 0
+```
+
+The standalone verifier accepts the same backend selection:
+
+```text
+cargo +nightly-2026-08-28 oxide run --features cuda \
+  --bin zksm83-native-verifier -- \
+  --proof-backend cuda --cuda-device 0 <statement.bin> <receipt.bin>
 ```
 
 An explicit target remains available for cross-compilation and repeatable CI:

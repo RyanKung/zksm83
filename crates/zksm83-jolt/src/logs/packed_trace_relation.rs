@@ -18,7 +18,7 @@ use crate::{
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
-        verify_uniform_composite_for_protocol,
+        verify_uniform_composite_for_protocol_with_backend,
     },
 };
 
@@ -263,14 +263,17 @@ pub(super) fn verify(
     inverses: &WitnessCommitments,
     challenges: LogChallenges,
     proof: &CompositeUniformRelationProof,
+    backend: &crate::NativeProverBackend,
 ) -> Result<(), ProtocolLogError> {
     let relation = ProjectedRelation::new(
         PackedTraceLogRelation { challenges },
         BLOCK_CPU_COLUMN_COUNT,
         relation_trace_columns()?,
     )?;
-    verify_uniform_composite_for_protocol(protocol, &relation, trace, inverses, proof)
-        .map_err(Into::into)
+    verify_uniform_composite_for_protocol_with_backend(
+        protocol, &relation, trace, inverses, proof, backend,
+    )
+    .map_err(Into::into)
 }
 
 struct PackedTraceLogRelation {

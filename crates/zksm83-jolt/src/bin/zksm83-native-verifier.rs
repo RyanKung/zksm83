@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, BufReader},
     path::Path,
@@ -11,14 +11,23 @@ use std::{
 
 use thiserror::Error;
 use zksm83_jolt::{
-    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NativeReceiptError,
-    NativeStatement, native_proof_phase_metrics, verify_native_receipt_reader,
+    MAX_NATIVE_STATEMENT_BYTES, MAX_NATIVE_STREAM_RECEIPT_BYTES, NativeProverBackend,
+    NativeProverBackendError, NativeProverBackendKind, NativeReceiptError, NativeStatement,
+    native_proof_phase_metrics, verify_native_receipt_reader_with_backend,
 };
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("usage: zksm83-native-verifier <expected-statement.bin> <receipt.bin>")]
+    #[error(
+        "usage: zksm83-native-verifier [--proof-backend cpu|cuda] [--cuda-device N] <expected-statement.bin> <receipt.bin>"
+    )]
     Usage,
+    #[error("invalid proof backend {0}")]
+    InvalidProofBackend(String),
+    #[error("invalid CUDA device ordinal {0}")]
+    InvalidCudaDevice(String),
+    #[error("--cuda-device requires --proof-backend cuda")]
+    CudaDeviceWithCpuBackend,
     #[error("{kind} file exceeds the protocol byte limit")]
     Length { kind: &'static str },
     #[error("failed to read {kind} file {path}: {source}")]
@@ -29,7 +38,23 @@ enum CliError {
         source: io::Error,
     },
     #[error(transparent)]
+    ProverBackend(#[from] NativeProverBackendError),
+    #[error(transparent)]
     Receipt(#[from] NativeReceiptError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofBackendArg {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VerifierArgs {
+    statement_path: OsString,
+    receipt_path: OsString,
+    proof_backend: ProofBackendArg,
+    cuda_device: Option<usize>,
 }
 
 fn main() -> ExitCode {
@@ -60,18 +85,14 @@ fn run_from<I>(arguments: I) -> Result<([u8; 32], u64), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut arguments = arguments.into_iter();
-    let statement_path = arguments.next().ok_or(CliError::Usage)?;
-    let receipt_path = arguments.next().ok_or(CliError::Usage)?;
-    if arguments.next().is_some() {
-        return Err(CliError::Usage);
-    }
+    let args = parse_args(arguments)?;
+    let backend = initialize_verifier_backend(args.proof_backend, args.cuda_device)?;
     let statement_bytes = read_bounded(
-        Path::new(&statement_path),
+        Path::new(&args.statement_path),
         "statement",
         MAX_NATIVE_STATEMENT_BYTES,
     )?;
-    let receipt_path = Path::new(&receipt_path);
+    let receipt_path = Path::new(&args.receipt_path);
     require_bounded_receipt(receipt_path)?;
     let receipt = File::open(receipt_path).map_err(|source| CliError::Read {
         kind: "receipt",
@@ -79,8 +100,117 @@ where
         source,
     })?;
     let expected = NativeStatement::from_bytes(&statement_bytes)?;
-    let verified = verify_native_receipt_reader(BufReader::new(receipt), &expected)?;
+    let verified =
+        verify_native_receipt_reader_with_backend(BufReader::new(receipt), &expected, &backend)?;
     Ok((verified.statement_id(), expected.protocol().code()))
+}
+
+fn parse_args<I>(arguments: I) -> Result<VerifierArgs, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut proof_backend = ProofBackendArg::Cpu;
+    let mut cuda_device = None;
+    let mut positional = Vec::with_capacity(2);
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == OsStr::new("--proof-backend") {
+            let value = arguments.next().ok_or(CliError::Usage)?;
+            proof_backend = parse_proof_backend(&value)?;
+        } else if let Some(value) = option_value(&argument, "--proof-backend") {
+            proof_backend = parse_proof_backend_str(value)?;
+        } else if argument == OsStr::new("--cuda-device") {
+            let value = arguments.next().ok_or(CliError::Usage)?;
+            cuda_device = Some(parse_cuda_device(&value)?);
+        } else if let Some(value) = option_value(&argument, "--cuda-device") {
+            cuda_device = Some(parse_cuda_device_str(value)?);
+        } else if argument
+            .to_str()
+            .is_some_and(|value| value.starts_with("--"))
+        {
+            return Err(CliError::Usage);
+        } else {
+            positional.push(argument);
+            if positional.len() > 2 {
+                return Err(CliError::Usage);
+            }
+        }
+    }
+    if positional.len() != 2 {
+        return Err(CliError::Usage);
+    }
+    let receipt_path = positional.pop().ok_or(CliError::Usage)?;
+    let statement_path = positional.pop().ok_or(CliError::Usage)?;
+    Ok(VerifierArgs {
+        statement_path,
+        receipt_path,
+        proof_backend,
+        cuda_device,
+    })
+}
+
+fn option_value<'a>(argument: &'a OsStr, option: &str) -> Option<&'a str> {
+    argument
+        .to_str()
+        .and_then(|value| value.strip_prefix(option))
+        .and_then(|value| value.strip_prefix('='))
+}
+
+fn parse_proof_backend(value: &OsStr) -> Result<ProofBackendArg, CliError> {
+    value.to_str().map_or_else(
+        || {
+            Err(CliError::InvalidProofBackend(
+                value.to_string_lossy().into_owned(),
+            ))
+        },
+        parse_proof_backend_str,
+    )
+}
+
+fn parse_proof_backend_str(value: &str) -> Result<ProofBackendArg, CliError> {
+    match value {
+        "cpu" => Ok(ProofBackendArg::Cpu),
+        "cuda" => Ok(ProofBackendArg::Cuda),
+        _ => Err(CliError::InvalidProofBackend(value.to_owned())),
+    }
+}
+
+fn parse_cuda_device(value: &OsStr) -> Result<usize, CliError> {
+    value.to_str().map_or_else(
+        || {
+            Err(CliError::InvalidCudaDevice(
+                value.to_string_lossy().into_owned(),
+            ))
+        },
+        parse_cuda_device_str,
+    )
+}
+
+fn parse_cuda_device_str(value: &str) -> Result<usize, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidCudaDevice(value.to_owned()))
+}
+
+fn initialize_verifier_backend(
+    selection: ProofBackendArg,
+    cuda_device: Option<usize>,
+) -> Result<NativeProverBackend, CliError> {
+    NativeProverBackend::initialize(verifier_backend_kind(selection, cuda_device)?)
+        .map_err(Into::into)
+}
+
+fn verifier_backend_kind(
+    selection: ProofBackendArg,
+    cuda_device: Option<usize>,
+) -> Result<NativeProverBackendKind, CliError> {
+    match (selection, cuda_device) {
+        (ProofBackendArg::Cpu, None) => Ok(NativeProverBackendKind::Cpu),
+        (ProofBackendArg::Cpu, Some(_)) => Err(CliError::CudaDeviceWithCpuBackend),
+        (ProofBackendArg::Cuda, device_ordinal) => Ok(NativeProverBackendKind::Cuda {
+            device_ordinal: device_ordinal.unwrap_or(0),
+        }),
+    }
 }
 
 fn require_bounded_receipt(path: &Path) -> Result<(), CliError> {
