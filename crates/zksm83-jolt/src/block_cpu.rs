@@ -17,23 +17,31 @@ use crate::{
         PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT, PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT,
         constrain_bus_matches, constrain_instruction_lane,
     },
+    execution_lookup::{
+        EXECUTION_LOOKUP_COLUMN_COUNT, EXECUTION_LOOKUP_WELL_FORMED_CONSTRAINT_COUNT,
+        ExecutionLookupColumns, ExecutionLookupWitness, ExecutionLookupWitnessError,
+        constrain_execution_lookup_well_formed,
+    },
     trace::{
         CPU_BOUNDARY_AUX_COLUMN_COUNT, CPU_LANE_AUX_COLUMN_COUNT, CPU_SEMANTIC_AUX_COLUMN_COUNT,
         CpuSemanticAuxEncoder, PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_BUS_MATCH_COLUMN_COUNT,
         PACKED_CPU_DERIVED_SCALAR_COUNT, PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT,
-        cpu_semantic_legacy_column, packed_cpu_aux_offset, packed_cpu_bus_match_offset,
-        packed_cpu_derived_scalar,
+        cpu_semantic_legacy_column, is_omitted_cpu_lane_legacy_column, packed_cpu_aux_offset,
+        packed_cpu_bus_match_offset, packed_cpu_derived_scalar,
     },
 };
 
-const PACKED_CPU_LANE_CONSTRAINT_COUNT: usize = 1_024 - PACKED_CPU_LANE_RANGE_CONSTRAINT_COUNT;
-const PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT: usize = PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT
+const PACKED_CPU_LANE_CONSTRAINT_COUNT: usize = 312;
+const PACKED_CPU_SEMANTIC_CONSTRAINT_COUNT: usize = PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT
     + PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT
     + PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT
     + BASIC_BLOCK_INSTRUCTION_BOUND * PACKED_CPU_LANE_CONSTRAINT_COUNT;
+const PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT: usize =
+    PACKED_CPU_SEMANTIC_CONSTRAINT_COUNT + EXECUTION_LOOKUP_WELL_FORMED_CONSTRAINT_COUNT;
 
 /// Logical columns in the packed memory plane plus four compact CPU helper lanes.
-pub const BLOCK_CPU_COLUMN_COUNT: usize = BLOCK_MEMORY_COLUMN_COUNT + PACKED_CPU_AUX_COLUMN_COUNT;
+pub const BLOCK_CPU_COLUMN_COUNT: usize =
+    BLOCK_MEMORY_COLUMN_COUNT + PACKED_CPU_AUX_COLUMN_COUNT + EXECUTION_LOOKUP_COLUMN_COUNT;
 /// Identities in the packed memory and lane-local CPU semantic relation.
 pub const BLOCK_CPU_CONSTRAINT_COUNT: usize =
     BLOCK_MEMORY_CONSTRAINT_COUNT + PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT;
@@ -41,9 +49,8 @@ pub const BLOCK_CPU_CONSTRAINT_COUNT: usize =
 pub const BLOCK_CPU_MAX_DEGREE: usize = 23;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
-const _: () = assert!(PACKED_CPU_LANE_CONSTRAINT_COUNT == 770);
-const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_565);
-const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 13_064);
+const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_604);
+const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 11_458);
 
 /// Fixed-row packed witness with compact helpers for every instruction lane.
 #[derive(Debug)]
@@ -52,6 +59,7 @@ pub struct BlockCpuWitness {
     active_block_count: usize,
     bus_event_count: usize,
     instruction_count: usize,
+    execution_lookup_count: usize,
     transition_count: usize,
     initial_state: VmState,
     final_state: VmState,
@@ -67,6 +75,9 @@ pub enum BlockCpuError {
     /// Construction of one lane's compact CPU helper values failed.
     #[error(transparent)]
     Trace(#[from] NativeTraceError),
+    /// Construction of the fixed execution-lookup projection failed.
+    #[error(transparent)]
+    ExecutionLookup(#[from] ExecutionLookupWitnessError),
     /// A block or auxiliary column violated the fixed packed layout.
     #[error("packed CPU witness violated its typed layout")]
     Layout,
@@ -80,9 +91,14 @@ impl BlockCpuWitness {
     /// Derives the shared packed prefix and all lane-local semantic helpers.
     pub fn from_blocks(blocks: &[BasicBlock]) -> Result<Self, BlockCpuError> {
         let memory = BlockMemoryWitness::from_blocks(blocks)?;
+        let execution = ExecutionLookupWitness::from_blocks(blocks)?;
         let active_block_count = memory.active_block_count();
+        if execution.active_block_count() != active_block_count {
+            return Err(BlockCpuError::Layout);
+        }
         let bus_event_count = memory.bus_event_count();
         let instruction_count = memory.instruction_count();
+        let execution_lookup_count = execution.lookup_count();
         let transition_count = blocks
             .iter()
             .try_fold(0_usize, |count, block| count.checked_add(block.row_count()));
@@ -102,6 +118,7 @@ impl BlockCpuWitness {
         let (mut columns, final_memory_timestamps) = memory.into_columns_and_timestamps();
         columns.reserve_exact(PACKED_CPU_AUX_COLUMN_COUNT);
         columns.extend(auxiliary);
+        columns.extend(execution.into_columns());
         if columns.len() != BLOCK_CPU_COLUMN_COUNT {
             return Err(BlockCpuError::Layout);
         }
@@ -110,6 +127,7 @@ impl BlockCpuWitness {
             active_block_count,
             bus_event_count,
             instruction_count,
+            execution_lookup_count,
             transition_count,
             initial_state,
             final_state,
@@ -139,6 +157,12 @@ impl BlockCpuWitness {
     #[must_use]
     pub const fn instruction_count(&self) -> usize {
         self.instruction_count
+    }
+
+    /// Returns the exact number of active execution-table queries.
+    #[must_use]
+    pub const fn execution_lookup_count(&self) -> usize {
+        self.execution_lookup_count
     }
 
     /// Returns the exact number of source machine transitions represented.
@@ -176,6 +200,17 @@ impl BlockCpuWitness {
     pub fn rom_lookup_columns() -> Result<RomLookupColumns, BlockFrontendError> {
         BlockMemoryWitness::rom_lookup_columns()
     }
+
+    /// Returns one packed execution-lookup slot on the shared commitment plane.
+    pub fn execution_lookup_columns(
+        lane: usize,
+        query: usize,
+    ) -> Result<ExecutionLookupColumns, ExecutionLookupWitnessError> {
+        let start = BLOCK_MEMORY_COLUMN_COUNT
+            .checked_add(PACKED_CPU_AUX_COLUMN_COUNT)
+            .ok_or(ExecutionLookupWitnessError::Layout)?;
+        ExecutionLookupWitness::lookup_columns_at(start, lane, query)
+    }
 }
 
 impl UniformRelation for BlockCpuRelation {
@@ -198,6 +233,8 @@ impl UniformRelation for BlockCpuRelation {
             PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT as u64,
             PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT as u64,
             PACKED_CPU_LANE_CONSTRAINT_COUNT as u64,
+            EXECUTION_LOOKUP_COLUMN_COUNT as u64,
+            EXECUTION_LOOKUP_WELL_FORMED_CONSTRAINT_COUNT as u64,
             BLOCK_CPU_COLUMN_COUNT as u64,
             BLOCK_CPU_CONSTRAINT_COUNT as u64,
             BLOCK_CPU_MAX_DEGREE as u64,
@@ -334,7 +371,9 @@ fn write_packed_lane(
         let legacy_column =
             cpu_semantic_legacy_column(source_offset).ok_or(BlockCpuError::Layout)?;
         let Some(target) = packed_cpu_aux_offset(legacy_column, lane) else {
-            if packed_cpu_derived_scalar(legacy_column).is_some() {
+            if packed_cpu_derived_scalar(legacy_column).is_some()
+                || is_omitted_cpu_lane_legacy_column(legacy_column)
+            {
                 continue;
             }
             return Err(BlockCpuError::Layout);
@@ -355,10 +394,12 @@ fn constrain_cpu(row: &[NativeField], constraints: &mut [NativeField]) -> Result
     if constraints.len() != PACKED_CPU_ADDITIONAL_CONSTRAINT_COUNT {
         return Err(UniformError::Shape);
     }
+    let (semantic_constraints, lookup_constraints) =
+        constraints.split_at_mut(PACKED_CPU_SEMANTIC_CONSTRAINT_COUNT);
     let instruction_block = block_metadata::instruction_value(row)?;
     let canonical_auxiliary = NativeField::from_u64(1) - instruction_block;
     let (padding_constraints, remaining_constraints) =
-        constraints.split_at_mut(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT);
+        semantic_constraints.split_at_mut(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT);
     for (offset, constraint) in padding_constraints.iter_mut().enumerate() {
         let value = row
             .get(
@@ -412,7 +453,7 @@ fn constrain_cpu(row: &[NativeField], constraints: &mut [NativeField]) -> Result
     if boundary_start != PACKED_CPU_SHARED_BOUNDARY_CONSTRAINT_COUNT {
         return Err(UniformError::Shape);
     }
-    Ok(())
+    constrain_execution_lookup_well_formed(row, lookup_constraints)
 }
 
 #[cfg(test)]
@@ -426,6 +467,56 @@ mod tests {
         trace::{packed_cpu_aux_offset, packed_cpu_bus_match_offset},
         validate_uniform_witness,
     };
+
+    #[test]
+    fn compact_cpu_relation_accepts_active_and_padding_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for program in [
+            [0x04, 0x00, 0x00, 0x00],
+            [0x06, 0x2a, 0x00, 0x00],
+            [0xcb, 0x00, 0x00, 0x00],
+            [0xc7, 0x00, 0x00, 0x00],
+        ] {
+            let blocks = lookup_blocks(&program, 1)?;
+            let witness = BlockCpuWitness::from_blocks(&blocks)?;
+            assert_cpu_row_satisfies(&witness, 0)?;
+        }
+        let blocks = lookup_blocks(&[0x04, 0x00, 0x00, 0x00], 1)?;
+        let witness = BlockCpuWitness::from_blocks(&blocks)?;
+        assert_cpu_row_satisfies(&witness, UNIFORM_ROW_COUNT - 1)
+    }
+
+    fn assert_cpu_row_satisfies(
+        witness: &BlockCpuWitness,
+        row_index: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let row = witness
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .get(row_index)
+                    .copied()
+                    .map(NativeField::from_u64)
+                    .ok_or(UniformError::Shape)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut constraints = vec![NativeField::from_u64(0); BLOCK_CPU_CONSTRAINT_COUNT];
+        let mut memory_constraints = vec![NativeField::from_u64(0); BLOCK_MEMORY_CONSTRAINT_COUNT];
+        let memory_result = BlockMemoryRelation.evaluate(
+            row.get(..BLOCK_MEMORY_COLUMN_COUNT)
+                .ok_or(UniformError::Shape)?,
+            &mut memory_constraints,
+        );
+        assert!(memory_result.is_ok(), "memory prefix: {memory_result:?}");
+        let cpu_result = BlockCpuRelation.evaluate(&row, &mut constraints);
+        assert!(cpu_result.is_ok(), "CPU relation: {cpu_result:?}");
+        let violated = constraints
+            .iter()
+            .position(|value| *value != NativeField::from_u64(0));
+        assert_eq!(violated, None, "row {row_index}");
+        Ok(())
+    }
 
     #[test]
     fn representative_instruction_families_satisfy_packed_cpu_semantics()

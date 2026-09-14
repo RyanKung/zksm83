@@ -24,8 +24,8 @@ pub(crate) use cpu_semantic::{
     CPU_BOUNDARY_AUX_COLUMN_COUNT, CPU_LANE_AUX_COLUMN_COUNT, CPU_SEMANTIC_AUX_COLUMN_COUNT,
     CpuSemanticAuxEncoder, PACKED_CPU_AUX_COLUMN_COUNT, PACKED_CPU_BUS_MATCH_COLUMN_COUNT,
     PACKED_CPU_DERIVED_SCALAR_COUNT, PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT,
-    cpu_semantic_legacy_column, packed_cpu_aux_offset, packed_cpu_bus_match_offset,
-    packed_cpu_derived_scalar, packed_cpu_derived_scalar_at,
+    cpu_semantic_legacy_column, is_omitted_cpu_lane_legacy_column, packed_cpu_aux_offset,
+    packed_cpu_bus_match_offset, packed_cpu_derived_scalar, packed_cpu_derived_scalar_at,
 };
 pub use device::{
     TRACE_AFTER_DMA_BITS_START, TRACE_AFTER_INTERRUPT_ENABLE_BITS_START,

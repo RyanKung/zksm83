@@ -49,7 +49,7 @@ pub struct IsaLookupColumns {
     outputs: [usize; ISA_OUTPUT_COUNT],
 }
 
-/// Verifier-visible commitment to all 49 fixed ISA table outputs.
+/// Verifier-visible commitment to all fixed ISA table outputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FixedIsaCommitments {
     pub(crate) inner: ColumnCommitments,
@@ -262,7 +262,7 @@ impl IsaLookupProof {
     }
 }
 
-/// Proves all 49 fixed-ISA outputs against one shared trace commitment plane.
+/// Proves all fixed-ISA outputs against one shared trace commitment plane.
 pub fn prove_isa_lookup(
     layout: IsaLookupColumns,
     witness: &CommittedWitness,

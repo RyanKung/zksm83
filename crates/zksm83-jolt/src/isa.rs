@@ -7,8 +7,8 @@ use zksm83_isa::{AlignedInstruction, AlignmentPackingError};
 /// Number of primary plus CB-prefixed lookup addresses.
 pub const ISA_TABLE_ROW_COUNT: usize = 512;
 
-/// Number of scalar outputs in one native ISA-table row.
-pub const ISA_OUTPUT_COUNT: usize = 49;
+/// Number of non-redundant outputs in one native ISA-table row.
+pub const ISA_OUTPUT_COUNT: usize = 38;
 /// Canonical undefined primary opcode used for inactive ISA lookup lanes.
 pub const ISA_PADDING_ADDRESS: u16 = 0x00d3;
 
@@ -19,37 +19,37 @@ pub const ISA_PACKED_LOW: usize = 1;
 /// Index of the high 42 bits of the collision-free packed descriptor.
 pub const ISA_PACKED_HIGH: usize = 2;
 /// First index of the 13 register-write selector bits.
-pub const ISA_WRITE_BITS_START: usize = 22;
+pub const ISA_WRITE_BITS_START: usize = 11;
 /// Index of the fixed primary/CB opcode-fetch count.
-pub const ISA_OPCODE_FETCHES: usize = 16;
+pub const ISA_OPCODE_FETCHES: usize = 5;
 /// Index of the fixed immediate-byte read count.
-pub const ISA_IMMEDIATE_READS: usize = 17;
+pub const ISA_IMMEDIATE_READS: usize = 6;
 /// Index of the fixed base-path data-read count.
-pub const ISA_DATA_READS: usize = 18;
+pub const ISA_DATA_READS: usize = 7;
 /// Index of the fixed base-path data-write count.
-pub const ISA_DATA_WRITES: usize = 19;
+pub const ISA_DATA_WRITES: usize = 8;
 /// Index of the instruction's unconditional machine-cycle count.
-pub const ISA_BASE_M_CYCLES: usize = 10;
+pub const ISA_BASE_M_CYCLES: usize = 3;
 /// Index of the additional machine-cycle count for a taken branch.
-pub const ISA_TAKEN_M_CYCLES: usize = 11;
+pub const ISA_TAKEN_M_CYCLES: usize = 4;
 /// Index of the conditional taken-path data-read count.
-pub const ISA_TAKEN_DATA_READS: usize = 20;
+pub const ISA_TAKEN_DATA_READS: usize = 9;
 /// Index of the conditional taken-path data-write count.
-pub const ISA_TAKEN_DATA_WRITES: usize = 21;
+pub const ISA_TAKEN_DATA_WRITES: usize = 10;
 /// Index indicating that the instruction has taken-branch timing.
-pub const ISA_TAKEN_TIMING: usize = 35;
+pub const ISA_TAKEN_TIMING: usize = 24;
 /// First index of the six operation-code bits.
-pub const ISA_OPERATION_BITS_START: usize = 36;
+pub const ISA_OPERATION_BITS_START: usize = 25;
 /// First index of the three first-argument bits.
-pub const ISA_ARGUMENT_ZERO_BITS_START: usize = 42;
+pub const ISA_ARGUMENT_ZERO_BITS_START: usize = 31;
 /// First index of the four second-argument bits.
-pub const ISA_ARGUMENT_ONE_BITS_START: usize = 45;
+pub const ISA_ARGUMENT_ONE_BITS_START: usize = 34;
 
 const REGISTER_WRITE_BITS: usize = 13;
 const OPERATION_BITS: usize = 6;
 const ARGUMENT_ZERO_BITS: usize = 3;
 const ARGUMENT_ONE_BITS: usize = 4;
-const ISA_TABLE_DIGEST_DOMAIN: &[u8] = b"zksm83/native-isa-table/v1";
+const ISA_TABLE_DIGEST_DOMAIN: &[u8] = b"zksm83/native-isa-table/v2";
 
 const _: () = assert!(ISA_TABLE_ROW_COUNT == 512);
 const _: () = assert!(ISA_PADDING_ADDRESS < 512);
@@ -105,19 +105,8 @@ impl IsaTableRow {
             1,
             packed_low,
             packed_high,
-            u64::from(aligned.key.prefix),
-            u64::from(aligned.key.opcode),
-            u64::from(aligned.family_id),
-            u64::from(aligned.operation),
-            u64::from(aligned.argument_zero),
-            u64::from(aligned.argument_one),
-            u64::from(aligned.byte_len),
             u64::from(aligned.base_m_cycles),
             u64::from(aligned.taken_m_cycles),
-            u64::from(aligned.pc_rule),
-            u64::from(aligned.flag_rule),
-            u64::from(aligned.register_reads),
-            u64::from(aligned.register_writes),
             u64::from(aligned.opcode_fetches),
             u64::from(aligned.immediate_reads),
             u64::from(aligned.data_reads),
@@ -278,9 +267,9 @@ mod tests {
         assert_eq!(
             digest,
             [
-                0x95, 0xe3, 0xe3, 0xc8, 0x30, 0x28, 0xbc, 0x69, 0x5b, 0x11, 0x5f, 0x5f, 0x34, 0x1e,
-                0x58, 0x96, 0x21, 0x24, 0x1b, 0xae, 0x76, 0xa4, 0xb0, 0xfa, 0xae, 0xf5, 0x55, 0x14,
-                0xa2, 0xf3, 0x21, 0x8f,
+                0x14, 0xf2, 0x48, 0xa5, 0x3f, 0x5f, 0xcd, 0x04, 0x9c, 0xbd, 0x6c, 0x8f, 0x2e, 0xd3,
+                0x0c, 0x53, 0x0f, 0x73, 0xb5, 0x6e, 0x2e, 0x26, 0x93, 0xcd, 0xaf, 0xc3, 0x8a, 0x85,
+                0x81, 0x7d, 0x81, 0x70,
             ]
         );
         Ok(())

@@ -54,8 +54,8 @@ pub const BLOCK_DEVICE_DMA_MAX_DEGREE: usize = BLOCK_DEVICE_PPU_INTERRUPT_MAX_DE
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
 const _: () = assert!(DMA_AUX_COLUMN_COUNT == 112);
-const _: () = assert!(BLOCK_DEVICE_DMA_COLUMN_COUNT == 2_474);
-const _: () = assert!(BLOCK_DEVICE_DMA_CONSTRAINT_COUNT == 5_352);
+const _: () = assert!(BLOCK_DEVICE_DMA_COLUMN_COUNT == 2_430);
+const _: () = assert!(BLOCK_DEVICE_DMA_CONSTRAINT_COUNT == 5_308);
 const _: () = assert!(BLOCK_DEVICE_DMA_MAX_DEGREE == 7);
 
 /// Fixed-row witness carrying bounded clock scheduling and DMA-byte consumption.
@@ -139,7 +139,7 @@ impl UniformRelation for BlockDeviceDmaRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [2_362_u64, 5_066, 112, 160, 2_474, 5_352, 3] {
+        for value in [2_318_u64, 5_022, 112, 160, 2_430, 5_308, 3] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

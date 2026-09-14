@@ -63,8 +63,8 @@ pub const BLOCK_DEVICE_PPU_INTERRUPT_MAX_DEGREE: usize = BLOCK_DEVICE_TIMER_CORE
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(STATE_WIDTH == 23);
 const _: () = assert!(PPU_INTERRUPT_AUX_COLUMN_COUNT == 80);
-const _: () = assert!(BLOCK_DEVICE_PPU_INTERRUPT_COLUMN_COUNT == 2_362);
-const _: () = assert!(BLOCK_DEVICE_PPU_INTERRUPT_CONSTRAINT_COUNT == 5_066);
+const _: () = assert!(BLOCK_DEVICE_PPU_INTERRUPT_COLUMN_COUNT == 2_318);
+const _: () = assert!(BLOCK_DEVICE_PPU_INTERRUPT_CONSTRAINT_COUNT == 5_022);
 const _: () = assert!(BLOCK_DEVICE_PPU_INTERRUPT_MAX_DEGREE == 7);
 
 /// Fixed-row witness carrying quiet-block VBlank and STAT interrupt transitions.
@@ -148,7 +148,7 @@ impl UniformRelation for BlockDevicePpuInterruptRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [2_282_u64, 4_812, 80, 70_224, 2_362, 5_066, 4] {
+        for value in [2_238_u64, 4_768, 80, 70_224, 2_318, 5_022, 4] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

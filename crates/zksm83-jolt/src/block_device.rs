@@ -36,8 +36,8 @@ const QUIET_DEVICE_INVARIANTS: [usize; 7] = [
 ];
 
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
-const _: () = assert!(BLOCK_DEVICE_ENVELOPE_COLUMN_COUNT == 841);
-const _: () = assert!(BLOCK_DEVICE_ENVELOPE_CONSTRAINT_COUNT == 1_406);
+const _: () = assert!(BLOCK_DEVICE_ENVELOPE_COLUMN_COUNT == 797);
+const _: () = assert!(BLOCK_DEVICE_ENVELOPE_CONSTRAINT_COUNT == 1_362);
 const _: () = assert!(BLOCK_DEVICE_ENVELOPE_MAX_DEGREE == 7);
 
 /// Fixed-row packed witness with one explicit device-I/O selector per block.
@@ -122,7 +122,7 @@ impl UniformRelation for BlockDeviceEnvelopeRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [840_u64, 1_397, 3, 7, 841, 1_406, 1] {
+        for value in [796_u64, 1_353, 3, 7, 797, 1_362, 1] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

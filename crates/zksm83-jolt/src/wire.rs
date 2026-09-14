@@ -11,6 +11,7 @@ use crate::{
     NativeField,
     block_proof::PackedBlockProof,
     continuity::{ContinuitySumProof, PackedContinuityProof},
+    execution_lookup::ExecutionLookupProof,
     isa_lookup::{FixedIsaCommitments, IsaLookupProof},
     logs::{PackedProtocolLogProof, ProtocolLogCommitments, sum::ProtocolLogSumProof},
     memory::{
@@ -307,6 +308,15 @@ wire_struct!(IsaLookupProof {
     trace_cycle_opening,
     trace_address_opening,
 });
+wire_struct!(ExecutionLookupProof {
+    claimed_output,
+    table_sumcheck,
+    address_sumcheck,
+    trace_cycle_values,
+    trace_address_values,
+    trace_cycle_opening,
+    trace_address_opening,
+});
 wire_struct!(RomCommitment { inner });
 wire_struct!(RomLookupProof {
     claimed_output,
@@ -380,6 +390,7 @@ wire_struct!(PackedBlockProof {
     commitments,
     relation,
     isa_lookup,
+    execution_lookup,
     rom_lookup,
     memory,
     continuity,

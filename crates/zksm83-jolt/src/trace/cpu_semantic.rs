@@ -24,10 +24,9 @@ const CPU_WORD_STATE_BIT_COUNT: usize = 16;
 const CPU_BOUNDARY_STATE_BIT_COUNT: usize = CPU_BYTE_STATE_BIT_COUNT + CPU_WORD_STATE_BIT_COUNT * 2;
 const CPU_BOUNDARY_MAPPER_BIT_COUNT: usize = 6 + 4;
 const CPU_SHARED_BOUNDARY_COUNT: usize = BASIC_BLOCK_INSTRUCTION_BOUND + 1;
-pub(crate) const PACKED_CPU_DERIVED_SCALAR_COUNT: usize = 6;
+pub(crate) const PACKED_CPU_DERIVED_SCALAR_COUNT: usize = 5;
 const PACKED_CPU_DERIVED_SCALARS: [(usize, usize, usize); PACKED_CPU_DERIVED_SCALAR_COUNT] = [
     (TRACE_OPERAND_VALUE, TRACE_OPERAND_BITS_START, 8),
-    (TRACE_RESULT_VALUE, TRACE_RESULT_BITS_START, 8),
     (TRACE_IMMEDIATE_LOW, TRACE_IMMEDIATE_LOW_BITS_START, 8),
     (TRACE_IMMEDIATE_HIGH, TRACE_IMMEDIATE_HIGH_BITS_START, 8),
     (TRACE_SEQUENTIAL_PC, TRACE_SEQUENTIAL_PC_BITS_START, 16),
@@ -42,8 +41,8 @@ pub(crate) const CPU_SEMANTIC_AUX_COLUMN_COUNT: usize =
         - CPU_SEMANTIC_MAPPER_START;
 pub(crate) const CPU_BOUNDARY_AUX_COLUMN_COUNT: usize =
     CPU_BOUNDARY_STATE_BIT_COUNT + CPU_BOUNDARY_MAPPER_BIT_COUNT;
-pub(crate) const CPU_LANE_AUX_COLUMN_COUNT: usize =
-    CPU_SEMANTIC_LOCAL_END - TRACE_OPERAND_VALUE - PACKED_CPU_DERIVED_SCALAR_COUNT;
+pub(crate) const CPU_LANE_AUX_COLUMN_COUNT: usize = 54;
+const CPU_LANE_OMITTED_COLUMN_COUNT: usize = 29;
 pub(crate) const PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT: usize = CPU_SHARED_BOUNDARY_COUNT
     * CPU_BOUNDARY_AUX_COLUMN_COUNT
     + BASIC_BLOCK_INSTRUCTION_BOUND * CPU_LANE_AUX_COLUMN_COUNT;
@@ -56,11 +55,14 @@ pub(crate) const PACKED_CPU_AUX_COLUMN_COUNT: usize =
 
 const _: () = assert!(CPU_SEMANTIC_AUX_COLUMN_COUNT == 300);
 const _: () = assert!(CPU_BOUNDARY_AUX_COLUMN_COUNT == 106);
-const _: () = assert!(CPU_LANE_AUX_COLUMN_COUNT == 82);
-const _: () = assert!(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT == 858);
+const _: () = assert!(
+    CPU_LANE_AUX_COLUMN_COUNT + CPU_LANE_OMITTED_COLUMN_COUNT + PACKED_CPU_DERIVED_SCALAR_COUNT
+        == CPU_SEMANTIC_LOCAL_END - TRACE_OPERAND_VALUE
+);
+const _: () = assert!(PACKED_CPU_SEMANTIC_AUX_COLUMN_COUNT == 746);
 const _: () = assert!(PACKED_CPU_BUS_MATCH_COLUMNS_PER_LANE == 15);
 const _: () = assert!(PACKED_CPU_BUS_MATCH_COLUMN_COUNT == 60);
-const _: () = assert!(PACKED_CPU_AUX_COLUMN_COUNT == 918);
+const _: () = assert!(PACKED_CPU_AUX_COLUMN_COUNT == 806);
 
 /// Reusable single-row encoder for the compact packed-lane CPU helper plane.
 pub(crate) struct CpuSemanticAuxEncoder {
@@ -188,21 +190,40 @@ pub(crate) fn packed_cpu_aux_offset(legacy_column: usize, lane: usize) -> Option
     if packed_cpu_derived_scalar(legacy_column).is_some() {
         return None;
     }
-    if (TRACE_OPERAND_VALUE..CPU_SEMANTIC_LOCAL_END).contains(&legacy_column) {
-        let skipped = PACKED_CPU_DERIVED_SCALARS
-            .iter()
-            .filter(|(scalar, _, _)| *scalar < legacy_column)
-            .count();
+    if let Some(lane_column) = packed_lane_aux_index(legacy_column) {
         return CPU_SHARED_BOUNDARY_COUNT
             .checked_mul(CPU_BOUNDARY_AUX_COLUMN_COUNT)
             .and_then(|offset| {
                 lane.checked_mul(CPU_LANE_AUX_COLUMN_COUNT)
                     .and_then(|lane_offset| offset.checked_add(lane_offset))
             })
-            .and_then(|offset| offset.checked_add(legacy_column - TRACE_OPERAND_VALUE))
-            .and_then(|offset| offset.checked_sub(skipped));
+            .and_then(|offset| offset.checked_add(lane_column));
     }
     None
+}
+
+fn packed_lane_aux_index(legacy_column: usize) -> Option<usize> {
+    let ranged = |start: usize, width: usize, packed_start: usize| {
+        legacy_column
+            .checked_sub(start)
+            .filter(|offset| *offset < width)
+            .and_then(|offset| packed_start.checked_add(offset))
+    };
+    ranged(TRACE_OPERAND_BITS_START, 8, 0)
+        .or_else(|| ranged(TRACE_IMMEDIATE_LOW_BITS_START, 8, 8))
+        .or_else(|| ranged(TRACE_IMMEDIATE_HIGH_BITS_START, 8, 16))
+        .or_else(|| ranged(TRACE_SEQUENTIAL_PC_BITS_START, 16, 24))
+        .or_else(|| ranged(super::TRACE_PC_WRAP, 5, 40))
+        .or_else(|| ranged(super::TRACE_STACK_WRAP, 2, 45))
+        .or_else(|| ranged(TRACE_POP_FLAGS_LOW_NIBBLE_BITS_START, 4, 47))
+        .or_else(|| ranged(super::TRACE_ADDRESS_WRAP, 3, 51))
+}
+
+pub(crate) fn is_omitted_cpu_lane_legacy_column(legacy_column: usize) -> bool {
+    legacy_column == TRACE_RESULT_VALUE
+        || (TRACE_RESULT_BITS_START..TRACE_IMMEDIATE_LOW).contains(&legacy_column)
+        || (super::TRACE_WORD_CARRY..=super::TRACE_SIGNED_SP_OVERFLOW).contains(&legacy_column)
+        || (super::TRACE_DAA_LOW_GT_NINE..=super::TRACE_DAA_WRAP).contains(&legacy_column)
 }
 
 pub(crate) fn packed_cpu_bus_match_offset(
@@ -350,4 +371,35 @@ fn single_value(columns: &[Vec<u64>], index: usize) -> Result<u64, NativeTraceEr
         return Err(NativeTraceError::Layout);
     }
     values.first().copied().ok_or(NativeTraceError::Layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_lane_layout_is_a_total_disjoint_partition() {
+        let mut packed = Vec::new();
+        let mut derived = 0_usize;
+        let mut omitted = 0_usize;
+        for legacy_column in TRACE_OPERAND_VALUE..CPU_SEMANTIC_LOCAL_END {
+            let packed_column = packed_lane_aux_index(legacy_column);
+            let is_derived = packed_cpu_derived_scalar(legacy_column).is_some();
+            let is_omitted = is_omitted_cpu_lane_legacy_column(legacy_column);
+            assert_eq!(
+                usize::from(packed_column.is_some())
+                    + usize::from(is_derived)
+                    + usize::from(is_omitted),
+                1
+            );
+            if let Some(column) = packed_column {
+                packed.push(column);
+            }
+            derived += usize::from(is_derived);
+            omitted += usize::from(is_omitted);
+        }
+        assert_eq!(packed, (0..CPU_LANE_AUX_COLUMN_COUNT).collect::<Vec<_>>());
+        assert_eq!(derived, PACKED_CPU_DERIVED_SCALAR_COUNT);
+        assert_eq!(omitted, CPU_LANE_OMITTED_COLUMN_COUNT);
+    }
 }

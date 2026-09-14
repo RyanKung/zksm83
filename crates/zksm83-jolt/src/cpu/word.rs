@@ -42,6 +42,17 @@ pub(super) fn constrain_word_operations(
     constrain_word_witness_scope(view, sink, instruction)
 }
 
+/// Packed-v2 affine word glue; table-backed word additions are constrained elsewhere.
+pub(super) fn constrain_word_operations_with_lookup(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+) -> Result<(), UniformError> {
+    sink.push(boolean(view.value(TRACE_WORD_WRAP)?))?;
+    let instruction = view.mode(INSTRUCTION_MODE)?;
+    constrain_increment_decrement(view, sink, instruction)?;
+    constrain_word_wrap_scope(view, sink, instruction)
+}
+
 fn constrain_increment_decrement(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
@@ -170,6 +181,19 @@ fn constrain_word_witness_scope(
     let signed = instruction * (operation_selector(view, 22)? + operation_selector(view, 23)?);
     sink.push((one - signed) * view.value(TRACE_SIGNED_SP_UNDERFLOW)?)?;
     sink.push((one - signed) * view.value(TRACE_SIGNED_SP_OVERFLOW)?)
+}
+
+fn constrain_word_wrap_scope(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+    instruction: NativeField,
+) -> Result<(), UniformError> {
+    let indirect = operation_selector(view, 6)?;
+    let changes_hl = argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 2)?
+        + argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 3)?;
+    let wrap_use = instruction
+        * (operation_selector(view, 7)? + operation_selector(view, 8)? + indirect * changes_hl);
+    sink.push((NativeField::from_u64(1) - wrap_use) * view.value(TRACE_WORD_WRAP)?)
 }
 
 fn selected_register_word(view: &RowView<'_>, after: bool) -> Result<NativeField, UniformError> {

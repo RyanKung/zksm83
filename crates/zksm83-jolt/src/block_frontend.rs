@@ -40,8 +40,8 @@ pub const BLOCK_FRONTEND_MAX_DEGREE: usize = if BLOCK_ISA_CONTROL_MAX_DEGREE > B
 const _: () = assert!(BLOCK_METADATA_COLUMN_COUNT == 6);
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
-const _: () = assert!(BLOCK_FRONTEND_COLUMN_COUNT == 773);
-const _: () = assert!(BLOCK_FRONTEND_CONSTRAINT_COUNT == 1_140);
+const _: () = assert!(BLOCK_FRONTEND_COLUMN_COUNT == 729);
+const _: () = assert!(BLOCK_FRONTEND_CONSTRAINT_COUNT == 1_096);
 const _: () = assert!(BLOCK_FRONTEND_MAX_DEGREE == 7);
 
 /// Fixed-row witness for the proof-free packed instruction front end.
@@ -131,7 +131,7 @@ impl UniformRelation for BlockFrontendRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [437_u64, 729, 336, 380, 6, 5, 20, 773, 1_140] {
+        for value in [393_u64, 685, 336, 380, 6, 5, 20, 729, 1_096] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

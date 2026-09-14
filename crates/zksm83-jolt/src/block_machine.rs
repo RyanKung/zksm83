@@ -9,10 +9,11 @@ use crate::{
     BLOCK_CONTROL_COLUMN_COUNT, BLOCK_FLOW_CONSTRAINT_COUNT, BLOCK_FLOW_MAX_DEGREE,
     BLOCK_FRONTEND_COLUMN_COUNT, BLOCK_ISA_CONTROL_COLUMN_COUNT, BLOCK_ROUTING_COLUMN_COUNT,
     BlockFlowRelation, BlockFrontendError, BlockFrontendWitness, ConstraintOutput, NativeField,
-    STATE_BUS_NEXT_INDEX, STATE_CPU_M_CYCLES_INDEX, STATE_INPUT_NEXT_INDEX, STATE_ISA_NEXT_INDEX,
+    STATE_BUS_NEXT_INDEX, STATE_CPU_M_CYCLES_INDEX, STATE_INPUT_NEXT_INDEX,
+    STATE_INTERRUPT_ENABLE_INDEX, STATE_INTERRUPT_REQUEST_INDEX, STATE_ISA_NEXT_INDEX,
     STATE_MACHINE_PROFILE_INDEX, STATE_OUTPUT_NEXT_INDEX, UNIFORM_ROW_COUNT, UniformError,
     UniformRelation,
-    block_boundary::local_state_value,
+    block_boundary::{device_state_value, local_state_value},
     block_bus::{slot_active_value, slot_address_value, slot_kind_selector, slot_value_value},
     block_metadata,
 };
@@ -58,8 +59,8 @@ const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
 const _: () = assert!(STATE_CPU_M_CYCLES_INDEX == 12);
 const _: () = assert!(MACHINE_AUX_COLUMN_COUNT == 67);
-const _: () = assert!(BLOCK_MACHINE_COLUMN_COUNT == 840);
-const _: () = assert!(BLOCK_MACHINE_CONSTRAINT_COUNT == 1_397);
+const _: () = assert!(BLOCK_MACHINE_COLUMN_COUNT == 796);
+const _: () = assert!(BLOCK_MACHINE_CONSTRAINT_COUNT == 1_353);
 const _: () = assert!(BLOCK_MACHINE_MAX_DEGREE == 7);
 
 /// Fixed-row witness carrying one typed machine mode for each singleton machine block.
@@ -143,7 +144,7 @@ impl UniformRelation for BlockMachineRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [773_u64, 1_168, 7, 67, 840, 1_397, 1] {
+        for value in [729_u64, 1_124, 7, 67, 796, 1_353, 1] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement
@@ -337,15 +338,21 @@ fn constrain_machine_inputs(
     machine: NativeField,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    for (state, start, width) in [
-        (21, BEFORE_IF_BITS_START, 5),
-        (22, BEFORE_IE_BITS_START, 5),
-        (STATE_PC, BEFORE_PC_BITS_START, 16),
-        (STATE_SP, BEFORE_SP_BITS_START, 16),
+    for (state, start) in [
+        (STATE_INTERRUPT_REQUEST_INDEX, BEFORE_IF_BITS_START),
+        (STATE_INTERRUPT_ENABLE_INDEX, BEFORE_IE_BITS_START),
     ] {
         sink.push(
             machine
-                * (local_state_value(boundary, 0, state)? - packed_bits(auxiliary, start, width)?),
+                * (device_state_value(boundary, false, state)? - packed_bits(auxiliary, start, 5)?),
+        )?;
+    }
+    for (state, start) in [
+        (STATE_PC, BEFORE_PC_BITS_START),
+        (STATE_SP, BEFORE_SP_BITS_START),
+    ] {
+        sink.push(
+            machine * (local_state_value(boundary, 0, state)? - packed_bits(auxiliary, start, 16)?),
         )?;
     }
     Ok(())

@@ -5,6 +5,7 @@
 
 mod alignment;
 mod decode;
+mod execution_lookup;
 mod metadata;
 mod types;
 
@@ -13,6 +14,7 @@ pub use alignment::{
     ProgramCounterRule,
 };
 pub use decode::{CompleteOpcodeTable, OPCODE_TABLE, decode_cb, decode_primary};
+pub use execution_lookup::{ExecutionLookupTable, ExecutionProofPlan};
 pub use types::{
     AluOperation, BusAccessPattern, CbOpcode, CbOperation, Condition, DecodedInstruction,
     FlagAction, FlagEffect, IndirectAddress, InstructionClass, InstructionDescriptor,

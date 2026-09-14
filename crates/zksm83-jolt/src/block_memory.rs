@@ -59,7 +59,7 @@ pub(crate) const BLOCK_MEMORY_ROW_BITS_START: usize = BLOCK_MEMORY_AUX_START + R
 
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
 const _: () = assert!(ISA_ADDRESS_BIT_COUNT == 9);
-const _: () = assert!(ISA_OUTPUT_COUNT == 49);
+const _: () = assert!(ISA_OUTPUT_COUNT == 38);
 const _: () = assert!(UNIFORM_NUM_VARIABLES == 14);
 const _: () = assert!(TRACE_MEMORY_TIMESTAMP_BITS == 17);
 const _: () = assert!(ROM_ADDRESS_BIT_COUNT == 20);
@@ -67,9 +67,9 @@ const _: () = assert!(MEMORY_IMAGE_BYTES == 1 << TRACE_MEMORY_TIMESTAMP_BITS);
 const _: () = assert!(SLOT_WIDTH == 36);
 const _: () = assert!(BLOCK_MEMORY_AUX_COLUMN_COUNT == 204);
 const _: () = assert!(BLOCK_MEMORY_ADDITIONAL_CONSTRAINT_COUNT == 254);
-const _: () = assert!(BLOCK_MEMORY_COLUMN_COUNT == 3_647);
-const _: () = assert!(BLOCK_MEMORY_CONSTRAINT_COUNT == 8_431);
-const _: () = assert!(BLOCK_MEMORY_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_MEMORY_COLUMN_COUNT == 3_542);
+const _: () = assert!(BLOCK_MEMORY_CONSTRAINT_COUNT == 8_257);
+const _: () = assert!(BLOCK_MEMORY_MAX_DEGREE == 15);
 
 /// Fixed-row packed-block witness carrying ordered mutable-memory timestamps.
 #[derive(Debug)]
@@ -231,7 +231,7 @@ impl UniformRelation for BlockMemoryRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [3_443_u64, 8_177, 204, 254, 5, 17, 14, 3_647, 8_431, 4] {
+        for value in [3_338_u64, 8_003, 204, 254, 5, 17, 14, 3_542, 8_257, 4] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

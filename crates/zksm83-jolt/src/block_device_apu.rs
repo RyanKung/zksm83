@@ -49,9 +49,9 @@ pub const BLOCK_DEVICE_APU_MAX_DEGREE: usize = BLOCK_DEVICE_JOYPAD_MAX_DEGREE;
 
 const _: () = assert!(APU_STATE_WIDTH == 320);
 const _: () = assert!(APU_AUX_COLUMN_COUNT == 659);
-const _: () = assert!(BLOCK_DEVICE_APU_COLUMN_COUNT == 3_269);
-const _: () = assert!(BLOCK_DEVICE_APU_CONSTRAINT_COUNT == 7_395);
-const _: () = assert!(BLOCK_DEVICE_APU_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_APU_COLUMN_COUNT == 3_164);
+const _: () = assert!(BLOCK_DEVICE_APU_CONSTRAINT_COUNT == 7_221);
+const _: () = assert!(BLOCK_DEVICE_APU_MAX_DEGREE == 14);
 
 /// Fixed-row witness carrying the five APU boundary packs and write predicates.
 #[derive(Debug)]
@@ -134,7 +134,7 @@ impl UniformRelation for BlockDeviceApuRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [2_610_u64, 5_717, 659, 1_678, 3_269, 7_395, 5] {
+        for value in [2_505_u64, 5_543, 659, 1_678, 3_164, 7_221, 5] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

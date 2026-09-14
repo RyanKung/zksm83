@@ -50,8 +50,8 @@ pub const BLOCK_DEVICE_PPU_MAX_DEGREE: usize = BLOCK_DEVICE_ENVELOPE_MAX_DEGREE;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(PPU_AUX_COLUMN_COUNT == 197);
-const _: () = assert!(BLOCK_DEVICE_PPU_COLUMN_COUNT == 1_038);
-const _: () = assert!(BLOCK_DEVICE_PPU_CONSTRAINT_COUNT == 1_868);
+const _: () = assert!(BLOCK_DEVICE_PPU_COLUMN_COUNT == 994);
+const _: () = assert!(BLOCK_DEVICE_PPU_CONSTRAINT_COUNT == 1_824);
 const _: () = assert!(BLOCK_DEVICE_PPU_MAX_DEGREE == 7);
 
 /// Fixed-row packed witness carrying one PPU transition per device-quiet block.
@@ -136,7 +136,7 @@ impl UniformRelation for BlockDevicePpuRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [841_u64, 1_406, 197, 70_224, 1_038, 1_868, 2] {
+        for value in [797_u64, 1_362, 197, 70_224, 994, 1_824, 2] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

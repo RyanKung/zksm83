@@ -46,9 +46,9 @@ pub const BLOCK_DEVICE_JOYPAD_MAX_DEGREE: usize = BLOCK_DEVICE_MMIO_MAX_DEGREE;
 
 const _: () = assert!(STATE_WIDTH == 10);
 const _: () = assert!(JOYPAD_AUX_COLUMN_COUNT == 45);
-const _: () = assert!(BLOCK_DEVICE_JOYPAD_COLUMN_COUNT == 2_610);
-const _: () = assert!(BLOCK_DEVICE_JOYPAD_CONSTRAINT_COUNT == 5_717);
-const _: () = assert!(BLOCK_DEVICE_JOYPAD_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_JOYPAD_COLUMN_COUNT == 2_505);
+const _: () = assert!(BLOCK_DEVICE_JOYPAD_CONSTRAINT_COUNT == 5_543);
+const _: () = assert!(BLOCK_DEVICE_JOYPAD_MAX_DEGREE == 14);
 
 /// Fixed-row witness carrying generic P1 state and falling-edge semantics.
 #[derive(Debug)]
@@ -131,7 +131,7 @@ impl UniformRelation for BlockDeviceJoypadRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [2_565_u64, 5_600, 45, 117, 2_610, 5_717, 5] {
+        for value in [2_460_u64, 5_426, 45, 117, 2_505, 5_543, 5] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

@@ -27,16 +27,16 @@ pub const BLOCK_FLOW_MAX_DEGREE: usize = BLOCK_FRONTEND_MAX_DEGREE;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(BASIC_BLOCK_M_CYCLE_BOUND == 6);
-const _: () = assert!(ISA_BASE_M_CYCLES == 10);
-const _: () = assert!(ISA_TAKEN_M_CYCLES == 11);
+const _: () = assert!(ISA_BASE_M_CYCLES == 3);
+const _: () = assert!(ISA_TAKEN_M_CYCLES == 4);
 const _: () = assert!(STATE_CPU_M_CYCLES_INDEX == 12);
 const _: () = assert!(STATE_INPUT_NEXT_INDEX == 16);
 const _: () = assert!(STATE_OUTPUT_NEXT_INDEX == 17);
 const _: () = assert!(STATE_BUS_NEXT_INDEX == 18);
 const _: () = assert!(STATE_ISA_NEXT_INDEX == 19);
 const _: () = assert!(STATE_MACHINE_PROFILE_INDEX == 20);
-const _: () = assert!(BLOCK_FLOW_COLUMN_COUNT == 773);
-const _: () = assert!(BLOCK_FLOW_CONSTRAINT_COUNT == 1_168);
+const _: () = assert!(BLOCK_FLOW_COLUMN_COUNT == 729);
+const _: () = assert!(BLOCK_FLOW_CONSTRAINT_COUNT == 1_124);
 const _: () = assert!(BLOCK_FLOW_MAX_DEGREE == 7);
 
 /// Low-degree front-end relation plus per-lane cycle and ordered-cursor flow.
@@ -50,7 +50,7 @@ impl UniformRelation for BlockFlowRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [773_u64, 1_140, 4, 7, 1_168, 12, 16, 17, 18, 19, 20, 1] {
+        for value in [729_u64, 1_096, 4, 7, 1_124, 12, 16, 17, 18, 19, 20, 1] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

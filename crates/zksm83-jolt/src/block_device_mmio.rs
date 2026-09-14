@@ -31,8 +31,9 @@ const MMIO_LOW_ADDRESSES: [u8; 69] = [
     0x48, 0x49, 0x4a, 0x4b, 0xff,
 ];
 const MMIO_AUX_START: usize = BLOCK_DEVICE_DMA_COLUMN_COUNT;
-const ADDRESS_SELECTORS_START: usize = 0;
-const IO_VALUE: usize = ADDRESS_SELECTORS_START + MMIO_LOW_ADDRESSES.len();
+const ADDRESS_BITS_START: usize = 0;
+const ADDRESS_BIT_COUNT: usize = 8;
+const IO_VALUE: usize = ADDRESS_BITS_START + ADDRESS_BIT_COUNT;
 const IO_BEFORE: usize = IO_VALUE + 1;
 const IO_AUXILIARY: usize = IO_BEFORE + 1;
 const IO_INDEX: usize = IO_AUXILIARY + 1;
@@ -40,15 +41,10 @@ const IO_VALUE_BITS_START: usize = IO_INDEX + 1;
 const BEFORE_IE_BITS_START: usize = IO_VALUE_BITS_START + 8;
 const AFTER_IE_BITS_START: usize = BEFORE_IE_BITS_START + 5;
 const MMIO_AUX_COLUMN_COUNT: usize = AFTER_IE_BITS_START + 5;
-const MMIO_ADDITIONAL_CONSTRAINT_COUNT: usize = 248;
+const MMIO_ADDITIONAL_CONSTRAINT_COUNT: usize = 118;
 const MMIO_READ_KIND: u8 = 11;
 const MMIO_WRITE_KIND: u8 = 12;
 const JOYPAD_READ_KIND: u8 = 13;
-const FF04_SELECTOR: usize = 3;
-const FF0F_SELECTOR: usize = 7;
-const FF44_SELECTOR: usize = 60;
-const FF46_SELECTOR: usize = 62;
-const FFFF_SELECTOR: usize = 68;
 
 /// Logical columns in the DMA relation plus typed MMIO classification.
 pub const BLOCK_DEVICE_MMIO_COLUMN_COUNT: usize =
@@ -57,13 +53,14 @@ pub const BLOCK_DEVICE_MMIO_COLUMN_COUNT: usize =
 pub const BLOCK_DEVICE_MMIO_CONSTRAINT_COUNT: usize =
     BLOCK_DEVICE_DMA_CONSTRAINT_COUNT + MMIO_ADDITIONAL_CONSTRAINT_COUNT;
 /// Maximum total degree in the typed DMG MMIO relation.
-pub const BLOCK_DEVICE_MMIO_MAX_DEGREE: usize = BLOCK_DEVICE_DMA_MAX_DEGREE;
+pub const BLOCK_DEVICE_MMIO_MAX_DEGREE: usize = 14;
 
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);
-const _: () = assert!(MMIO_AUX_COLUMN_COUNT == 91);
-const _: () = assert!(BLOCK_DEVICE_MMIO_COLUMN_COUNT == 2_565);
-const _: () = assert!(BLOCK_DEVICE_MMIO_CONSTRAINT_COUNT == 5_600);
-const _: () = assert!(BLOCK_DEVICE_MMIO_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_DMA_MAX_DEGREE == 7);
+const _: () = assert!(MMIO_AUX_COLUMN_COUNT == 30);
+const _: () = assert!(BLOCK_DEVICE_MMIO_COLUMN_COUNT == 2_460);
+const _: () = assert!(BLOCK_DEVICE_MMIO_CONSTRAINT_COUNT == 5_426);
+const _: () = assert!(BLOCK_DEVICE_MMIO_MAX_DEGREE == 14);
 
 /// Fixed-row witness classifying the one typed DMG device access in a block.
 #[derive(Debug)]
@@ -150,7 +147,7 @@ impl UniformRelation for BlockDeviceMmioRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [2_474_u64, 5_352, 69, 91, 248, 2_565, 5_600, 10] {
+        for value in [2_430_u64, 5_308, 69, 8, 30, 118, 2_460, 5_426, 14] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement
@@ -215,9 +212,9 @@ fn append_mmio_row(
             let Some(low) = u8::try_from(tuple.address & 0x00ff).ok() else {
                 return Err(BlockDeviceMmioError::Layout);
             };
-            let selector = MMIO_LOW_ADDRESSES
-                .iter()
-                .position(|address| *address == low)
+            MMIO_LOW_ADDRESSES
+                .contains(&low)
+                .then_some(())
                 .filter(|_| tuple.address >> 8 == 0xff)
                 .filter(|_| kind != MMIO_READ_KIND || low != 0x00)
                 .filter(|_| kind != JOYPAD_READ_KIND || low == 0x00)
@@ -226,7 +223,7 @@ fn append_mmio_row(
                     kind,
                     address: tuple.address,
                 })?;
-            set(row, ADDRESS_SELECTORS_START + selector, 1)?;
+            append_bits(row, ADDRESS_BITS_START, u64::from(low), ADDRESS_BIT_COUNT)?;
             set(row, IO_VALUE, u64::from(tuple.value))?;
             set(row, IO_BEFORE, u64::from(tuple.before))?;
             set(row, IO_AUXILIARY, u64::from(tuple.auxiliary))?;
@@ -262,16 +259,13 @@ fn constrain_mmio(
     let one = NativeField::from_u64(1);
     let device_io = device_io_selector_value(dma)?;
     let mut sink = ConstraintSink::new(constraints);
-    let mut selector_sum = NativeField::from_u64(0);
-    let mut classified_address = NativeField::from_u64(0);
-    for (index, address) in MMIO_LOW_ADDRESSES.iter().copied().enumerate() {
-        let selector = value(auxiliary, ADDRESS_SELECTORS_START + index)?;
-        sink.push(selector * (selector - one))?;
-        sink.push((one - device_io) * selector)?;
-        selector_sum += selector;
-        classified_address +=
-            NativeField::from_u64(u64::from(0xff00 | u16::from(address))) * selector;
+    for bit in 0..ADDRESS_BIT_COUNT {
+        let address_bit = value(auxiliary, ADDRESS_BITS_START + bit)?;
+        sink.push(address_bit * (address_bit - one))?;
     }
+    let low_address = packed_bits(auxiliary, ADDRESS_BITS_START, ADDRESS_BIT_COUNT)?;
+    let supported_address_sum = supported_address_selector_sum(auxiliary)?;
+    sink.push(device_io * (supported_address_sum - one))?;
     let io_value = value(auxiliary, IO_VALUE)?;
     let io_before = value(auxiliary, IO_BEFORE)?;
     let io_auxiliary = value(auxiliary, IO_AUXILIARY)?;
@@ -281,14 +275,14 @@ fn constrain_mmio(
     sink.push((one - device_io) * io_auxiliary)?;
     sink.push((one - device_io) * io_index)?;
     constrain_value_and_ie_bits(dma, auxiliary, device_io, io_value, &mut sink)?;
-    sink.push(selector_sum - device_io)?;
+    let classified_address = NativeField::from_u64(0xff00) * device_io + low_address;
     let events = selected_events(dma)?;
     sink.push(classified_address - events.address)?;
     sink.push(io_value - events.value)?;
     sink.push(io_before - events.before)?;
     sink.push(io_auxiliary - events.auxiliary)?;
     sink.push(io_index - events.index)?;
-    let address_zero = value(auxiliary, ADDRESS_SELECTORS_START)?;
+    let address_zero = address_selector(auxiliary, 0x00)?;
     sink.push(events.joypad * (one - address_zero))?;
     sink.push(address_zero * events.read)?;
     sink.push(events.read * io_before)?;
@@ -376,11 +370,11 @@ pub(crate) fn mmio_address_selector_value(
     row: &[NativeField],
     low_address: u8,
 ) -> Result<NativeField, UniformError> {
-    let selector = MMIO_LOW_ADDRESSES
-        .iter()
-        .position(|address| *address == low_address)
-        .ok_or(UniformError::Shape)?;
-    mmio_auxiliary_value(row, ADDRESS_SELECTORS_START + selector)
+    if !MMIO_LOW_ADDRESSES.contains(&low_address) {
+        return Err(UniformError::Shape);
+    }
+    let auxiliary = mmio_auxiliary(row)?;
+    address_selector(auxiliary, low_address)
 }
 
 pub(crate) fn mmio_io_value(row: &[NativeField]) -> Result<NativeField, UniformError> {
@@ -427,15 +421,15 @@ pub(crate) fn mmio_joypad_selector_value(row: &[NativeField]) -> Result<NativeFi
 }
 
 fn mmio_auxiliary_value(row: &[NativeField], index: usize) -> Result<NativeField, UniformError> {
+    value(mmio_auxiliary(row)?, index)
+}
+
+fn mmio_auxiliary(row: &[NativeField]) -> Result<&[NativeField], UniformError> {
     if row.len() < BLOCK_DEVICE_MMIO_COLUMN_COUNT {
         return Err(UniformError::Shape);
     }
-    value(
-        row,
-        MMIO_AUX_START
-            .checked_add(index)
-            .ok_or(UniformError::Shape)?,
-    )
+    row.get(MMIO_AUX_START..BLOCK_DEVICE_MMIO_COLUMN_COUNT)
+        .ok_or(UniformError::Shape)
 }
 
 fn constrain_dma_start(
@@ -447,7 +441,7 @@ fn constrain_dma_start(
     events: SelectedEvents,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    let address = value(auxiliary, ADDRESS_SELECTORS_START + FF46_SELECTOR)?;
+    let address = address_selector(auxiliary, 0x46)?;
     let ff46_read = address * events.read;
     let ff46 = address * events.write;
     let before_source = dma_state_byte_value(dma, false, 0)?;
@@ -475,7 +469,7 @@ fn constrain_interrupt_enable(
     events: SelectedEvents,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    let address = value(auxiliary, ADDRESS_SELECTORS_START + FFFF_SELECTOR)?;
+    let address = address_selector(auxiliary, 0xff)?;
     let read = address * events.read;
     let write = address * events.write;
     let before = packed_bits(auxiliary, BEFORE_IE_BITS_START, 5)?;
@@ -501,17 +495,17 @@ fn constrain_direct_register_tuples(
     let boundary = frontend
         .get(BLOCK_ROUTING_COLUMN_COUNT..BLOCK_CONTROL_COLUMN_COUNT)
         .ok_or(UniformError::Shape)?;
-    for (selector, scalar, visible_high) in [
-        (FF0F_SELECTOR, STATE_INTERRUPT_REQUEST_INDEX, 0xe0),
-        (FF44_SELECTOR, STATE_PPU_LINE_INDEX, 0),
+    for (address, scalar, visible_high) in [
+        (0x0f, STATE_INTERRUPT_REQUEST_INDEX, 0xe0),
+        (0x44, STATE_PPU_LINE_INDEX, 0),
     ] {
-        let address = value(auxiliary, ADDRESS_SELECTORS_START + selector)?;
+        let address = address_selector(auxiliary, address)?;
         let visible =
             device_state_value(boundary, false, scalar)? + NativeField::from_u64(visible_high);
         sink.push(address * events.read * (io_value - visible))?;
         sink.push(address * events.write * (io_before - visible))?;
     }
-    let div_address = value(auxiliary, ADDRESS_SELECTORS_START + FF04_SELECTOR)?;
+    let div_address = address_selector(auxiliary, 0x04)?;
     let div = timer_div_high_byte(dma)?;
     sink.push(div_address * events.read * (io_value - div))?;
     sink.push(div_address * events.write * (io_before - div))?;
@@ -536,22 +530,22 @@ fn constrain_packed_register_tuples(
     events: SelectedEvents,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    for (selector, high_pack, byte, visible_high) in [
-        (1, false, 0, 0_u64),
-        (2, false, 1, 0),
-        (5, false, 2, 0),
-        (6, false, 3, 0xf8),
-        (56, false, 4, 0),
-        (58, false, 6, 0),
-        (59, false, 7, 0),
-        (61, true, 5, 0),
-        (63, true, 0, 0),
-        (64, true, 1, 0),
-        (65, true, 2, 0),
-        (66, true, 3, 0),
-        (67, true, 4, 0),
+    for (address, high_pack, byte, visible_high) in [
+        (0x01, false, 0, 0_u64),
+        (0x02, false, 1, 0),
+        (0x05, false, 2, 0),
+        (0x06, false, 3, 0xf8),
+        (0x40, false, 4, 0),
+        (0x42, false, 6, 0),
+        (0x43, false, 7, 0),
+        (0x45, true, 5, 0),
+        (0x47, true, 0, 0),
+        (0x48, true, 1, 0),
+        (0x49, true, 2, 0),
+        (0x4a, true, 3, 0),
+        (0x4b, true, 4, 0),
     ] {
-        let address = value(auxiliary, ADDRESS_SELECTORS_START + selector)?;
+        let address = address_selector(auxiliary, address)?;
         let visible =
             packed_register_byte(dma, high_pack, byte)? + NativeField::from_u64(visible_high);
         sink.push(address * events.read * (io_value - visible))?;
@@ -591,24 +585,24 @@ fn constrain_stable_packed_registers(
     write: NativeField,
     sink: &mut ConstraintSink<'_>,
 ) -> Result<(), UniformError> {
-    for (selector, high_pack, byte, write_mask) in [
-        (2, false, 1, 0xff_u8),
-        (5, false, 2, 0xff),
-        (6, false, 3, 0x07),
-        (56, false, 4, 0xff),
-        (57, false, 5, 0x78),
-        (58, false, 6, 0xff),
-        (59, false, 7, 0xff),
-        (61, true, 5, 0xff),
-        (63, true, 0, 0xff),
-        (64, true, 1, 0xff),
-        (65, true, 2, 0xff),
-        (66, true, 3, 0xff),
-        (67, true, 4, 0xff),
+    for (address, high_pack, byte, write_mask) in [
+        (0x02, false, 1, 0xff_u8),
+        (0x05, false, 2, 0xff),
+        (0x06, false, 3, 0x07),
+        (0x40, false, 4, 0xff),
+        (0x41, false, 5, 0x78),
+        (0x42, false, 6, 0xff),
+        (0x43, false, 7, 0xff),
+        (0x45, true, 5, 0xff),
+        (0x47, true, 0, 0xff),
+        (0x48, true, 1, 0xff),
+        (0x49, true, 2, 0xff),
+        (0x4a, true, 3, 0xff),
+        (0x4b, true, 4, 0xff),
     ] {
         let before = packed_register_byte(dma, high_pack, byte)?;
         let after = packed_register_byte_after(dma, high_pack, byte)?;
-        let selected = value(auxiliary, ADDRESS_SELECTORS_START + selector)? * write;
+        let selected = address_selector(auxiliary, address)? * write;
         let written = masked_io_value(auxiliary, write_mask)?;
         sink.push(device_io * (after - before) - selected * (written - before))?;
     }
@@ -663,6 +657,32 @@ fn packed_bits(
         power += power;
     }
     Ok(packed)
+}
+
+fn address_selector(
+    auxiliary: &[NativeField],
+    low_address: u8,
+) -> Result<NativeField, UniformError> {
+    let one = NativeField::from_u64(1);
+    (0..ADDRESS_BIT_COUNT).try_fold(one, |selector, bit| {
+        let address_bit = value(auxiliary, ADDRESS_BITS_START + bit)?;
+        let expected = low_address >> bit & 1;
+        Ok(selector
+            * if expected == 1 {
+                address_bit
+            } else {
+                one - address_bit
+            })
+    })
+}
+
+fn supported_address_selector_sum(auxiliary: &[NativeField]) -> Result<NativeField, UniformError> {
+    MMIO_LOW_ADDRESSES
+        .iter()
+        .copied()
+        .try_fold(NativeField::from_u64(0), |sum, address| {
+            Ok(sum + address_selector(auxiliary, address)?)
+        })
 }
 
 fn append_bits(
@@ -741,6 +761,38 @@ mod tests {
         validate_uniform_witness,
     };
 
+    fn address_auxiliary(low_address: u8) -> Result<Vec<NativeField>, UniformError> {
+        let mut auxiliary = vec![NativeField::from_u64(0); MMIO_AUX_COLUMN_COUNT];
+        for bit in 0..ADDRESS_BIT_COUNT {
+            *auxiliary
+                .get_mut(ADDRESS_BITS_START + bit)
+                .ok_or(UniformError::Shape)? =
+                NativeField::from_u64(u64::from(low_address >> bit & 1));
+        }
+        Ok(auxiliary)
+    }
+
+    #[test]
+    fn compressed_address_bits_select_exactly_the_supported_mmio_set() -> Result<(), UniformError> {
+        for low_address in MMIO_LOW_ADDRESSES {
+            let auxiliary = address_auxiliary(low_address)?;
+            assert_eq!(
+                supported_address_selector_sum(&auxiliary)?,
+                NativeField::from_u64(1),
+                "supported address {low_address:#04x}",
+            );
+        }
+        for low_address in [0x03, 0x08, 0x4c, 0xfe] {
+            let auxiliary = address_auxiliary(low_address)?;
+            assert_eq!(
+                supported_address_selector_sum(&auxiliary)?,
+                NativeField::from_u64(0),
+                "unsupported address {low_address:#04x}",
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn ff46_write_is_admitted_by_typed_mmio_relation() -> Result<(), Box<dyn std::error::Error>> {
         let blocks = lookup_blocks(&[0x3e, 0xc0, 0xea, 0x46, 0xff], 2)?;
@@ -750,7 +802,7 @@ mod tests {
         let mut mutated = witness.columns().to_vec();
         flip_witness_bit(
             &mut mutated,
-            MMIO_AUX_START + ADDRESS_SELECTORS_START + FF46_SELECTOR,
+            MMIO_AUX_START + ADDRESS_BITS_START,
             device_row,
         )?;
         assert!(validate_uniform_witness(&BlockDeviceMmioRelation, &mutated).is_err());

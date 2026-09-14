@@ -33,12 +33,12 @@ const COLUMN_END: usize = LANE_START + BASIC_BLOCK_INSTRUCTION_BOUND * BLOCK_ISA
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(ISA_ADDRESS_BIT_COUNT == 9);
-const _: () = assert!(ISA_OUTPUT_COUNT == 49);
+const _: () = assert!(ISA_OUTPUT_COUNT == 38);
 const _: () = assert!(ISA_TABLE_ROW_COUNT == 512);
-const _: () = assert!(BLOCK_ISA_LANE_COLUMN_COUNT == 59);
+const _: () = assert!(BLOCK_ISA_LANE_COLUMN_COUNT == 48);
 const _: () = assert!(COLUMN_END == BLOCK_ISA_COLUMN_COUNT);
-const _: () = assert!(BLOCK_ISA_COLUMN_COUNT == 242);
-const _: () = assert!(BLOCK_ISA_CONSTRAINT_COUNT == 291);
+const _: () = assert!(BLOCK_ISA_COLUMN_COUNT == 198);
+const _: () = assert!(BLOCK_ISA_CONSTRAINT_COUNT == 247);
 
 /// Fixed-row lane-local ISA witness derived from validated owned blocks.
 #[derive(Debug)]
@@ -154,7 +154,7 @@ impl UniformRelation for BlockIsaRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [4_u64, 9, 49, 59, 242, 291, u64::from(ISA_PADDING_ADDRESS)] {
+        for value in [4_u64, 9, 38, 48, 198, 247, u64::from(ISA_PADDING_ADDRESS)] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

@@ -5,12 +5,12 @@ use akita_pcs::Ring;
 use super::{
     BUS_ADDRESS_OFFSET, BUS_VALUE_OFFSET, ConstraintSink, DMA_BYTE_MODE, HALT_IDLE_MODE,
     HALT_UNTIL_SERIAL_MODE, HALT_UNTIL_TIMER_MODE, HALT_UNTIL_VBLANK_MODE, HALT_WAKE_MODE,
-    INTERRUPT_MODE, ISA_OPCODE, ISA_PREFIX, RowView, STATE_CYCLES, STATE_IME, STATE_PC,
-    STATE_RUN_STATE, STATE_SP, bus_field, packed_bits,
+    INTERRUPT_MODE, RowView, STATE_CYCLES, STATE_IME, STATE_PC, STATE_RUN_STATE, STATE_SP,
+    bus_field, packed_bits,
 };
 use crate::{
     NativeField, TRACE_BEFORE_PC_BITS_START, TRACE_INTERRUPT_COUNT, TRACE_INTERRUPT_START,
-    TRACE_STACK_FIRST_WRAP, TRACE_STACK_WRAP, UniformError,
+    TRACE_ISA_ADDRESS_START, TRACE_STACK_FIRST_WRAP, TRACE_STACK_WRAP, UniformError,
 };
 
 pub(super) fn constrain_machine_cpu(
@@ -34,10 +34,12 @@ fn constrain_machine_markers(
         + view.mode(HALT_UNTIL_TIMER_MODE)?
         + view.mode(HALT_WAKE_MODE)?;
     let interrupt = view.mode(INTERRUPT_MODE)?;
-    sink.push((noop + halt + interrupt) * view.isa(ISA_PREFIX)?)?;
-    sink.push(noop * view.isa(ISA_OPCODE)?)?;
-    sink.push(halt * (view.isa(ISA_OPCODE)? - NativeField::from_u64(0x76)))?;
-    sink.push(interrupt * (view.isa(ISA_OPCODE)? - NativeField::from_u64(0xff)))
+    let prefix = view.value(TRACE_ISA_ADDRESS_START + 8)?;
+    let opcode = packed_bits(view, TRACE_ISA_ADDRESS_START, 8)?;
+    sink.push((noop + halt + interrupt) * prefix)?;
+    sink.push(noop * opcode)?;
+    sink.push(halt * (opcode - NativeField::from_u64(0x76)))?;
+    sink.push(interrupt * (opcode - NativeField::from_u64(0xff)))
 }
 
 fn constrain_passive_cpu_modes(

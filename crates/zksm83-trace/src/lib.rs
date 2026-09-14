@@ -5,6 +5,7 @@
 
 mod block;
 mod builder;
+mod execution_lookup;
 mod lookup_builder;
 mod model;
 
@@ -15,6 +16,9 @@ pub use block::{
     pack_witness_basic_blocks_at, plan_basic_blocks, plan_witness_basic_blocks,
 };
 pub use builder::{TraceBuilder, TraceBuilderError};
+pub use execution_lookup::{
+    InstructionLookupRecord, InstructionLookupRecordError, InstructionLookupRecords,
+};
 pub use lookup_builder::{LookupTraceBuilder, LookupTraceBuilderError};
 pub use model::{
     ExecutionBoundary, ExecutionMetrics, ProgramCounterCount, ProgramCounterProfile, TraceChunk,

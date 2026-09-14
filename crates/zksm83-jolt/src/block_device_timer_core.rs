@@ -75,8 +75,8 @@ const _: () = assert!(BASIC_BLOCK_M_CYCLE_BOUND == 6);
 const _: () = assert!(TIMER_TICK_BOUND == 24);
 const _: () = assert!(TIMER_CORE_AUX_COLUMN_COUNT == 1_039);
 const _: () = assert!(TIMER_CORE_ADDITIONAL_CONSTRAINT_COUNT == 2_392);
-const _: () = assert!(BLOCK_DEVICE_TIMER_CORE_COLUMN_COUNT == 2_282);
-const _: () = assert!(BLOCK_DEVICE_TIMER_CORE_CONSTRAINT_COUNT == 4_812);
+const _: () = assert!(BLOCK_DEVICE_TIMER_CORE_COLUMN_COUNT == 2_238);
+const _: () = assert!(BLOCK_DEVICE_TIMER_CORE_CONSTRAINT_COUNT == 4_768);
 const _: () = assert!(BLOCK_DEVICE_TIMER_CORE_MAX_DEGREE == 7);
 
 /// Fixed-row witness carrying one 24-tick-bounded timer transition per quiet block.
@@ -165,7 +165,7 @@ impl UniformRelation for BlockDeviceTimerCoreRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [1_243_u64, 2_420, 24, 42, 2, 16, 2_282, 4_812, 2] {
+        for value in [1_199_u64, 2_376, 24, 42, 2, 16, 2_238, 4_768, 2] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

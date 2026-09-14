@@ -62,7 +62,7 @@ impl<'a> PackedProjection<'a> {
         let expected = BLOCK_MEMORY_COLUMN_COUNT
             .checked_add(PACKED_CPU_AUX_COLUMN_COUNT)
             .ok_or(UniformError::Shape)?;
-        if row.len() != expected || lane >= BASIC_BLOCK_INSTRUCTION_BOUND {
+        if row.len() < expected || lane >= BASIC_BLOCK_INSTRUCTION_BOUND {
             return Err(UniformError::Shape);
         }
         let mut bus_kind_bits =
@@ -444,14 +444,13 @@ pub(crate) fn constrain_instruction_lane(
     }
     let mut sink = ConstraintSink::new(constraints);
     constrain_state_write_mask(&view, &mut sink)?;
+    super::execution::constrain_execution_lookup_glue(row, lane, &view, &mut sink)?;
     super::mbc3::constrain_mapper_and_rom(&view, &mut sink)?;
-    super::semantics::constrain_byte_arithmetic(&view, &mut sink)?;
-    super::control::constrain_instruction_flow(&view, &mut sink)?;
+    super::control::constrain_instruction_flow_with_lookup(&view, &mut sink)?;
     super::data::constrain_data_and_simple_operations(&view, &mut sink)?;
-    super::word::constrain_word_operations(&view, &mut sink)?;
+    super::word::constrain_word_operations_with_lookup(&view, &mut sink)?;
     super::stack::constrain_stack_operations(&view, &mut sink)?;
-    super::bit::constrain_rotate_and_bit_operations(&view, &mut sink)?;
-    super::daa::constrain_decimal_adjust(&view, &mut sink)?;
+    super::bit::constrain_cb_bus_with_lookup(&view, &mut sink)?;
     sink.finish()
 }
 
@@ -600,7 +599,7 @@ pub(crate) fn constrain_bus_matches(
 }
 
 const _: () = assert!(ISA_ADDRESS_BIT_COUNT == 9);
-const _: () = assert!(ISA_OUTPUT_COUNT == 49);
+const _: () = assert!(ISA_OUTPUT_COUNT == 38);
 const _: () = assert!(TRACE_INTERRUPT_COUNT == 5);
 const _: () = assert!(TRACE_BUS_KIND_BITS == 5);
 const _: () = assert!(BASIC_BLOCK_BUS_EVENT_BOUND == 5);

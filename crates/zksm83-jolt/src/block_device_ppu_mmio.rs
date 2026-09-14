@@ -64,14 +64,15 @@ pub const BLOCK_DEVICE_PPU_MMIO_COLUMN_COUNT: usize =
 pub const BLOCK_DEVICE_PPU_MMIO_CONSTRAINT_COUNT: usize =
     BLOCK_DEVICE_TIMER_MMIO_CONSTRAINT_COUNT + PPU_MMIO_ADDITIONAL_CONSTRAINT_COUNT;
 /// Maximum total degree in the typed PPU-MMIO relation.
-pub const BLOCK_DEVICE_PPU_MMIO_MAX_DEGREE: usize = BLOCK_DEVICE_TIMER_MMIO_MAX_DEGREE;
+pub const BLOCK_DEVICE_PPU_MMIO_MAX_DEGREE: usize = 15;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(STATE_WIDTH == 23);
 const _: () = assert!(PPU_MMIO_AUX_COLUMN_COUNT == 75);
-const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_COLUMN_COUNT == 3_443);
-const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_CONSTRAINT_COUNT == 8_177);
-const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_MAX_DEGREE == 14);
+const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_COLUMN_COUNT == 3_338);
+const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_CONSTRAINT_COUNT == 8_003);
+const _: () = assert!(BLOCK_DEVICE_PPU_MMIO_MAX_DEGREE == 15);
 
 /// Fixed-row witness for PPU writes, immediate STAT edges, and bounded clocking.
 #[derive(Debug)]
@@ -154,7 +155,7 @@ impl UniformRelation for BlockDevicePpuMmioRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [3_368_u64, 7_963, 75, 214, 3_443, 8_177, 3] {
+        for value in [3_263_u64, 7_789, 75, 214, 3_338, 8_003, 3] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

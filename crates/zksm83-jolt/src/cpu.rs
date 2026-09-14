@@ -10,6 +10,7 @@ mod data;
 mod devices;
 #[cfg(test)]
 mod dma_tests;
+mod execution;
 mod joypad;
 #[cfg(test)]
 mod joypad_tests;
@@ -52,12 +53,11 @@ use std::cell::Cell;
 use akita_pcs::Ring;
 
 use crate::{
-    ConstraintOutput, ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_BASE_M_CYCLES,
-    ISA_DATA_READS, ISA_DATA_WRITES, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES,
-    ISA_OPERATION_BITS_START, ISA_OUTPUT_COUNT, ISA_PADDING_ADDRESS, ISA_TAKEN_DATA_READS,
-    ISA_TAKEN_DATA_WRITES, ISA_TAKEN_M_CYCLES, ISA_TAKEN_TIMING, ISA_VALID, ISA_WRITE_BITS_START,
-    NATIVE_TRACE_COLUMN_COUNT, NativeField, ROM_ADDRESS_BIT_COUNT, STATE_SCALAR_COUNT,
-    TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
+    ConstraintOutput, ISA_BASE_M_CYCLES, ISA_DATA_READS, ISA_DATA_WRITES, ISA_IMMEDIATE_READS,
+    ISA_OPCODE_FETCHES, ISA_OPERATION_BITS_START, ISA_OUTPUT_COUNT, ISA_PADDING_ADDRESS,
+    ISA_TAKEN_DATA_READS, ISA_TAKEN_DATA_WRITES, ISA_TAKEN_M_CYCLES, ISA_TAKEN_TIMING, ISA_VALID,
+    ISA_WRITE_BITS_START, NATIVE_TRACE_COLUMN_COUNT, NativeField, ROM_ADDRESS_BIT_COUNT,
+    STATE_SCALAR_COUNT, TRACE_ACTIVE, TRACE_AFTER_CPU_BYTE_BITS_START, TRACE_AFTER_PC_BITS_START,
     TRACE_AFTER_RAM_RTC_BITS_START, TRACE_AFTER_ROM_BANK_BITS_START, TRACE_AFTER_SP_BITS_START,
     TRACE_AFTER_STATE_START, TRACE_BEFORE_CPU_BYTE_BITS_START, TRACE_BEFORE_PC_BITS_START,
     TRACE_BEFORE_RAM_RTC_BITS_START, TRACE_BEFORE_ROM_BANK_BITS_START, TRACE_BEFORE_SP_BITS_START,
@@ -74,7 +74,7 @@ use selectors::{argument_selector, operation_selector};
 /// Number of relation slots; unused tail slots are canonical zero identities.
 pub const CPU_STRUCTURAL_CONSTRAINT_COUNT: usize = 6144;
 // Keep the 876-slot zero tail explicit while guarding every real constraint push.
-const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5268;
+const CPU_STRUCTURAL_USED_CONSTRAINT_COUNT: usize = 5263;
 /// Maximum algebraic degree of one CPU/device constraint before equality weighting.
 pub const CPU_STRUCTURAL_MAX_DEGREE: usize = 18;
 
@@ -98,11 +98,6 @@ pub(super) const STATE_MBC3_RAM_ENABLED: usize = 13;
 pub(super) const STATE_MBC3_ROM_BANK: usize = 14;
 pub(super) const STATE_MBC3_RAM_RTC_SELECT: usize = 15;
 const STATE_PROFILE: usize = 20;
-const ISA_PREFIX: usize = 3;
-const ISA_OPCODE: usize = 4;
-const ISA_OPERATION: usize = 6;
-const ISA_ARGUMENT_ZERO: usize = 7;
-const ISA_ARGUMENT_ONE: usize = 8;
 pub(super) const BUS_ADDRESS_OFFSET: usize = 1 + TRACE_BUS_KIND_BITS;
 pub(super) const BUS_PHYSICAL_ADDRESS_OFFSET: usize = BUS_ADDRESS_OFFSET + 1;
 pub(super) const BUS_BEFORE_OFFSET: usize = BUS_ADDRESS_OFFSET + 2;
@@ -504,17 +499,6 @@ fn constrain_isa(view: &RowView<'_>, sink: &mut ConstraintSink<'_>) -> Result<()
     for bit in 0..9 {
         let expected = NativeField::from_u64(u64::from((ISA_PADDING_ADDRESS >> bit) & 1));
         sink.push(padding * (view.value(TRACE_ISA_ADDRESS_START + bit)? - expected))?;
-    }
-    sink.push(active * (view.isa(ISA_PREFIX)? - view.value(TRACE_ISA_ADDRESS_START + 8)?))?;
-    sink.push(active * (view.isa(ISA_OPCODE)? - packed_bits(view, TRACE_ISA_ADDRESS_START, 8)?))?;
-    for (field, start, width) in [
-        (ISA_OPERATION, ISA_OPERATION_BITS_START, 6),
-        (ISA_ARGUMENT_ZERO, ISA_ARGUMENT_ZERO_BITS_START, 3),
-        (ISA_ARGUMENT_ONE, ISA_ARGUMENT_ONE_BITS_START, 4),
-    ] {
-        sink.push(
-            active * (view.isa(field)? - packed_bits(view, TRACE_ISA_OUTPUT_START + start, width)?),
-        )?;
     }
     Ok(())
 }

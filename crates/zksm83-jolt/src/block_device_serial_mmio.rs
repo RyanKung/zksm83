@@ -46,9 +46,9 @@ pub const BLOCK_DEVICE_SERIAL_MMIO_CONSTRAINT_COUNT: usize =
 pub const BLOCK_DEVICE_SERIAL_MMIO_MAX_DEGREE: usize = BLOCK_DEVICE_APU_MAX_DEGREE;
 
 const _: () = assert!(SERIAL_MMIO_AUX_COLUMN_COUNT == 50);
-const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_COLUMN_COUNT == 3_319);
-const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_CONSTRAINT_COUNT == 7_552);
-const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_COLUMN_COUNT == 3_214);
+const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_CONSTRAINT_COUNT == 7_378);
+const _: () = assert!(BLOCK_DEVICE_SERIAL_MMIO_MAX_DEGREE == 14);
 
 /// Fixed-row witness for the serial state immediately after MMIO and after clocking.
 #[derive(Debug)]
@@ -131,7 +131,7 @@ impl UniformRelation for BlockDeviceSerialMmioRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [3_269_u64, 7_395, 50, 157, 3_319, 7_552, 5] {
+        for value in [3_164_u64, 7_221, 50, 157, 3_214, 7_378, 5] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

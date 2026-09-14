@@ -16,21 +16,26 @@ domain-separated SHA-256; verifier-visible ROM/RAM/log claims remain Akita
 commitments and openings. This cutover does not turn the transparent protocol
 into witness-hiding zero knowledge.
 
-New statements and receipts use a hard-cut native receipt v2. Its 4,565-column
+New statements and receipts use a hard-cut native receipt v2. Its 4,604-column
 packed CPU plane forms 36 ordered commitment groups. The full CPU relation
 opens all 18 schedule-bound adjacent pairs. Memory-event, continuity, and log
 sumchecks use transcript-bound projections containing only the main columns
 they consume. The four ISA lanes are reduced by one Fiat-Shamir random linear
 combination and share one table proof plus two trace openings; ISA, ROM,
 fixed-clock, and projected composite checks open only the adjacent pairs they
-consume. High-level encoders and decoders reject v1; there is no legacy
+consume. CPU execution uses 13 generic byte-level SM83 tables and at most two
+queries per instruction. Their aligned 19-bit union is authenticated by one
+Shout-style proof across all eight packed lookup slots, plus two selective
+trace openings. High-level encoders and decoders reject v1; there is no legacy
 receipt fallback.
 
-Source-level accounting for one segment now schedules 33 main-trace
+Source-level accounting for one segment now schedules 37 main-trace
 group-pair opening proofs instead of the former 270: 18 for the full CPU
-relation and 15 across projected memory, continuity, logs, batched ISA, ROM,
-and fixed clock checks. ISA table proofs fall from four to one. These are
-algorithmic operation counts; no proof timing is inferred from them.
+relation, 15 across projected memory, continuity, logs, batched ISA, ROM, and
+fixed clock checks, and four for the two execution-lookup trace openings. ISA
+table proofs fall from four to one. The packed relation contains 11,458
+identities. These are algorithmic operation counts; no proof timing is inferred
+from them.
 
 The former one-transition CPU, continuity, mutable-memory, and protocol-log
 proof APIs and their wire layouts have been deleted. The one-transition trace
@@ -39,7 +44,10 @@ the packed V2 instruction lanes; they cannot produce a receipt.
 
 Execution and proof construction contain no cartridge-identity, ROM-root,
 program-counter, bank, or instruction-byte-pattern fast path. Every cartridge
-uses the same transition modes and constraints. Historical prefix proofs made
+uses the same transition modes, lookup tables, and constraints. The proved
+device projection contains CPU-observable Timer, PPU timing and interrupts,
+DMA, serial, joypad, APU-register/Wave-RAM, and MMIO state; it does not prove a
+framebuffer renderer or generated audio samples. Historical prefix proofs made
 before this generic-relation cutover are incompatible with the current backend
 identity and are not current performance evidence.
 See [implementation status](docs/completion-report.md), the

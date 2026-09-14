@@ -36,8 +36,8 @@ pub const BLOCK_DEVICE_TIMER_MAX_DEGREE: usize = BLOCK_DEVICE_SERIAL_MAX_DEGREE;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(TIMER_AUX_COLUMN_COUNT == 37);
-const _: () = assert!(BLOCK_DEVICE_TIMER_COLUMN_COUNT == 1_243);
-const _: () = assert!(BLOCK_DEVICE_TIMER_CONSTRAINT_COUNT == 2_420);
+const _: () = assert!(BLOCK_DEVICE_TIMER_COLUMN_COUNT == 1_199);
+const _: () = assert!(BLOCK_DEVICE_TIMER_CONSTRAINT_COUNT == 2_376);
 const _: () = assert!(BLOCK_DEVICE_TIMER_MAX_DEGREE == 7);
 
 /// Fixed-row packed witness carrying one timer-divider transition per quiet block.
@@ -124,7 +124,7 @@ impl UniformRelation for BlockDeviceTimerRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [1_206_u64, 2_343, 37, 65_536, 1_243, 2_420, 2] {
+        for value in [1_162_u64, 2_299, 37, 65_536, 1_199, 2_376, 2] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

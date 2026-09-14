@@ -48,8 +48,8 @@ pub const BLOCK_DEVICE_SERIAL_MAX_DEGREE: usize = BLOCK_DEVICE_PPU_MAX_DEGREE;
 
 const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(SERIAL_AUX_COLUMN_COUNT == 168);
-const _: () = assert!(BLOCK_DEVICE_SERIAL_COLUMN_COUNT == 1_206);
-const _: () = assert!(BLOCK_DEVICE_SERIAL_CONSTRAINT_COUNT == 2_343);
+const _: () = assert!(BLOCK_DEVICE_SERIAL_COLUMN_COUNT == 1_162);
+const _: () = assert!(BLOCK_DEVICE_SERIAL_CONSTRAINT_COUNT == 2_299);
 const _: () = assert!(BLOCK_DEVICE_SERIAL_MAX_DEGREE == 7);
 
 /// Fixed-row packed witness carrying one serial transition per quiet block.
@@ -134,7 +134,7 @@ impl UniformRelation for BlockDeviceSerialRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [1_038_u64, 1_868, 168, 4_096, 1_206, 2_343, 3] {
+        for value in [994_u64, 1_824, 168, 4_096, 1_162, 2_299, 3] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement

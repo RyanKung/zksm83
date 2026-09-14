@@ -35,7 +35,7 @@ pub const BLOCK_CPU_OPENING_COUNT: usize = BLOCK_CPU_COMMITMENT_GROUP_COUNT / 2;
 pub const BLOCK_CPU_PADDED_COLUMN_COUNT: usize =
     BLOCK_CPU_COMMITMENT_GROUP_COUNT * COMMITMENT_GROUP_COLUMNS;
 
-/// Canonical zero columns remaining in the final packed v2 CPU group.
+/// Canonical zero columns remaining in the final packed v2 opening pair.
 pub const BLOCK_CPU_PADDING_COLUMN_COUNT: usize =
     BLOCK_CPU_PADDED_COLUMN_COUNT - BLOCK_CPU_COLUMN_COUNT;
 
@@ -47,6 +47,6 @@ const _: () = assert!(
 const _: () = assert!(NATIVE_TRACE_COLUMN_COUNT <= NATIVE_TRACE_PADDED_COLUMN_COUNT);
 const _: () = assert!(BLOCK_CPU_COMMITMENT_GROUP_COUNT.is_multiple_of(2));
 const _: () = assert!(
-    BLOCK_CPU_COLUMN_COUNT > (BLOCK_CPU_COMMITMENT_GROUP_COUNT - 1) * COMMITMENT_GROUP_COLUMNS
+    BLOCK_CPU_COLUMN_COUNT > (BLOCK_CPU_COMMITMENT_GROUP_COUNT - 2) * COMMITMENT_GROUP_COLUMNS
 );
 const _: () = assert!(BLOCK_CPU_COLUMN_COUNT <= BLOCK_CPU_PADDED_COLUMN_COUNT);

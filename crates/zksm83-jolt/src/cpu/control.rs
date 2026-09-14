@@ -7,17 +7,14 @@ use super::{
     argument_selector, boolean, bus_field, operation_selector, packed_bits,
 };
 use crate::{
-    ISA_ARGUMENT_ZERO_BITS_START, NativeField, TRACE_BRANCH_TAKEN, TRACE_CONTROL_OVERFLOW,
-    TRACE_CONTROL_UNDERFLOW, TRACE_FETCH_ONE_WRAP, TRACE_FETCH_TWO_WRAP, TRACE_HALT_BUG,
-    TRACE_IMMEDIATE_HIGH, TRACE_IMMEDIATE_HIGH_BITS_START, TRACE_IMMEDIATE_LOW,
-    TRACE_IMMEDIATE_LOW_BITS_START, TRACE_PC_WRAP, TRACE_SEQUENTIAL_PC,
-    TRACE_SEQUENTIAL_PC_BITS_START, UniformError,
+    ISA_ARGUMENT_ZERO_BITS_START, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES, NativeField,
+    TRACE_BRANCH_TAKEN, TRACE_CONTROL_OVERFLOW, TRACE_CONTROL_UNDERFLOW, TRACE_FETCH_ONE_WRAP,
+    TRACE_FETCH_TWO_WRAP, TRACE_HALT_BUG, TRACE_IMMEDIATE_HIGH, TRACE_IMMEDIATE_HIGH_BITS_START,
+    TRACE_IMMEDIATE_LOW, TRACE_IMMEDIATE_LOW_BITS_START, TRACE_ISA_ADDRESS_START,
+    TRACE_ISA_OUTPUT_START, TRACE_PC_WRAP, TRACE_SEQUENTIAL_PC, TRACE_SEQUENTIAL_PC_BITS_START,
+    UniformError,
 };
 
-const ISA_BYTE_LEN: usize = 9;
-const ISA_IMMEDIATE_READS: usize = 17;
-const ISA_PREFIX: usize = 3;
-const ISA_OPCODE: usize = 4;
 const STATE_PC: usize = 8;
 const STATE_RUN_STATE: usize = 11;
 const FLAGS_CARRY_BIT: usize = 4;
@@ -30,6 +27,17 @@ pub(super) fn constrain_instruction_flow(
     constrain_instruction_witness(view, sink)?;
     constrain_fetch_alignment(view, sink)?;
     constrain_branch_decision(view, sink)?;
+    constrain_program_counter(view, sink)
+}
+
+/// Packed-v2 flow constraints whose conditional predicate comes from the execution lookup.
+pub(super) fn constrain_instruction_flow_with_lookup(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+) -> Result<(), UniformError> {
+    constrain_instruction_witness(view, sink)?;
+    constrain_fetch_alignment(view, sink)?;
+    constrain_branch_routing_with_lookup(view, sink)?;
     constrain_program_counter(view, sink)
 }
 
@@ -107,7 +115,8 @@ fn constrain_instruction_witness(
         instruction
             * (view.value(TRACE_SEQUENTIAL_PC)?
                 - view.before(STATE_PC)?
-                - view.isa(ISA_BYTE_LEN)?
+                - view.isa(ISA_OPCODE_FETCHES)?
+                - view.isa(ISA_IMMEDIATE_READS)?
                 + halt_bug
                 + NativeField::from_u64(65_536) * view.value(TRACE_PC_WRAP)?),
     )?;
@@ -134,8 +143,8 @@ fn constrain_fetch_alignment(
 ) -> Result<(), UniformError> {
     let one = NativeField::from_u64(1);
     let instruction = view.mode(INSTRUCTION_MODE)?;
-    let prefix = view.isa(ISA_PREFIX)?;
-    let opcode = view.isa(ISA_OPCODE)?;
+    let prefix = view.value(TRACE_ISA_ADDRESS_START + 8)?;
+    let opcode = packed_bits(view, TRACE_ISA_ADDRESS_START, 8)?;
     let halt_bug = view.value(TRACE_HALT_BUG)?;
     sink.push(instruction * (bus_field(view, 0, BUS_ADDRESS_OFFSET)? - view.before(STATE_PC)?))?;
     sink.push(
@@ -195,6 +204,32 @@ fn constrain_branch_decision(
     sink.push(instruction * (one - conditional - fixed) * branch)
 }
 
+fn constrain_branch_routing_with_lookup(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+) -> Result<(), UniformError> {
+    let one = NativeField::from_u64(1);
+    let instruction = view.mode(INSTRUCTION_MODE)?;
+    let branch = view.value(TRACE_BRANCH_TAKEN)?;
+    let conditional_operation = operation_selector(view, 3)?
+        + operation_selector(view, 20)?
+        + operation_selector(view, 28)?
+        + operation_selector(view, 34)?;
+    let unconditional =
+        conditional_operation * argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 0)?;
+    let conditional = conditional_operation
+        * (argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 1)?
+            + argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 2)?
+            + argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 3)?
+            + argument_selector(view, ISA_ARGUMENT_ZERO_BITS_START, 3, 4)?);
+    let fixed = unconditional
+        + operation_selector(view, 25)?
+        + operation_selector(view, 26)?
+        + operation_selector(view, 36)?;
+    sink.push(instruction * fixed * (branch - one))?;
+    sink.push(instruction * (one - conditional - fixed) * branch)
+}
+
 fn constrain_program_counter(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,
@@ -247,7 +282,15 @@ fn constrain_program_counter(
     )?;
     sink.push(instruction * return_interrupt * (view.after(STATE_PC)? - popped))?;
     sink.push(
-        instruction * restart * (view.after(STATE_PC)? - NativeField::from_u64(8) * view.isa(7)?),
+        instruction
+            * restart
+            * (view.after(STATE_PC)?
+                - NativeField::from_u64(8)
+                    * packed_bits(
+                        view,
+                        TRACE_ISA_OUTPUT_START + ISA_ARGUMENT_ZERO_BITS_START,
+                        3,
+                    )?),
     )
 }
 

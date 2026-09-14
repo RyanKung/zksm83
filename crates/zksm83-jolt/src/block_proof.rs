@@ -5,18 +5,19 @@ use zksm83_trace::{BASIC_BLOCK_INSTRUCTION_BOUND, BasicBlockLaneIndex};
 
 use crate::{
     BlockCpuRelation, BlockCpuWitness, BlockFrontendError, CommittedMemory, CommittedProtocolLogs,
-    CommittedRom, ContinuityError, IsaLookupColumns, IsaLookupError, IsaLookupProof,
-    MemoryCommitment, MutableMemoryError, NativeExecutionClaim, NativeProtocolVersion,
-    PackedContinuityProof, PackedMutableMemoryProof, PackedProtocolLogClaim,
-    PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError, RomCommitment,
-    RomLookupError, RomLookupProof, UniformError, UniformRelationProof, WitnessCommitments,
-    commit_witness, prove_rom_lookup, prove_uniform_committed,
+    CommittedRom, ContinuityError, ExecutionLookupProof, ExecutionLookupProofError,
+    IsaLookupColumns, IsaLookupError, IsaLookupProof, MemoryCommitment, MutableMemoryError,
+    NativeExecutionClaim, NativeProtocolVersion, PackedContinuityProof, PackedMutableMemoryProof,
+    PackedProtocolLogClaim, PackedProtocolLogProof, ProtocolLogCommitments, ProtocolLogError,
+    RomCommitment, RomLookupError, RomLookupProof, UniformError, UniformRelationProof,
+    WitnessCommitments, commit_witness, prove_rom_lookup, prove_uniform_committed,
 };
 use crate::{
     continuity::{
         prepare_packed_continuity, prove_prepared_packed_continuity,
         verify_packed_continuity_for_protocol,
     },
+    execution_lookup::proof::{prove_execution_lookups, verify_execution_lookups_for_protocol},
     isa_lookup::{prove_isa_lookups, verify_isa_lookups_for_protocol},
     logs::{
         prepare_packed_protocol_logs, prove_prepared_packed_protocol_logs,
@@ -54,7 +55,7 @@ pub(crate) struct PackedBlockVerificationInputs<'a> {
 /// Proof components that all open one packed-block witness commitment plane.
 ///
 /// This object authenticates the current deepest row-local relation, four fixed
-/// ISA lookups, immutable-ROM reads, mutable-memory chronology, cross-row state
+/// ISA and execution lookups, immutable-ROM reads, mutable-memory chronology, cross-row state
 /// continuity, and canonical-position ordered logs. A v2 segment receipt
 /// serializes this object together with its public boundaries and commitments.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,7 @@ pub struct PackedBlockProof {
     pub(crate) commitments: WitnessCommitments,
     pub(crate) relation: UniformRelationProof,
     pub(crate) isa_lookup: IsaLookupProof,
+    pub(crate) execution_lookup: ExecutionLookupProof,
     pub(crate) rom_lookup: RomLookupProof,
     pub(crate) memory: PackedMutableMemoryProof,
     pub(crate) continuity: PackedContinuityProof,
@@ -80,6 +82,9 @@ pub enum PackedBlockProofError {
     /// One fixed-ISA lookup failed.
     #[error(transparent)]
     IsaLookup(#[from] IsaLookupError),
+    /// One fixed execution-table lookup failed.
+    #[error(transparent)]
+    ExecutionLookup(#[from] ExecutionLookupProofError),
     /// The immutable-ROM lookup failed.
     #[error(transparent)]
     RomLookup(#[from] RomLookupError),
@@ -139,11 +144,13 @@ pub fn prove_packed_block_components(
         .try_into()
         .map_err(|_| BlockFrontendError::Shape)?;
     let isa_lookup = prove_isa_lookups(isa_layouts, &witness)?;
+    let execution_lookup = prove_execution_lookups(&witness)?;
     let rom_lookup = prove_rom_lookup(BlockCpuWitness::rom_lookup_columns()?, rom, &witness)?;
     Ok(PackedBlockProof {
         commitments: witness.into_commitments(),
         relation,
         isa_lookup,
+        execution_lookup,
         rom_lookup,
         memory,
         continuity,
@@ -193,6 +200,7 @@ pub(crate) fn verify_packed_block_components_for_protocol(
         .try_into()
         .map_err(|_| BlockFrontendError::Shape)?;
     verify_isa_lookups_for_protocol(protocol, isa_layouts, &proof.commitments, &proof.isa_lookup)?;
+    verify_execution_lookups_for_protocol(protocol, &proof.commitments, &proof.execution_lookup)?;
     verify_rom_lookup_for_protocol(
         protocol,
         BlockCpuWitness::rom_lookup_columns()?,

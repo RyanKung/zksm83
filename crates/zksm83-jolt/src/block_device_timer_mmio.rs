@@ -76,9 +76,9 @@ const _: () = assert!(BASIC_BLOCK_M_CYCLE_BOUND == 6);
 const _: () = assert!(TIMER_TICK_BOUND == 24);
 const _: () = assert!(TIMER_MMIO_AUX_COLUMN_COUNT == 49);
 const _: () = assert!(TIMER_MMIO_SEMANTIC_CONSTRAINT_COUNT == 313);
-const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_COLUMN_COUNT == 3_368);
-const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_CONSTRAINT_COUNT == 7_963);
-const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_MAX_DEGREE == 7);
+const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_COLUMN_COUNT == 3_263);
+const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_CONSTRAINT_COUNT == 7_789);
+const _: () = assert!(BLOCK_DEVICE_TIMER_MMIO_MAX_DEGREE == 14);
 
 /// Fixed-row witness for timer writes followed by at most 24 exact T-cycles.
 #[derive(Debug)]
@@ -165,7 +165,7 @@ impl UniformRelation for BlockDeviceTimerMmioRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [3_319_u64, 7_552, 49, 411, 24, 42, 3_368, 7_963, 4] {
+        for value in [3_214_u64, 7_378, 49, 411, 24, 42, 3_263, 7_789, 4] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement
@@ -570,36 +570,48 @@ fn constrain_tick(
     let phase_five = phase_selector_source(auxiliary, stage, current.source, 5)?;
     let phase_zero = phase_selector_source(auxiliary, stage, current.source, 0)?;
     let modulo = packed_bits(auxiliary, POST_MODULO_BITS_START, 8)?;
-    sink.push(reload_counter - current.counter - phase_five * (modulo - current.counter))?;
     sink.push(
-        reload_phase - current.phase - (one - phase_zero) * (one - phase_five)
-            + phase_five * current.phase,
+        device_io * (reload_counter - current.counter - phase_five * (modulo - current.counter)),
+    )?;
+    sink.push(
+        device_io
+            * (reload_phase - current.phase - (one - phase_zero) * (one - phase_five)
+                + phase_five * current.phase),
     )?;
     let active = tick_active(serial, tick, device_io)?;
     let wrap = stage_value(stage, tick, STAGE_DIV_WRAP_OFFSET)?;
     let overflow = stage_value(stage, tick, STAGE_COUNTER_OVERFLOW_OFFSET)?;
     let detector = timer_detector(auxiliary, stage, tick)?;
     let falling = current.latch * (one - detector);
-    sink.push(wrap * (one - active))?;
-    sink.push(overflow * (one - active))?;
-    sink.push(overflow * (one - falling))?;
+    sink.push(device_io * wrap * (one - active))?;
+    sink.push(device_io * overflow * (one - active))?;
+    sink.push(device_io * overflow * (one - falling))?;
     sink.push(
-        next.divider - current.divider - active + NativeField::from_u64(65_536) * active * wrap,
+        device_io
+            * (next.divider - current.divider - active
+                + NativeField::from_u64(65_536) * active * wrap),
     )?;
     sink.push(
-        next.counter
-            - current.counter
-            - active
-                * (reload_counter - current.counter + falling
-                    - NativeField::from_u64(256) * overflow),
+        device_io
+            * (next.counter
+                - current.counter
+                - active
+                    * (reload_counter - current.counter + falling
+                        - NativeField::from_u64(256) * overflow)),
     )?;
     sink.push(
-        next.phase
-            - current.phase
-            - active * (reload_phase - current.phase + overflow * (one - reload_phase)),
+        device_io
+            * (next.phase
+                - current.phase
+                - active * (reload_phase - current.phase + overflow * (one - reload_phase))),
     )?;
-    sink.push(next.latch - current.latch - active * (detector - current.latch))?;
-    sink.push(next.interrupt - current.interrupt - active * (one - current.interrupt) * phase_five)
+    sink.push(device_io * (next.latch - current.latch - active * (detector - current.latch)))?;
+    sink.push(
+        device_io
+            * (next.interrupt
+                - current.interrupt
+                - active * (one - current.interrupt) * phase_five),
+    )
 }
 
 fn constrain_final_state(

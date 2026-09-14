@@ -35,6 +35,7 @@ mod block_routing;
 mod block_test_support;
 mod continuity;
 mod cpu;
+mod execution_lookup;
 mod field_batch;
 mod field_fold;
 mod isa;
@@ -210,6 +211,14 @@ pub use continuity::{
     verify_packed_continuity,
 };
 pub use cpu::{CPU_STRUCTURAL_CONSTRAINT_COUNT, CPU_STRUCTURAL_MAX_DEGREE, CpuStructuralRelation};
+pub use execution_lookup::{
+    EXECUTION_LOOKUP_ADDRESS_BIT_COUNT, EXECUTION_LOOKUP_COLUMN_COUNT,
+    EXECUTION_LOOKUP_INPUT_BIT_COUNT, EXECUTION_LOOKUP_OUTPUT_BIT_COUNT,
+    EXECUTION_LOOKUP_WELL_FORMED_CONSTRAINT_COUNT, EXECUTION_LOOKUPS_PER_BLOCK,
+    EXECUTION_LOOKUPS_PER_INSTRUCTION, ExecutionLookupColumns, ExecutionLookupProof,
+    ExecutionLookupProofError, ExecutionLookupWellFormedRelation, ExecutionLookupWitness,
+    ExecutionLookupWitnessError, evaluate_packed_execution_table_entry,
+};
 pub use isa::{
     ISA_ARGUMENT_ONE_BITS_START, ISA_ARGUMENT_ZERO_BITS_START, ISA_BASE_M_CYCLES, ISA_DATA_READS,
     ISA_DATA_WRITES, ISA_IMMEDIATE_READS, ISA_OPCODE_FETCHES, ISA_OPERATION_BITS_START,
@@ -349,8 +358,7 @@ pub const PROTOCOL_ID_V2: &str = "zksm83-native-jolt-akita-v2";
 pub const PROTOCOL_ID: &str = PROTOCOL_ID_V2;
 
 /// Explicit proof/receipt composition revision bound by current backend identities.
-pub const PROOF_COMPOSITION_REVISION_V2: &str =
-    "packed-block-projected-composites-batched-isa-lanes-selective-openings-native-only-wire-v2";
+pub const PROOF_COMPOSITION_REVISION_V2: &str = "packed-block-jolt-execution-shout-compact19-compact-aux54-isa38-mmio-address-bits-projected-composites-batched-isa-selective-openings-native-only-wire-v2";
 
 /// The sole native receipt protocol revision supported by this build.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -525,7 +533,7 @@ mod tests {
         assert_eq!(BLOCK_CPU_COMMITMENT_GROUP_COUNT, 36);
         assert_eq!(BLOCK_CPU_OPENING_COUNT, 18);
         assert_eq!(BLOCK_CPU_PADDED_COLUMN_COUNT, 4_608);
-        assert_eq!(BLOCK_CPU_PADDING_COLUMN_COUNT, 43);
+        assert_eq!(BLOCK_CPU_PADDING_COLUMN_COUNT, 4);
         assert_eq!(NativeProtocolVersion::V2.code(), NATIVE_RECEIPT_VERSION);
         assert_eq!(NativeProtocolVersion::current(), NativeProtocolVersion::V2);
     }

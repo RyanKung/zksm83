@@ -38,6 +38,24 @@ pub(super) fn constrain_rotate_and_bit_operations(
     constrain_cb_destination(view, sink, instruction, cb_rotate, test, reset, set)
 }
 
+/// Packed-v2 bus-address glue for CB operations; values come from the execution lookup.
+pub(super) fn constrain_cb_bus_with_lookup(
+    view: &RowView<'_>,
+    sink: &mut ConstraintSink<'_>,
+) -> Result<(), UniformError> {
+    let instruction = view.mode(INSTRUCTION_MODE)?;
+    let rotate = operation_selector(view, 37)?;
+    let test = operation_selector(view, 38)?;
+    let reset = operation_selector(view, 39)?;
+    let set = operation_selector(view, 40)?;
+    let memory = argument_selector(view, ISA_ARGUMENT_ONE_BITS_START, 4, 6)?;
+    let hl = view.before(STATE_H)? * NativeField::from_u64(256) + view.before(STATE_L)?;
+    let cb = rotate + test + reset + set;
+    let writes = rotate + reset + set;
+    sink.push(instruction * cb * memory * (bus_field(view, 2, BUS_ADDRESS_OFFSET)? - hl))?;
+    sink.push(instruction * writes * memory * (bus_field(view, 3, BUS_ADDRESS_OFFSET)? - hl))
+}
+
 fn constrain_operand_routing(
     view: &RowView<'_>,
     sink: &mut ConstraintSink<'_>,

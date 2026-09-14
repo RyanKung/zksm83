@@ -25,8 +25,8 @@ pub const BLOCK_ISA_CONTROL_MAX_DEGREE: usize = if BLOCK_CONTROL_MAX_DEGREE > BL
 };
 
 const _: () = assert!(BLOCK_METADATA_COLUMN_COUNT == 6);
-const _: () = assert!(BLOCK_ISA_CONTROL_COLUMN_COUNT == 437);
-const _: () = assert!(BLOCK_ISA_CONTROL_CONSTRAINT_COUNT == 729);
+const _: () = assert!(BLOCK_ISA_CONTROL_COLUMN_COUNT == 393);
+const _: () = assert!(BLOCK_ISA_CONTROL_CONSTRAINT_COUNT == 685);
 const _: () = assert!(BLOCK_ISA_CONTROL_MAX_DEGREE == 7);
 
 /// Fixed-row witness composing packed control metadata with four fixed-ISA query lanes.
@@ -110,7 +110,7 @@ impl UniformRelation for BlockIsaControlRelation {
 
     fn statement_bytes(&self) -> Vec<u8> {
         let mut statement = Vec::new();
-        for value in [195_u64, 432, 242, 291, 6, 437, 729] {
+        for value in [195_u64, 432, 198, 247, 6, 393, 685] {
             statement.extend_from_slice(&value.to_le_bytes());
         }
         statement
@@ -183,7 +183,7 @@ fn shift_indices<const N: usize>(
 }
 
 const _: () = assert!(ISA_ADDRESS_BIT_COUNT == 9);
-const _: () = assert!(ISA_OUTPUT_COUNT == 49);
+const _: () = assert!(ISA_OUTPUT_COUNT == 38);
 
 #[cfg(test)]
 mod tests {
