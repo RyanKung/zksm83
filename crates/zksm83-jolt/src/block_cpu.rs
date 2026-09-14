@@ -52,6 +52,68 @@ const _: () = assert!(BASIC_BLOCK_INSTRUCTION_BOUND == 4);
 const _: () = assert!(BLOCK_CPU_COLUMN_COUNT == 4_604);
 const _: () = assert!(BLOCK_CPU_CONSTRAINT_COUNT == 11_483);
 
+/// Repeated packed-CPU computation that should be isolated before benchmarking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackedCpuEvaluationHotspot {
+    /// Mapping one shared packed row into each lane-local SM83 view.
+    LaneProjection,
+    /// Reconstructing packed byte, word, address, and state scalars from bits.
+    BitReconstruction,
+    /// Building selector polynomials from fixed-ISA and bus-kind bits.
+    SelectorConstruction,
+    /// Reconstructing lane-local bus slots from committed bus-match columns.
+    LocalBusProjection,
+    /// Checking committed bus-match helper columns against routing ownership.
+    BusMatchReconstruction,
+    /// Binding byte-operation queries to the fixed execution lookup table.
+    ExecutionLookupGlue,
+}
+
+/// Cached value family used by the current packed CPU evaluator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackedCpuCachedValue {
+    /// Lane-local projected bus tuple fields.
+    LocalBusTupleFields,
+    /// Lane-local bus address, physical-address, value, and before bit planes.
+    LocalBusBitPlanes,
+    /// Lane-local ROM selector and value projections.
+    LocalRomProjection,
+    /// Derived byte or word scalars reconstructed once per lane.
+    DerivedScalars,
+    /// Committed helper columns for local-to-shared bus-slot matching.
+    BusMatchWitness,
+}
+
+/// Static profile of the packed CPU evaluator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedCpuEvaluationProfile {
+    /// Number of packed instruction lanes per row.
+    pub lane_count: usize,
+    /// Maximum lane-local bus slots per packed row.
+    pub local_bus_slot_count: usize,
+    /// Hot computations to benchmark before protocol-level claims.
+    pub hotspots: &'static [PackedCpuEvaluationHotspot],
+    /// Computations currently cached or materialized as witness helpers.
+    pub cached_values: &'static [PackedCpuCachedValue],
+}
+
+const PACKED_CPU_EVALUATION_HOTSPOTS: [PackedCpuEvaluationHotspot; 6] = [
+    PackedCpuEvaluationHotspot::LaneProjection,
+    PackedCpuEvaluationHotspot::BitReconstruction,
+    PackedCpuEvaluationHotspot::SelectorConstruction,
+    PackedCpuEvaluationHotspot::LocalBusProjection,
+    PackedCpuEvaluationHotspot::BusMatchReconstruction,
+    PackedCpuEvaluationHotspot::ExecutionLookupGlue,
+];
+
+const PACKED_CPU_CACHED_VALUES: [PackedCpuCachedValue; 5] = [
+    PackedCpuCachedValue::LocalBusTupleFields,
+    PackedCpuCachedValue::LocalBusBitPlanes,
+    PackedCpuCachedValue::LocalRomProjection,
+    PackedCpuCachedValue::DerivedScalars,
+    PackedCpuCachedValue::BusMatchWitness,
+];
+
 /// Fixed-row packed witness with compact helpers for every instruction lane.
 #[derive(Debug)]
 pub struct BlockCpuWitness {
@@ -86,6 +148,19 @@ pub enum BlockCpuError {
 /// Deepest proof-free packed relation, including all ordinary instruction families.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockCpuRelation;
+
+impl BlockCpuRelation {
+    /// Returns the current packed CPU evaluator's hotspot and cache profile.
+    #[must_use]
+    pub const fn evaluation_profile() -> PackedCpuEvaluationProfile {
+        PackedCpuEvaluationProfile {
+            lane_count: BASIC_BLOCK_INSTRUCTION_BOUND,
+            local_bus_slot_count: BASIC_BLOCK_BUS_EVENT_BOUND,
+            hotspots: &PACKED_CPU_EVALUATION_HOTSPOTS,
+            cached_values: &PACKED_CPU_CACHED_VALUES,
+        }
+    }
+}
 
 impl BlockCpuWitness {
     /// Derives the shared packed prefix and all lane-local semantic helpers.
@@ -467,6 +542,28 @@ mod tests {
         trace::{packed_cpu_aux_offset, packed_cpu_bus_match_offset},
         validate_uniform_witness,
     };
+
+    #[test]
+    fn evaluation_profile_identifies_cached_hot_paths() {
+        let profile = BlockCpuRelation::evaluation_profile();
+        assert_eq!(profile.lane_count, BASIC_BLOCK_INSTRUCTION_BOUND);
+        assert_eq!(profile.local_bus_slot_count, BASIC_BLOCK_BUS_EVENT_BOUND);
+        assert!(
+            profile
+                .hotspots
+                .contains(&PackedCpuEvaluationHotspot::LocalBusProjection)
+        );
+        assert!(
+            profile
+                .cached_values
+                .contains(&PackedCpuCachedValue::LocalBusTupleFields)
+        );
+        assert!(
+            profile
+                .cached_values
+                .contains(&PackedCpuCachedValue::LocalBusBitPlanes)
+        );
+    }
 
     #[test]
     fn compact_cpu_relation_accepts_active_and_padding_rows()

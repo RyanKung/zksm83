@@ -751,7 +751,7 @@ fn prove_segments(
         write_progress(args, identities, builder, prover)?;
         let phases = native_proof_phase_metrics().since(phases_before);
         println!(
-            "segment={} steps={} segment_relation_rows={} completed_steps={} relation_rows={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} commit_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
+            "segment={} steps={} segment_relation_rows={} completed_steps={} relation_rows={} spool_bytes={} elapsed_seconds={:.3} setup_seconds={:.3} relation_eval_seconds={:.3} commit_seconds={:.3} rom_lookup_seconds={:.3} mutable_memory_seconds={:.3} continuity_seconds={:.3} protocol_log_seconds={:.3} sumcheck_seconds={:.3} opening_seconds={:.3} encode_seconds={:.3}",
             prover.segment_count() - 1,
             segment_steps,
             segment_relation_rows,
@@ -760,7 +760,12 @@ fn prove_segments(
             prover.spooled_bytes(),
             started.elapsed().as_secs_f64(),
             phases.setup().as_secs_f64(),
+            phases.packed_relation_evaluation().as_secs_f64(),
             phases.commit().as_secs_f64(),
+            phases.rom_lookup().as_secs_f64(),
+            phases.mutable_memory().as_secs_f64(),
+            phases.continuity().as_secs_f64(),
+            phases.protocol_log().as_secs_f64(),
             phases.sumcheck().as_secs_f64(),
             phases.opening().as_secs_f64(),
             phases.encode().as_secs_f64()

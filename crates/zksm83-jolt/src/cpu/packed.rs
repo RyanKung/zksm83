@@ -54,7 +54,14 @@ const _: () = assert!(PACKED_CPU_BUS_MATCH_CONSTRAINT_COUNT == 60);
 pub(super) struct PackedProjection<'a> {
     row: &'a [NativeField],
     lane: usize,
+    bus_fields: [[NativeField; TRACE_BUS_SLOT_WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND],
     bus_kind_bits: [[NativeField; TRACE_BUS_KIND_BITS]; BASIC_BLOCK_BUS_EVENT_BOUND],
+    address_bits: [[NativeField; 16]; BASIC_BLOCK_BUS_EVENT_BOUND],
+    physical_bits: [[NativeField; ROM_ADDRESS_BIT_COUNT]; BASIC_BLOCK_BUS_EVENT_BOUND],
+    value_bits: [[NativeField; 8]; BASIC_BLOCK_BUS_EVENT_BOUND],
+    before_bits: [[NativeField; 8]; BASIC_BLOCK_BUS_EVENT_BOUND],
+    rom_selectors: [NativeField; BASIC_BLOCK_BUS_EVENT_BOUND],
+    rom_values: [NativeField; BASIC_BLOCK_BUS_EVENT_BOUND],
     derived_scalars: [NativeField; PACKED_CPU_DERIVED_SCALAR_COUNT],
 }
 
@@ -66,22 +73,26 @@ impl<'a> PackedProjection<'a> {
         if row.len() < expected || lane >= BASIC_BLOCK_INSTRUCTION_BOUND {
             return Err(UniformError::Shape);
         }
-        let mut bus_kind_bits =
-            [[NativeField::from_u64(0); TRACE_BUS_KIND_BITS]; BASIC_BLOCK_BUS_EVENT_BOUND];
-        for slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
-            for bit in 0..TRACE_BUS_KIND_BITS {
-                let target = bus_kind_bits
-                    .get_mut(slot)
-                    .and_then(|bits| bits.get_mut(bit))
-                    .ok_or(UniformError::Shape)?;
-                *target = local_bus_field(row, lane, slot, 1 + bit)?;
-            }
-        }
+        let bus_fields = project_local_bus_fields(row, lane)?;
+        let bus_kind_bits = project_local_bus_kind_bits(&bus_fields)?;
+        let address_bits = project_local_bus_bits(row, lane, BusBits::Address)?;
+        let physical_bits = project_local_bus_bits(row, lane, BusBits::Physical)?;
+        let value_bits = project_local_bus_bits(row, lane, BusBits::Value)?;
+        let before_bits = project_local_bus_bits(row, lane, BusBits::Before)?;
+        let rom_selectors = project_local_rom_values(row, lane, false)?;
+        let rom_values = project_local_rom_values(row, lane, true)?;
         let derived_scalars = project_derived_scalars(row, lane)?;
         Ok(Self {
             row,
             lane,
+            bus_fields,
             bus_kind_bits,
+            address_bits,
+            physical_bits,
+            value_bits,
+            before_bits,
+            rom_selectors,
+            rom_values,
             derived_scalars,
         })
     }
@@ -168,22 +179,22 @@ impl<'a> PackedProjection<'a> {
             );
         }
         if (TRACE_ROM_SELECTOR_START..TRACE_ROM_VALUE_START).contains(&legacy_column) {
-            return local_bus_rom_value(
-                self.row,
-                self.lane,
-                legacy_column - TRACE_ROM_SELECTOR_START,
-                false,
-            );
+            let slot = legacy_column - TRACE_ROM_SELECTOR_START;
+            return self
+                .rom_selectors
+                .get(slot)
+                .copied()
+                .ok_or(UniformError::Shape);
         }
         if (TRACE_ROM_VALUE_START..TRACE_ROM_VALUE_START + BASIC_BLOCK_BUS_EVENT_BOUND)
             .contains(&legacy_column)
         {
-            return local_bus_rom_value(
-                self.row,
-                self.lane,
-                legacy_column - TRACE_ROM_VALUE_START,
-                true,
-            );
+            let slot = legacy_column - TRACE_ROM_VALUE_START;
+            return self
+                .rom_values
+                .get(slot)
+                .copied()
+                .ok_or(UniformError::Shape);
         }
         Err(UniformError::Shape)
     }
@@ -266,15 +277,11 @@ impl<'a> PackedProjection<'a> {
             .ok_or(UniformError::Shape)?;
         let slot = relative / TRACE_BUS_SLOT_WIDTH;
         let offset = relative % TRACE_BUS_SLOT_WIDTH;
-        if offset > 0 && offset <= TRACE_BUS_KIND_BITS {
-            return self
-                .bus_kind_bits
-                .get(slot)
-                .and_then(|bits| bits.get(offset - 1))
-                .copied()
-                .ok_or(UniformError::Shape);
-        }
-        local_bus_field(self.row, self.lane, slot, offset)
+        self.bus_fields
+            .get(slot)
+            .and_then(|fields| fields.get(offset))
+            .copied()
+            .ok_or(UniformError::Shape)
     }
 
     fn bus_bit_value(
@@ -289,7 +296,23 @@ impl<'a> PackedProjection<'a> {
             .ok_or(UniformError::Shape)?;
         let slot = relative / width;
         let bit = relative % width;
-        local_bus_bit(self.row, self.lane, slot, bit, kind)
+        match kind {
+            BusBits::Address if width == 16 => {
+                self.address_bits.get(slot).and_then(|bits| bits.get(bit))
+            }
+            BusBits::Physical if width == ROM_ADDRESS_BIT_COUNT => {
+                self.physical_bits.get(slot).and_then(|bits| bits.get(bit))
+            }
+            BusBits::Value if width == 8 => {
+                self.value_bits.get(slot).and_then(|bits| bits.get(bit))
+            }
+            BusBits::Before if width == 8 => {
+                self.before_bits.get(slot).and_then(|bits| bits.get(bit))
+            }
+            _ => None,
+        }
+        .copied()
+        .ok_or(UniformError::Shape)
     }
 
     fn aux_value(&self, offset: usize) -> Result<NativeField, UniformError> {
@@ -339,6 +362,76 @@ fn project_derived_scalars(
         }
     }
     Ok(derived)
+}
+
+fn project_local_bus_fields(
+    row: &[NativeField],
+    lane: usize,
+) -> Result<[[NativeField; TRACE_BUS_SLOT_WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND], UniformError> {
+    let mut fields =
+        [[NativeField::from_u64(0); TRACE_BUS_SLOT_WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND];
+    for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+        for offset in 0..TRACE_BUS_SLOT_WIDTH {
+            let target = fields
+                .get_mut(local_slot)
+                .and_then(|slot| slot.get_mut(offset))
+                .ok_or(UniformError::Shape)?;
+            *target = local_bus_field(row, lane, local_slot, offset)?;
+        }
+    }
+    Ok(fields)
+}
+
+fn project_local_bus_kind_bits(
+    fields: &[[NativeField; TRACE_BUS_SLOT_WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND],
+) -> Result<[[NativeField; TRACE_BUS_KIND_BITS]; BASIC_BLOCK_BUS_EVENT_BOUND], UniformError> {
+    let mut bits = [[NativeField::from_u64(0); TRACE_BUS_KIND_BITS]; BASIC_BLOCK_BUS_EVENT_BOUND];
+    for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+        for bit in 0..TRACE_BUS_KIND_BITS {
+            let source = fields
+                .get(local_slot)
+                .and_then(|slot| slot.get(bit + 1))
+                .copied()
+                .ok_or(UniformError::Shape)?;
+            let target = bits
+                .get_mut(local_slot)
+                .and_then(|slot| slot.get_mut(bit))
+                .ok_or(UniformError::Shape)?;
+            *target = source;
+        }
+    }
+    Ok(bits)
+}
+
+fn project_local_bus_bits<const WIDTH: usize>(
+    row: &[NativeField],
+    lane: usize,
+    kind: BusBits,
+) -> Result<[[NativeField; WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND], UniformError> {
+    let mut bits = [[NativeField::from_u64(0); WIDTH]; BASIC_BLOCK_BUS_EVENT_BOUND];
+    for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+        for bit in 0..WIDTH {
+            let target = bits
+                .get_mut(local_slot)
+                .and_then(|slot| slot.get_mut(bit))
+                .ok_or(UniformError::Shape)?;
+            *target = local_bus_bit(row, lane, local_slot, bit, kind)?;
+        }
+    }
+    Ok(bits)
+}
+
+fn project_local_rom_values(
+    row: &[NativeField],
+    lane: usize,
+    value: bool,
+) -> Result<[NativeField; BASIC_BLOCK_BUS_EVENT_BOUND], UniformError> {
+    let mut values = [NativeField::from_u64(0); BASIC_BLOCK_BUS_EVENT_BOUND];
+    for local_slot in 0..BASIC_BLOCK_BUS_EVENT_BOUND {
+        let target = values.get_mut(local_slot).ok_or(UniformError::Shape)?;
+        *target = local_bus_rom_value(row, lane, local_slot, value)?;
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy)]
