@@ -1,97 +1,172 @@
 # zksm83
 
-`zksm83` is an experimental native SM83 verifiable-execution workspace. It
-models and proves the SM83 transition relation directly instead of compiling a
-Game Boy emulator through RV64.
+`zksm83` is an experimental proof system for the SM83 CPU core used by the
+original Nintendo Game Boy (DMG).
 
-> **Status:** v2-only research implementation. The default CI validates the
-> Rust workspace and proof-free semantic relations; expensive end-to-end proof
-> tests are opt-in and are not part of CI. There is not yet a supported
-> performance or real-time-proving claim.
+Given a cartridge, an initial machine state, and an input sequence, the prover
+executes the Game Boy hardware model and produces a cryptographic receipt. A
+verifier can check that the claimed final state and public outputs follow from
+the modeled SM83 execution without replaying the whole game.
 
-The only proof pipeline is `zksm83-jolt`: a Jolt-like lookup-and-sumcheck
-architecture with transparent Akita lattice polynomial commitments over a
-shared native witness. It is a native SM83 construction, not an upstream Jolt
-RV64 guest. It binds the complete SM83 CPU/ISA relation, a one-MiB immutable
-ROM, ordered 128-KiB mutable memory, no-RTC MBC3, the modeled DMG devices,
-segment continuity, and ordered bus/input/output/ISA logs. The standalone
-verifier receives a separately pinned public statement and no emulator, trace,
-ROM image, memory image, or private log values.
+This proves execution of the hardware model. It does **not** authenticate a
+physical Nintendo chip, prove that a cartridge dump is legally owned, or
+reproduce pixels and audio as part of the proof. Nintendo and Game Boy are
+trademarks of Nintendo; this independent research project is not affiliated
+with or endorsed by Nintendo.
 
-Halo2/Pasta, the MOVA-era audit implementation, and their old CLI/receipt crates
-have been removed. Witness-side execution authentication now uses
-domain-separated SHA-256; verifier-visible ROM/RAM/log claims remain Akita
-commitments and openings. This cutover does not turn the transparent protocol
-into witness-hiding zero knowledge.
+> [!WARNING]
+> **Unstable experimental software.** The proof composition, receipt format,
+> performance, and APIs can change without compatibility support. The project
+> has not received a production security audit. Do not use it to secure assets
+> or make production claims.
 
-New statements and receipts use a hard-cut native receipt v2. Its 4,604-column
-packed CPU plane forms 36 ordered commitment groups. The full CPU relation
-opens all 18 schedule-bound adjacent pairs. Memory-event, continuity, and log
-sumchecks use transcript-bound projections containing only the main columns
-they consume. The four ISA lanes are reduced by one Fiat-Shamir random linear
-combination and share one table proof plus two trace openings; ISA, ROM,
-fixed-clock, and projected composite checks open only the adjacent pairs they
-consume. CPU execution uses 13 generic byte-level SM83 tables and at most two
-queries per instruction. Their aligned 19-bit union is authenticated by one
-Shout-style proof across all eight packed lookup slots, plus two selective
-trace openings. High-level encoders and decoders reject v1; there is no legacy
-receipt fallback.
+## What is proved?
 
-Source-level accounting for one segment now schedules 37 main-trace
-group-pair opening proofs instead of the former 270: 18 for the full CPU
-relation, 15 across projected memory, continuity, logs, batched ISA, ROM, and
-fixed clock checks, and four for the two execution-lookup trace openings. ISA
-table proofs fall from four to one. The packed relation contains 11,458
-identities. These are algorithmic operation counts; no proof timing is inferred
-from them.
+The current machine profile covers the CPU-visible behavior needed to prove a
+DMG execution:
 
-The former one-transition CPU, continuity, mutable-memory, and protocol-log
-proof APIs and their wire layouts have been deleted. The one-transition trace
-and relation remain only as a semantic reference used to construct and audit
-the packed V2 instruction lanes; they cannot produce a receipt.
+- the primary and CB-prefixed SM83 instruction sets, registers, flags, jumps,
+  stack operations, interrupts, HALT behavior, and machine-cycle accounting;
+- an immutable cartridge ROM of up to one MiB;
+- ordered 128-KiB mutable memory and no-RTC MBC3 mapping;
+- Timer, PPU timing and interrupts, OAM DMA, serial, joypad, APU registers,
+  Wave RAM, and MMIO behavior;
+- ordered bus, private-input, public-output, and ISA logs; and
+- continuity between independently proved execution segments.
 
-Execution and proof construction contain no cartridge-identity, ROM-root,
-program-counter, bank, or instruction-byte-pattern fast path. Every cartridge
-uses the same transition modes, lookup tables, and constraints. The proved
-device projection contains CPU-observable Timer, PPU timing and interrupts,
-DMA, serial, joypad, APU-register/Wave-RAM, and MMIO state; it does not prove a
-framebuffer renderer or generated audio samples. Historical prefix proofs made
-before this generic-relation cutover are incompatible with the current backend
-identity and are not current performance evidence.
-See [implementation status](docs/completion-report.md), the
-[validation map](docs/validation.md), and the
-[native milestone contract](docs/native-jolt-plan.md). The next optimization
-work is specified in the [generic optimization plan](docs/optimization-plan.md),
-with a reproducible [proof-free baseline](docs/proof-free-baseline.md).
+Framebuffer rendering and generated audio samples are outside the relation.
+The proof binds the CPU-visible device state that can affect program execution,
+not a complete audiovisual Game Boy emulator.
+
+The verifier is given a separately pinned public statement. The receipt alone
+is not authorization. The statement fixes the protocol/backend identity, ROM
+commitment, initial and final boundaries, segment and transition counts,
+machine-cycle count, and log counts.
+
+## Proof architecture
+
+There is one current proof path: `zksm83-jolt`.
+
+1. A native SM83 executor creates a typed execution trace.
+2. Up to four ordinary instructions are packed into one relation row; machine
+   events that require an exact boundary use their own row.
+3. Jolt-like lookup arguments authenticate the fixed ISA, ROM, byte-level CPU
+   operations, mutable memory, and ordered logs.
+4. Sumcheck proves the native CPU and device relations over the packed trace.
+5. The Akita lattice PCS commits to the witness and opens the values required
+   by the verifier.
+6. Long executions are chained as independently verifiable v2 segments.
+
+This is a native SM83 Jolt-like construction, not a Game Boy emulator compiled
+through an RV64 guest and not a wrapper around upstream Jolt's RV64 machine.
+Halo2/Pasta and MOVA have been removed. There is no v1 fallback or dual receipt
+decoder.
+
+Akita is transparent and lattice-based, but the current protocol is **not
+witness-hiding zero knowledge**. The repository name should not be read as a
+claim that private traces are hidden.
+
+## Paper performance estimate
+
+No complete proof or benchmark was run to produce the numbers below. They are
+a source-level model of the current implementation and must not be quoted as
+measured performance.
+
+One fixed-capacity v2 segment currently has:
+
+| Quantity | Current source value |
+| --- | ---: |
+| Packed relation rows | 16,384 |
+| Ordinary instructions per row | up to 4 |
+| Logical / physical columns | 4,604 / 4,608 |
+| Constraint slots | 11,458 |
+| Maximum relation degree | 23 |
+| Sumcheck interpolation points per round | 25 |
+| Commitment groups / paired openings | 36 / 18 |
+| Main-trace pair-opening tasks across the composed proof | about 37 |
+| Raw logical `u64` witness | 575.5 MiB |
+| Same cells represented as 128-bit field elements | about 1.125 GiB |
+
+The main CPU sumcheck performs
+`25 × (16,384 - 1) = 409,575` full relation evaluations per segment. That is
+about 4.69 billion constraint-slot evaluations before the extra relation
+validation, lookup, commitment, opening, and encoding work.
+
+For ten seconds of DMG time, the hardware budget is:
+
+```text
+4,194,304 clock ticks/s ÷ 4 × 10 s = 10,485,760 machine cycles
+```
+
+Using a paper model of 3–7 minutes per segment on a 64-GB M1 Max, with segments
+proved serially by the current CPU implementation:
+
+| Workload model for 10 seconds | Estimated segments | Paper proving time |
+| --- | ---: | ---: |
+| Typical game using VBlank/HALT compression | 50–90 | 2.5–10.5 hours |
+| CPU kept busy, averaging 3–5 M-cycles per packed row | 128–214 | 6–25 hours |
+| Control-flow/MMIO/device-boundary heavy | 213–320 | 11–37 hours |
+| Stress case near one M-cycle per row | about 640 | 32–75 hours |
+
+The practical center estimate for an ordinary ten-second play interval is
+about **6 hours**, with **8–10 hours** as a conservative planning number. That
+is roughly **2,000–3,600 times slower than real time**. Workload-dependent
+packing makes this range wide; it is not a formal upper bound.
+
+The current code has no CUDA prover. Merely running it on a machine containing
+an NVIDIA V100 does not provide a GPU speedup; field arithmetic, sumcheck,
+folding, and Akita commitment/opening kernels would first need a real CUDA
+implementation and separate measurement.
+
+## Project status
+
+The repository is in an unstable experimental phase:
+
+- v2 is the only supported protocol and breaking changes are intentional;
+- default CI checks formatting, strict lint, compilation, and proof-free
+  semantic tests;
+- expensive end-to-end cryptographic proof tests are opt-in and excluded from
+  normal CI;
+- the current relation and receipt path are implemented, but a full current
+  Game Boy workload has not been proved and timed end to end;
+- performance numbers in this README are paper estimates, not benchmarks; and
+- the protocol is transparent, not witness hiding.
+
+The implementation is cartridge-generic. Production code must not branch on a
+ROM digest, title, program counter, bank, or expected instruction pattern to
+compress a particular game.
 
 ## Workspace
 
 | Crate | Responsibility |
 | --- | --- |
-| `zksm83-isa` | typed primary and CB opcode metadata |
-| `zksm83-core` | deterministic machine state and the sole transition relation |
+| `zksm83-isa` | Typed primary and CB opcode metadata |
+| `zksm83-core` | Deterministic machine state and the sole transition relation |
 | `zksm83-memory` | ROM/RAM images and witness-side authentication |
-| `zksm83-trace` | validated bounded witness construction |
-| `zksm83-jolt` | native relation, Akita prover, receipt stream, and independent verifier |
+| `zksm83-trace` | Validated bounded witness construction and block packing |
+| `zksm83-jolt` | Native relations, Akita prover, receipt stream, and verifier |
 
-## Verify a receipt
+## Build and check
 
-Verification requires the expected statement as a separate policy input:
+The workspace uses the Rust toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
-cargo run --release -p zksm83-jolt --bin zksm83-native-verifier -- \
-  /absolute/path/expected-statement.bin \
-  /absolute/path/native-receipt.bin
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
-The receipt's embedded statement is never sufficient authorization by itself.
-The verifier decodes and drops one bounded segment at a time.
+The last command runs proof-free tests only. Tests that construct real
+cryptographic proofs are marked ignored and must be selected explicitly.
 
-## Prove and resume
+ROMs, save files, input schedules, checkpoints, spools, receipts, statements,
+traces, benchmarks, and temporary proof data are local-only and excluded by
+the repository ignore rules.
 
-Long proofs use a length-delimited spool plus an atomic state/memory progress
-checkpoint. Preflight validates file shapes, protocol bounds, input consumption,
-and content identities without creating proof data:
+## Preflight without proving
+
+Preflight validates inputs, protocol bounds, commitments, and the expected end
+checkpoint without producing proof data:
 
 ```sh
 cargo run --release -p zksm83-jolt --bin zksm83-native-prover -- \
@@ -105,60 +180,35 @@ cargo run --release -p zksm83-jolt --bin zksm83-native-prover -- \
   --preflight-only
 ```
 
-Replace `--preflight-only` with `--segment-limit 1` for a bounded first run.
-Use the same arguments plus `--resume` to verify the durable prefix and
-continue from its exact SM83 boundary. A partial spool is never published as
-the declared final receipt. Finalization durably publishes or byte-checks the
-statement first and publishes the receipt last as the completion marker, so a
-crash cannot leave a declared receipt without its matching statement.
+## Prove, resume, and inspect
 
-Use the same arguments plus `--inspect-progress-only` to verify an existing
-progress/spool pair without opening either file for writing. This mode requires
-the spool length to match the checkpoint exactly, verifies every persisted
-proof frame, checks the final state and memory commitment, and prints stable
-`zksm83-native-progress-evidence/v5` JSON. The progress-v5 checkpoint records
-raw completed transitions separately from packed relation rows. Both counters
-must equal the values recovered by verifying every persisted proof frame: a
-fifth packed-continuity auxiliary column authenticates the number of source
-SM83 transitions represented by each row. The checkpoint also binds the
-receipt version, protocol ID, explicit proof-composition revision, complete
-compiled backend digest, and both trace schedule digests. A relation, layout,
-transcript, wire, or schedule change is therefore rejected before the spool is
-decoded. Unknown checkpoint fields and counters outside the fixed segment,
-row, transition-density, or spool-size bounds also fail before spool decoding.
-There is no fallback reader for earlier progress schemas. Inspection never
-truncates crash-tail bytes, continues execution, or creates a receipt or
-statement.
+Replace `--preflight-only` with `--segment-limit 1` for a bounded first proof
+run. Repeat the same command with `--resume` to verify the durable prefix and
+continue from the exact saved boundary.
 
-Completed segment log lines separate process-local `setup`, `commit`,
-`sumcheck`, `opening`, and `encode` wall times. The standalone verifier reports
-its aggregate `verify_seconds`. These diagnostics are not receipt fields and do
-not affect the protocol identity.
+Use `--inspect-progress-only` with the same paths to verify an existing
+progress/spool pair without opening it for writing. Inspection checks every
+stored proof frame, segment counters, final state and memory commitment, the
+receipt version, protocol identity, backend digest, and trace schedules. It
+does not truncate, continue execution, or create a receipt.
 
-## Development
+A partial spool is never published as the final receipt. Finalization writes
+the statement first and the receipt last, so the receipt acts as the completion
+marker.
+
+## Verify a receipt
+
+Verification requires the expected statement as a separate policy input:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --all-targets --locked
+cargo run --release -p zksm83-jolt --bin zksm83-native-verifier -- \
+  /absolute/path/expected-statement.bin \
+  /absolute/path/native-receipt.bin
 ```
 
-Default tests are self-contained. Expensive cryptographic gates are ignored
-and must be invoked explicitly; CI never produces a proof. ROMs, saves, input
-schedules, checkpoints, spools, receipts, statements, traces, benchmarks, and
-temporary proof data are local-only; see [development.md](docs/development.md).
-
-## Privacy boundary
-
-The current protocol is transparent and is not witness-hiding. The project may
-not claim zero knowledge until a separate hiding construction, leakage tests,
-and security review exist.
-
-Version 2 pair batching was selected by the isolated bounded gate documented in
-[pcs-v2-evaluation.md](docs/pcs-v2-evaluation.md). The gate runs only through
-the explicit `zksm83-pcs-batch-gate` binary and is absent from default tests.
-Three- and four-group candidates exceeded the frozen memory-growth limit, so
-v2 deliberately stops at two groups per opening.
+The verifier decodes one bounded segment at a time and does not need the
+emulator, execution trace, cartridge image, memory image, or private log
+values.
 
 ## License
 
