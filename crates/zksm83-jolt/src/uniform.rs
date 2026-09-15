@@ -15,7 +15,10 @@ use akita_serialization::SerializationError;
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::{AkitaWorkerError, FieldFoldError, NativeProtocolVersion, NativeProverBackend};
+use crate::{
+    AkitaWorkerError, FieldFoldError, NativeProtocolVersion, NativeProverBackend,
+    prover_backend::NativeVerificationContext,
+};
 pub use commitment::{CommittedWitness, WitnessCommitments};
 use commitment::{
     OpeningProof, commit_columns_with_backend, prove_opening_with_backend,
@@ -371,24 +374,22 @@ pub(crate) fn prove_witness_selected_opening_with_backend(
 }
 
 pub(crate) fn verify_witness_selected_opening_for_protocol_with_backend(
-    protocol: NativeProtocolVersion,
+    context: NativeVerificationContext<'_>,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     values: &[NativeField],
     selected_columns: &[usize],
     descriptor: &[u8],
     opening: &crate::pcs::OpeningProof,
-    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
     verify_selected_opening_for_protocol_with_backend(
-        protocol,
+        context,
         commitments,
         point,
         values,
         selected_columns,
         descriptor,
         opening,
-        backend,
     )
 }
 

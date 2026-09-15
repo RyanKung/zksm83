@@ -4,6 +4,7 @@ use crate::{
     NativeField, NativeProtocolVersion, NativeProverBackend, TRACE_ROW_BIT_COUNT,
     UNIFORM_NUM_VARIABLES, WitnessCommitments,
     pcs::OpeningProof,
+    prover_backend::NativeVerificationContext,
     uniform::{
         CommittedWitness, prove_witness_selected_opening_with_backend,
         verify_witness_selected_opening_for_protocol_with_backend,
@@ -52,14 +53,13 @@ pub(super) fn verify_at(
     let point = point(&descriptor);
     let selected_columns = row_bit_columns(row_bits_start)?;
     verify_witness_selected_opening_for_protocol_with_backend(
-        protocol,
+        NativeVerificationContext::new(protocol, backend),
         trace,
         &point,
         &proof.values,
         &selected_columns,
         &descriptor,
         &proof.opening,
-        backend,
     )?;
     check_row_bits(&proof.values, &point, row_bits_start)
 }

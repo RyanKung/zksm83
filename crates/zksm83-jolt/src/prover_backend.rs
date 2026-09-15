@@ -3,7 +3,9 @@ use core::fmt::{self, Display, Formatter};
 use thiserror::Error;
 use zksm83_trace::BasicBlock;
 
-use crate::{BlockCpuError, BlockCpuWitness, NativeField, field_fold::FieldFoldError};
+use crate::{
+    BlockCpuError, BlockCpuWitness, NativeField, NativeProtocolVersion, field_fold::FieldFoldError,
+};
 
 /// Canonical proof-pipeline phase covered by a selected native backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +85,29 @@ enum NativeProverBackendState {
 pub struct NativeProverBackend {
     kind: NativeProverBackendKind,
     state: NativeProverBackendState,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NativeVerificationContext<'a> {
+    protocol: NativeProtocolVersion,
+    backend: &'a NativeProverBackend,
+}
+
+impl<'a> NativeVerificationContext<'a> {
+    pub(crate) const fn new(
+        protocol: NativeProtocolVersion,
+        backend: &'a NativeProverBackend,
+    ) -> Self {
+        Self { protocol, backend }
+    }
+
+    pub(crate) const fn protocol(self) -> NativeProtocolVersion {
+        self.protocol
+    }
+
+    pub(crate) const fn backend(self) -> &'a NativeProverBackend {
+        self.backend
+    }
 }
 
 impl NativeProverBackendKind {

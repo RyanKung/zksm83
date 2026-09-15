@@ -34,6 +34,29 @@ use crate::{
 
 type Config = fp128::DenseBounded;
 
+pub(crate) struct SelectedOpeningClaim<'a> {
+    point: &'a [NativeField],
+    logical_values: &'a [NativeField],
+    selected_columns: &'a [usize],
+    instance_descriptor: &'a [u8],
+}
+
+impl<'a> SelectedOpeningClaim<'a> {
+    pub(crate) const fn new(
+        point: &'a [NativeField],
+        logical_values: &'a [NativeField],
+        selected_columns: &'a [usize],
+        instance_descriptor: &'a [u8],
+    ) -> Self {
+        Self {
+            point,
+            logical_values,
+            selected_columns,
+            instance_descriptor,
+        }
+    }
+}
+
 /// Frozen PCS geometry and transcript domains for one column family.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) struct PcsLayout {
@@ -801,19 +824,16 @@ pub(crate) fn verify_opening_with_backend(
 pub(crate) fn verify_selected_opening_with_backend(
     layout: PcsLayout,
     commitments: &ColumnCommitments,
-    point: &[NativeField],
-    logical_values: &[NativeField],
-    selected_columns: &[usize],
-    instance_descriptor: &[u8],
+    claim: SelectedOpeningClaim<'_>,
     opening: &OpeningProof,
     backend: &NativeProverBackend,
 ) -> Result<(), PcsError> {
-    let opening_indices = selected_opening_indices(layout, commitments, selected_columns)?;
+    let opening_indices = selected_opening_indices(layout, commitments, claim.selected_columns)?;
     validate_selected_opening_shape(
         layout,
         commitments,
-        point,
-        logical_values,
+        claim.point,
+        claim.logical_values,
         &opening_indices,
         opening.groups.len(),
     )?;
@@ -846,9 +866,9 @@ pub(crate) fn verify_selected_opening_with_backend(
                 &scheme,
                 &verifier_setup,
                 committed_groups,
-                point,
-                logical_values,
-                instance_descriptor,
+                claim.point,
+                claim.logical_values,
+                claim.instance_descriptor,
                 opening_index,
                 group_opening,
             )?;

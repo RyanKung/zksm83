@@ -18,6 +18,7 @@ use crate::{
     commit_witness_with_backend,
     field_batch::{FieldBatchError, SelectedDenominator, selected_inverse_columns},
     pcs::OpeningProof,
+    prover_backend::NativeVerificationContext,
     uniform::{
         CommittedWitness, CompositeUniformRelationProof, ProjectedRelation,
         prove_uniform_composite_with_backend, prove_witness_opening_with_backend,
@@ -276,28 +277,28 @@ pub(crate) fn verify_packed_continuity_for_protocol_with_backend(
     claim: &NativeExecutionClaim,
     backend: &NativeProverBackend,
 ) -> Result<(), ContinuityError> {
+    let context = NativeVerificationContext::new(protocol, backend);
     verify_for_layout(
-        protocol,
+        context,
         ContinuityLayout::Packed,
         &proof.inverse_commitments,
         &proof.relation,
         &proof.sum,
         trace,
         claim,
-        backend,
     )
 }
 
 fn verify_for_layout(
-    protocol: NativeProtocolVersion,
+    context: NativeVerificationContext<'_>,
     layout: ContinuityLayout,
     inverse_commitments: &WitnessCommitments,
     relation_proof: &CompositeUniformRelationProof,
     sum: &ContinuitySumProof,
     trace: &WitnessCommitments,
     claim: &NativeExecutionClaim,
-    backend: &NativeProverBackend,
 ) -> Result<(), ContinuityError> {
+    let protocol = context.protocol();
     claim.validate()?;
     let phase_one = phase_one_descriptor(protocol, layout, trace, claim)?;
     let challenges = challenges(protocol, layout, &phase_one)?;
@@ -312,19 +313,18 @@ fn verify_for_layout(
         trace,
         inverse_commitments,
         relation_proof,
-        backend,
+        context.backend(),
     )?;
     let full = full_descriptor(protocol, &phase_one, inverse_commitments)?;
     on_worker(|| {
         verify_sum(
-            protocol,
+            context,
             layout,
             sum,
             inverse_commitments,
             claim,
             challenges,
             &full,
-            backend,
         )
     })
 }
@@ -602,15 +602,15 @@ fn prove_sum(
 }
 
 fn verify_sum(
-    protocol: NativeProtocolVersion,
+    context: NativeVerificationContext<'_>,
     layout: ContinuityLayout,
     proof: &ContinuitySumProof,
     inverses: &WitnessCommitments,
     claim: &NativeExecutionClaim,
     challenges: ContinuityChallenges,
     full_descriptor: &[u8],
-    backend: &NativeProverBackend,
 ) -> Result<(), ContinuityError> {
+    let protocol = context.protocol();
     let descriptor = sum_descriptor(protocol, layout, full_descriptor)?;
     let point = half_point()?;
     verify_witness_opening_for_protocol_with_backend(
@@ -620,7 +620,7 @@ fn verify_sum(
         &proof.values,
         &descriptor,
         &proof.opening,
-        backend,
+        context.backend(),
     )?;
     check_sum(layout, &proof.values, claim, challenges)
 }

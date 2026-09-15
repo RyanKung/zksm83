@@ -13,12 +13,14 @@ use crate::{
     BLOCK_CPU_COLUMN_COUNT, NATIVE_TRACE_COLUMN_COUNT, NativeProtocolVersion, NativeProverBackend,
     pcs::{
         ColumnCommitments, CommittedColumns, FieldColumnView, OpeningProof as PcsOpeningProof,
-        PcsError, PcsLayout, commit_columns_with_backend as commit_pcs_columns_with_backend,
+        PcsError, PcsLayout, SelectedOpeningClaim,
+        commit_columns_with_backend as commit_pcs_columns_with_backend,
         prove_opening_with_backend as prove_pcs_opening_with_backend,
         prove_selected_opening_with_backend as prove_pcs_selected_opening_with_backend,
         selected_logical_columns, verify_opening_with_backend as verify_pcs_opening_with_backend,
         verify_selected_opening_with_backend as verify_pcs_selected_opening_with_backend,
     },
+    prover_backend::NativeVerificationContext,
 };
 
 use super::{COMMITMENT_GROUP_COLUMNS, NativeField, UNIFORM_NUM_VARIABLES, UniformError};
@@ -231,24 +233,20 @@ pub(super) fn prove_selected_opening_with_backend(
 }
 
 pub(super) fn verify_selected_opening_for_protocol_with_backend(
-    protocol: NativeProtocolVersion,
+    context: NativeVerificationContext<'_>,
     commitments: &WitnessCommitments,
     point: &[NativeField],
     logical_values: &[NativeField],
     selected_columns: &[usize],
     instance_descriptor: &[u8],
     opening: &OpeningProof,
-    backend: &NativeProverBackend,
 ) -> Result<(), UniformError> {
     verify_pcs_selected_opening_with_backend(
-        layout_for(protocol, commitments.column_count()),
+        layout_for(context.protocol(), commitments.column_count()),
         &commitments.inner,
-        point,
-        logical_values,
-        selected_columns,
-        instance_descriptor,
+        SelectedOpeningClaim::new(point, logical_values, selected_columns, instance_descriptor),
         opening,
-        backend,
+        context.backend(),
     )
     .map_err(map_pcs_error)
 }

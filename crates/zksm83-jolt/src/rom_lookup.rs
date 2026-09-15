@@ -11,6 +11,7 @@ use crate::{
         ColumnCommitments, CommittedColumns, OpeningProof, PcsError, PcsLayout,
         commit_columns_with_backend, prove_opening_with_backend, verify_opening_with_backend,
     },
+    prover_backend::NativeVerificationContext,
     sumcheck::{
         ProductSumcheckError, ProductSumcheckProof, SumOfProductsSumcheckProof, SumcheckFactor,
     },
@@ -484,14 +485,13 @@ fn verify_on_worker(
         &mut transcript,
     )?;
     verify_witness_selected_opening_for_protocol_with_backend(
-        protocol,
+        NativeVerificationContext::new(protocol, backend),
         trace_commitments,
         &cycle_point,
         &proof.trace_cycle_values,
         &layout.values,
         &descriptor,
         &proof.trace_cycle_opening,
-        backend,
     )?;
     require_mixed_value(
         &proof.trace_cycle_values,
@@ -501,14 +501,13 @@ fn verify_on_worker(
     )?;
     let address_opening_columns = address_opening_columns(layout);
     verify_witness_selected_opening_for_protocol_with_backend(
-        protocol,
+        NativeVerificationContext::new(protocol, backend),
         trace_commitments,
         &address_point,
         &proof.trace_address_values,
         &address_opening_columns,
         &descriptor,
         &proof.trace_address_opening,
-        backend,
     )?;
     verify_address_terminal(
         &proof.address_sumcheck,

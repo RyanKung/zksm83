@@ -9,7 +9,9 @@ use super::{
     prove_sumcheck, push_bytes, push_usize, replay_sumcheck, sample_point, validate_relation,
     verify_opening_for_protocol_with_backend, verify_selected_opening_for_protocol_with_backend,
 };
-use crate::{NativeProtocolVersion, NativeProverBackend};
+use crate::{
+    NativeProtocolVersion, NativeProverBackend, prover_backend::NativeVerificationContext,
+};
 
 const PROJECTED_RELATION_DOMAIN: &[u8] = b"zksm83/native-projected-relation/v2";
 
@@ -342,14 +344,13 @@ fn verify_on_worker<R: UniformRelation>(
         &mut transcript,
     )?;
     verify_selected_opening_for_protocol_with_backend(
-        protocol,
+        NativeVerificationContext::new(protocol, backend),
         left,
         &opening_point,
         &proof.left_values,
         relation.trace_columns(),
         &descriptor,
         &proof.left_opening,
-        backend,
     )?;
     verify_opening_for_protocol_with_backend(
         protocol,
